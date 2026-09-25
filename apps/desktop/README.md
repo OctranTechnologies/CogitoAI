@@ -30,8 +30,13 @@ pnpm tauri dev
 ```
 
 Enter the runtime address and workspace path in the shell, then select
-Connect. The shell reconnects to durable runtime sessions after a window close
-and reopen; it never writes agent state itself.
+Connect. The conversation panel shows prompts, streamed assistant output, and
+run phase. The context panel shows expandable tool cards, verification results,
+and a chronological session timeline. Approval requests are explicitly
+allow-once or deny-once; no permanent policy change is inferred by the UI.
+Select a persisted session and use Resume to rehydrate its durable events and
+conversation, then continue sending work. Closing the window does not corrupt
+the runtime-owned session.
 
 ## Checks
 

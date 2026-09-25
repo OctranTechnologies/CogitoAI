@@ -304,10 +304,12 @@ cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
 
 In the desktop shell, enter the runtime address and a repository path, then
 select Connect. The shell can create/resume sessions, send messages, stream
-runtime events, approve or deny tools, cancel runs, and inspect the contextual
-runtime panel. Closing and reopening the window does not delete or corrupt an
-active session: reconnecting reloads the session list and the runtime remains
-the source of truth.
+assistant output, show tool activity and verification results, approve or deny
+tools once, cancel runs, and inspect the chronological runtime timeline.
+Closing and reopening the window does not delete or corrupt an active session:
+reconnecting reloads the session list and the runtime remains the source of
+truth. Use Resume on a selected session to rehydrate its persisted conversation
+and event timeline before continuing.
 
 Frontend and Tauri checks:
 

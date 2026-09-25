@@ -15,13 +15,27 @@ import {
   type SessionSummary,
   type WorkspaceSummary,
 } from "./lib/rpc";
+import {
+  deriveTimeline,
+  deriveToolActivities,
+  deriveVerificationActivities,
+  hydrateConversation,
+  type ChatMessage,
+  type RunPhase,
+  type TimelineEntry,
+  type ToolActivity,
+  type VerificationActivity,
+} from "./lib/events";
 
-export interface ChatMessage {
-  id: string;
-  role: "user" | "assistant" | "system";
-  text: string;
-  createdAt: number;
-  streaming?: boolean;
+export type { ChatMessage, RunPhase, TimelineEntry, ToolActivity, VerificationActivity } from "./lib/events";
+
+interface SessionInspectReport {
+  session: {
+    id: string;
+    workspace_root: string;
+    events: HarnessEvent[];
+  };
+  warnings: unknown[];
 }
 
 export interface DesktopStore {
@@ -33,11 +47,16 @@ export interface DesktopStore {
   sessions: SessionSummary[];
   activeSessionId: string | null;
   activeRunId: string | null;
+  runPhase: RunPhase;
   messages: ChatMessage[];
   events: HarnessEvent[];
+  toolActivity: ToolActivity[];
+  verificationActivity: VerificationActivity[];
+  timeline: TimelineEntry[];
   approvals: ApprovalRequest[];
   composer: string;
   isLoadingWorkspace: boolean;
+  isLoadingSession: boolean;
   lastError: string | null;
   connect: (address: string, workspacePath: string) => Promise<void>;
   disconnect: () => Promise<void>;
@@ -45,6 +64,7 @@ export interface DesktopStore {
   setComposer: (value: string) => void;
   selectSession: (sessionId: string) => void;
   createSession: () => Promise<void>;
+  resumeSession: (sessionId?: string) => Promise<void>;
   sendMessage: (text: string) => Promise<void>;
   approve: (approvalId: string) => Promise<void>;
   deny: (approvalId: string) => Promise<void>;
@@ -64,7 +84,7 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-function isHarnessEvent(value: unknown): value is HarnessEvent {
+export function isHarnessEvent(value: unknown): value is HarnessEvent {
   if (!value || typeof value !== "object") return false;
   const event = value as Partial<HarnessEvent>;
   return (
@@ -72,18 +92,17 @@ function isHarnessEvent(value: unknown): value is HarnessEvent {
     typeof event.event_id === "string" &&
     typeof event.session_id === "string" &&
     typeof event.event_type === "string" &&
+    typeof event.timestamp === "number" &&
     typeof event.payload === "object" &&
     event.payload !== null
   );
 }
 
-function eventText(event: HarnessEvent): string | null {
-  const data = event.payload.data;
-  if (typeof data.text === "string") return data.text;
-  return null;
+function eventText(event: HarnessEvent): string {
+  return typeof event.payload.data.text === "string" ? event.payload.data.text : "";
 }
 
-function makeTask(workspacePath: string, text: string, sessionId: string | null): AgentTask {
+function makeTask(workspacePath: string, text: string, sessionId: string): AgentTask {
   return {
     workspace_root: workspacePath,
     user_task: text,
@@ -99,236 +118,281 @@ function makeTask(workspacePath: string, text: string, sessionId: string | null)
   };
 }
 
+function derivedFromEvents(events: HarnessEvent[]) {
+  return {
+    events,
+    toolActivity: deriveToolActivities(events),
+    verificationActivity: deriveVerificationActivities(events),
+    timeline: deriveTimeline(events),
+  };
+}
+
+function emptyRunState() {
+  return {
+    messages: [] as ChatMessage[],
+    events: [] as HarnessEvent[],
+    toolActivity: [] as ToolActivity[],
+    verificationActivity: [] as VerificationActivity[],
+    timeline: [] as TimelineEntry[],
+    approvals: [] as ApprovalRequest[],
+    activeRunId: null,
+    runPhase: "idle" as RunPhase,
+  };
+}
+
 export const useDesktopStore = create<DesktopStore>()(
   persist(
     (set, get) => ({
-  status: "unavailable",
-  address: "127.0.0.1:4545",
-  clientId: null,
-  workspacePath: "",
-  workspace: null,
-  sessions: [],
-  activeSessionId: null,
-  activeRunId: null,
-  messages: [],
-  events: [],
-  approvals: [],
-  composer: "",
-  isLoadingWorkspace: false,
-  lastError: null,
+      status: "unavailable",
+      address: "127.0.0.1:4545",
+      clientId: null,
+      workspacePath: "",
+      workspace: null,
+      sessions: [],
+      activeSessionId: null,
+      activeRunId: null,
+      runPhase: "idle",
+      messages: [],
+      events: [],
+      toolActivity: [],
+      verificationActivity: [],
+      timeline: [],
+      approvals: [],
+      composer: "",
+      isLoadingWorkspace: false,
+      isLoadingSession: false,
+      lastError: null,
 
-  connect: async (address, workspacePath) => {
-    const current = get();
-    if (current.clientId) await get().disconnect();
-    set({ status: "connecting", address, workspacePath, lastError: null, isLoadingWorkspace: true });
-    try {
-      const clientId = await connectRuntime(address);
-      set({ clientId });
-      const initialize = await requestRuntime(clientId, "rpc.initialize");
-      expectResult(initialize);
-      const workspace = await requestRuntime<WorkspaceSummary>(clientId, "workspace.open", {
-        path: workspacePath,
-      });
-      set({ workspace: expectResult(workspace) });
-      const sessions = await requestRuntime<SessionSummary[]>(clientId, "session.list", { limit: 30 });
-      set({ sessions: expectResult(sessions), status: "connected", isLoadingWorkspace: false });
-    } catch (error) {
-      const clientId = get().clientId;
-      if (clientId) await disconnectRuntime(clientId).catch(() => undefined);
-      set({
-        status: "error",
-        clientId: null,
-        isLoadingWorkspace: false,
-        lastError: errorMessage(error),
-      });
-    }
-  },
+      connect: async (address, workspacePath) => {
+        if (get().clientId) await get().disconnect();
+        set({ status: "connecting", address, workspacePath, lastError: null, isLoadingWorkspace: true });
+        try {
+          const clientId = await connectRuntime(address);
+          set({ clientId });
+          expectResult(await requestRuntime(clientId, "rpc.initialize"));
+          const workspace = await requestRuntime<WorkspaceSummary>(clientId, "workspace.open", { path: workspacePath });
+          const sessions = await requestRuntime<SessionSummary[]>(clientId, "session.list", { limit: 30 });
+          const workspaceResult = expectResult(workspace);
+          const sessionResult = expectResult(sessions);
+          set({ workspace: workspaceResult, sessions: sessionResult, status: "connected", isLoadingWorkspace: false });
+          const persistedSession = get().activeSessionId;
+          if (persistedSession && sessionResult.some((session) => session.id === persistedSession)) {
+            await get().resumeSession(persistedSession);
+          }
+        } catch (error) {
+          const clientId = get().clientId;
+          if (clientId) await disconnectRuntime(clientId).catch(() => undefined);
+          set({ status: "error", clientId: null, isLoadingWorkspace: false, lastError: errorMessage(error) });
+        }
+      },
 
-  disconnect: async () => {
-    const clientId = get().clientId;
-    if (clientId) await disconnectRuntime(clientId);
-    set({ status: "disconnected", clientId: null, activeRunId: null });
-  },
+      disconnect: async () => {
+        const clientId = get().clientId;
+        if (clientId) await disconnectRuntime(clientId);
+        set({ status: "disconnected", clientId: null, activeRunId: null, runPhase: "idle" });
+      },
 
-  setWorkspacePath: (workspacePath) => set({ workspacePath }),
-  setComposer: (composer) => set({ composer }),
-  selectSession: (activeSessionId) => set({ activeSessionId, messages: [], events: [], approvals: [] }),
-  setRuntimeError: (message) => set({ status: "error", lastError: message, clientId: null, activeRunId: null }),
-  markDisconnected: () => set({ status: "disconnected", clientId: null, activeRunId: null }),
-  clearError: () => set({ lastError: null }),
+      setWorkspacePath: (workspacePath) => set({ workspacePath }),
+      setComposer: (composer) => set({ composer }),
+      selectSession: (activeSessionId) => set({ activeSessionId, ...emptyRunState() }),
+      setRuntimeError: (message) =>
+        set({ status: "error", lastError: message, clientId: null, activeRunId: null, runPhase: "failed" }),
+      markDisconnected: () => set({ status: "disconnected", clientId: null, activeRunId: null }),
+      clearError: () => set({ lastError: null }),
 
-  createSession: async () => {
-    const { clientId, workspacePath } = get();
-    if (!clientId || !workspacePath) return;
-    try {
-      const response = await requestRuntime<{ session: { id: string } }>(clientId, "session.create", {
-        path: workspacePath,
-      });
-      const result = expectResult(response);
-      set((state) => ({
-        activeSessionId: result.session.id,
-        messages: [],
-        events: [],
-        approvals: [],
-        sessions: [
-          {
-            id: result.session.id,
-            workspace_root: workspacePath,
-            status: "Active",
-            created_at: Date.now(),
-            last_updated_at: Date.now(),
-            event_count: 1,
-            context_compactions: 0,
-          },
-          ...state.sessions,
-        ],
-      }));
-    } catch (error) {
-      set({ lastError: errorMessage(error) });
-    }
-  },
+      createSession: async () => {
+        const { clientId, workspacePath } = get();
+        if (!clientId || !workspacePath) return;
+        try {
+          const response = await requestRuntime<{ session: { id: string } }>(clientId, "session.create", {
+            path: workspacePath,
+          });
+          const result = expectResult(response);
+          set((state) => ({
+            activeSessionId: result.session.id,
+            ...emptyRunState(),
+            sessions: [
+              {
+                id: result.session.id,
+                workspace_root: workspacePath,
+                status: "Active",
+                created_at: Date.now(),
+                last_updated_at: Date.now(),
+                event_count: 1,
+                context_compactions: 0,
+              },
+              ...state.sessions,
+            ],
+          }));
+        } catch (error) {
+          set({ lastError: errorMessage(error) });
+        }
+      },
 
-  sendMessage: async (text) => {
-    const { clientId, workspacePath, activeSessionId, activeRunId } = get();
-    if (!clientId || !workspacePath || activeRunId) return;
-    if (!text.trim()) return;
-    if (!activeSessionId) {
-      await get().createSession();
-    }
-    const sessionId = get().activeSessionId;
-    if (!sessionId) return;
-    const userMessage: ChatMessage = {
-      id: `user-${Date.now()}`,
-      role: "user",
-      text: text.trim(),
-      createdAt: Date.now(),
-    };
-    set((state) => ({ messages: [...state.messages, userMessage], composer: "" }));
-    try {
-      const response = await requestRuntime<{ run_id: string }>(clientId, "agent.send", {
-        task: makeTask(workspacePath, text, sessionId),
-      });
-      set({ activeRunId: expectResult(response).run_id, lastError: null });
-    } catch (error) {
-      set({ lastError: errorMessage(error) });
-    }
-  },
+      resumeSession: async (sessionId) => {
+        const { clientId, activeSessionId } = get();
+        const targetSession = sessionId ?? activeSessionId;
+        if (!clientId || !targetSession) return;
+        set({ isLoadingSession: true, lastError: null });
+        try {
+          expectResult(await requestRuntime(clientId, "session.resume", { session_id: targetSession }));
+          const report = expectResult(
+            await requestRuntime<SessionInspectReport>(clientId, "session.inspect", { session_id: targetSession }),
+          );
+          if (!report.session.events.every(isHarnessEvent)) {
+            throw new RpcTransportError("runtime returned a malformed persisted event", "malformed_event");
+          }
+          const events = report.session.events;
+          set({
+            activeSessionId: targetSession,
+            ...derivedFromEvents(events),
+            messages: hydrateConversation(events),
+            approvals: [],
+            activeRunId: null,
+            runPhase: "idle",
+            isLoadingSession: false,
+            workspacePath: report.session.workspace_root,
+          });
+        } catch (error) {
+          set({ isLoadingSession: false, lastError: errorMessage(error) });
+        }
+      },
 
-  approve: async (approvalId) => {
-    const { clientId } = get();
-    if (!clientId) return;
-    try {
-      await requestRuntime(clientId, "agent.approve", { approval_id: approvalId });
-      set((state) => ({ approvals: state.approvals.filter((item) => item.approval_id !== approvalId) }));
-    } catch (error) {
-      set({ lastError: errorMessage(error) });
-    }
-  },
+      sendMessage: async (text) => {
+        const { clientId, workspacePath, activeSessionId, activeRunId } = get();
+        if (!clientId || !workspacePath || activeRunId || !text.trim()) return;
+        if (!activeSessionId) await get().createSession();
+        const sessionId = get().activeSessionId;
+        if (!sessionId) return;
+        const userMessage: ChatMessage = {
+          id: `user-${Date.now()}`,
+          role: "user",
+          text: text.trim(),
+          createdAt: Date.now(),
+        };
+        set((state) => ({ messages: [...state.messages, userMessage], composer: "", runPhase: "pending" }));
+        try {
+          const response = await requestRuntime<{ run_id: string }>(clientId, "agent.send", {
+            task: makeTask(workspacePath, text, sessionId),
+          });
+          set({ activeRunId: expectResult(response).run_id, lastError: null });
+        } catch (error) {
+          set({ runPhase: "failed", lastError: errorMessage(error) });
+        }
+      },
 
-  deny: async (approvalId) => {
-    const { clientId } = get();
-    if (!clientId) return;
-    try {
-      await requestRuntime(clientId, "agent.deny", { approval_id: approvalId });
-      set((state) => ({ approvals: state.approvals.filter((item) => item.approval_id !== approvalId) }));
-    } catch (error) {
-      set({ lastError: errorMessage(error) });
-    }
-  },
+      approve: async (approvalId) => {
+        const { clientId } = get();
+        if (!clientId) return;
+        try {
+          expectResult(await requestRuntime(clientId, "agent.approve", { approval_id: approvalId }));
+          set((state) => ({ approvals: state.approvals.filter((item) => item.approval_id !== approvalId) }));
+        } catch (error) {
+          set({ lastError: errorMessage(error) });
+        }
+      },
 
-  cancel: async () => {
-    const { clientId, activeRunId } = get();
-    if (!clientId || !activeRunId) return;
-    try {
-      await requestRuntime(clientId, "agent.cancel", { run_id: activeRunId });
-    } catch (error) {
-      set({ lastError: errorMessage(error) });
-    }
-  },
+      deny: async (approvalId) => {
+        const { clientId } = get();
+        if (!clientId) return;
+        try {
+          expectResult(await requestRuntime(clientId, "agent.deny", { approval_id: approvalId }));
+          set((state) => ({ approvals: state.approvals.filter((item) => item.approval_id !== approvalId) }));
+        } catch (error) {
+          set({ lastError: errorMessage(error) });
+        }
+      },
 
-  handleServerMessage: (message) => {
-    if (message.kind === "response") {
-      if (!message.response.ok) {
-        set({ lastError: message.response.error?.message ?? "runtime request failed" });
-      }
-      return;
-    }
-    const { method, params } = message.notification;
-    if (method === "agent.event") {
-      const event = params.event;
-      if (!isHarnessEvent(event)) {
-        set({ lastError: "runtime returned a malformed harness event" });
-        return;
-      }
-      set((state) => ({ events: [...state.events, event].slice(-250) }));
-      if (event.event_type === "assistant.delta") {
-        const text = eventText(event);
-        if (text) {
+      cancel: async () => {
+        const { clientId, activeRunId } = get();
+        if (!clientId || !activeRunId) return;
+        set({ runPhase: "cancelling" });
+        try {
+          expectResult(await requestRuntime(clientId, "agent.cancel", { run_id: activeRunId }));
+        } catch (error) {
+          set({ lastError: errorMessage(error), runPhase: "failed" });
+        }
+      },
+
+      handleServerMessage: (message) => {
+        if (message.kind === "response") {
+          if (!message.response.ok) {
+            set({ lastError: message.response.error?.message ?? "runtime request failed", runPhase: "failed" });
+          }
+          return;
+        }
+        const { method, params } = message.notification;
+        if (method === "agent.event") {
+          const event = params.event;
+          if (!isHarnessEvent(event)) {
+            set({ lastError: "runtime returned a malformed harness event", runPhase: "failed" });
+            return;
+          }
           set((state) => {
-            const last = state.messages[state.messages.length - 1];
-            if (last?.role === "assistant" && last.streaming) {
-              return {
-                messages: [
-                  ...state.messages.slice(0, -1),
-                  { ...last, text: last.text + text, streaming: true },
-                ],
-              };
+            const events = [...state.events, event].slice(-250);
+            let messages = state.messages;
+            if (event.event_type === "user.message" && !messages.some((item) => item.role === "user" && item.text === eventText(event))) {
+              messages = [...messages, { id: event.event_id, role: "user", text: eventText(event), createdAt: event.timestamp }];
             }
+            if (event.event_type === "assistant.delta") {
+              const value = eventText(event);
+              const last = messages[messages.length - 1];
+              messages =
+                last?.role === "assistant" && last.streaming
+                  ? [...messages.slice(0, -1), { ...last, text: last.text + value, streaming: true }]
+                  : [...messages, { id: event.event_id, role: "assistant", text: value, createdAt: event.timestamp, streaming: true }];
+            }
+            if (event.event_type === "assistant.message") {
+              const value = eventText(event);
+              const last = messages[messages.length - 1];
+              messages =
+                last?.role === "assistant" && last.streaming
+                  ? [...messages.slice(0, -1), { ...last, text: value, streaming: false }]
+                  : [...messages, { id: event.event_id, role: "assistant", text: value, createdAt: event.timestamp }];
+            }
+            const terminal = event.event_type === "session.completed";
             return {
-              messages: [
-                ...state.messages,
-                { id: event.event_id, role: "assistant", text, createdAt: Date.now(), streaming: true },
-              ],
+              ...derivedFromEvents(events),
+              messages,
+              activeRunId: terminal ? null : state.activeRunId,
+              runPhase: terminal ? "completed" : state.runPhase === "idle" || state.runPhase === "pending" ? "running" : state.runPhase,
             };
           });
+          return;
         }
-      }
-      if (event.event_type === "assistant.message") {
-        const text = eventText(event) ?? "";
-        set((state) => {
-          const last = state.messages[state.messages.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            return {
-              messages: [...state.messages.slice(0, -1), { ...last, text, streaming: false }],
-            };
+        if (method === "approval.request") {
+          const approvalId = params.approval_id;
+          const tool = params.tool;
+          if (typeof approvalId === "string" && tool && typeof tool === "object") {
+            set((state) => ({
+              approvals: [
+                ...state.approvals.filter((item) => item.approval_id !== approvalId),
+                { approval_id: approvalId, tool: tool as ApprovalRequest["tool"] },
+              ],
+              toolActivity: state.toolActivity.map((activity, index, all) =>
+                index === all.length - 1 && activity.name === (tool as ApprovalRequest["tool"]).name
+                  ? { ...activity, state: "awaiting_approval" }
+                  : activity,
+              ),
+              runPhase: state.runPhase === "pending" ? "running" : state.runPhase,
+            }));
+          } else {
+            set({ lastError: "runtime returned a malformed approval request", runPhase: "failed" });
           }
-          return {
-            messages: [...state.messages, { id: event.event_id, role: "assistant", text, createdAt: Date.now() }],
-          };
-        });
-      }
-      if (event.event_type === "session.completed") {
-        set({ activeRunId: null });
-      }
-      return;
-    }
-    if (method === "approval.request") {
-      const approvalId = params.approval_id;
-      const tool = params.tool;
-      if (typeof approvalId === "string" && tool && typeof tool === "object") {
-        set((state) => ({
-          approvals: [
-            ...state.approvals.filter((item) => item.approval_id !== approvalId),
-            { approval_id: approvalId, tool: tool as ApprovalRequest["tool"] },
-          ],
-        }));
-      } else {
-        set({ lastError: "runtime returned a malformed approval request" });
-      }
-      return;
-    }
-    if (method === "agent.completed") {
-      set({ activeRunId: null, lastError: null });
-      return;
-    }
-    if (method === "agent.failed") {
-      const error = params.error;
-      set({
-        activeRunId: null,
-        lastError: error && typeof error === "object" && "message" in error ? String(error.message) : "agent run failed",
-      });
-    }
-  },
+          return;
+        }
+        if (method === "agent.completed") {
+          set({ activeRunId: null, runPhase: "completed", lastError: null });
+          return;
+        }
+        if (method === "agent.failed") {
+          const error = params.error;
+          const code = error && typeof error === "object" && "code" in error ? String(error.code) : "runtime_error";
+          const messageText =
+            error && typeof error === "object" && "message" in error ? String(error.message) : "agent run failed";
+          set({ activeRunId: null, runPhase: code === "cancelled" ? "cancelled" : "failed", lastError: messageText });
+        }
+      },
     }),
     {
       name: "cogitoai-desktop-ui",
