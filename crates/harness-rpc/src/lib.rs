@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
-use harness_git::{Checkpoint, CheckpointStore};
+use harness_git::{Checkpoint, CheckpointInfo, CheckpointStore, GitError, RestoreReport};
 use harness_models::ModelProvider;
 use harness_policy::Policy;
 use harness_session::{HarnessEvent, Session, SessionStore, SessionSummary};
@@ -89,8 +89,38 @@ impl Runtime {
         &self,
         session_id: &harness_core::SessionId,
         working_directory: &std::path::Path,
-    ) -> Result<Checkpoint, Error> {
+    ) -> Result<Checkpoint, GitError> {
         self.checkpoints.create(session_id, working_directory)
+    }
+
+    pub fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, GitError> {
+        self.checkpoints.list()
+    }
+
+    pub fn inspect_checkpoint(
+        &self,
+        checkpoint_id: &harness_core::CheckpointId,
+    ) -> Result<CheckpointInfo, GitError> {
+        self.checkpoints.inspect(checkpoint_id)
+    }
+
+    pub fn record_checkpoint_change(
+        &self,
+        checkpoint_id: &harness_core::CheckpointId,
+        path: &std::path::Path,
+    ) -> Result<(), GitError> {
+        self.checkpoints.record_harness_change(checkpoint_id, path)
+    }
+
+    pub fn restore_checkpoint(&self, checkpoint: &Checkpoint) -> Result<RestoreReport, GitError> {
+        self.checkpoints.restore(checkpoint)
+    }
+
+    pub fn undo_checkpoint(
+        &self,
+        checkpoint_id: &harness_core::CheckpointId,
+    ) -> Result<RestoreReport, GitError> {
+        self.checkpoints.undo(checkpoint_id)
     }
 
     pub fn verify(&self, request: &VerificationRequest) -> Result<Vec<VerificationReport>, Error> {

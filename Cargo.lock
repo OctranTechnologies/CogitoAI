@@ -282,6 +282,11 @@ name = "harness-git"
 version = "0.1.0"
 dependencies = [
  "harness-core",
+ "harness-session",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

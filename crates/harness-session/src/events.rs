@@ -96,6 +96,8 @@ pub enum EventType {
     FileChanged,
     #[serde(rename = "checkpoint.created")]
     CheckpointCreated,
+    #[serde(rename = "checkpoint.restored")]
+    CheckpointRestored,
     #[serde(rename = "verification.started")]
     VerificationStarted,
     #[serde(rename = "verification.result")]
@@ -190,6 +192,12 @@ pub enum EventPayload {
         checkpoint_id: Id,
         reference: String,
     },
+    #[serde(rename = "checkpoint.restored")]
+    CheckpointRestored {
+        checkpoint_id: Id,
+        restored_files: Vec<PathBuf>,
+        conflicts: Vec<PathBuf>,
+    },
     #[serde(rename = "verification.started")]
     VerificationStarted { commands: Vec<String> },
     #[serde(rename = "verification.result")]
@@ -231,6 +239,7 @@ impl EventPayload {
             Self::PolicyDecision { .. } => EventType::PolicyDecision,
             Self::FileChanged { .. } => EventType::FileChanged,
             Self::CheckpointCreated { .. } => EventType::CheckpointCreated,
+            Self::CheckpointRestored { .. } => EventType::CheckpointRestored,
             Self::VerificationStarted { .. } => EventType::VerificationStarted,
             Self::VerificationResult { .. } => EventType::VerificationResult,
             Self::ContextCompacted { .. } => EventType::ContextCompacted,

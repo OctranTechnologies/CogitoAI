@@ -155,6 +155,32 @@ added behind `ProcessRunner` without changing the agent loop. Windows uses
 `cmd /C` by default and Unix uses `sh -lc`; process-tree cleanup depends on
 available OS process controls.
 
+## Git checkpoints
+
+`harness-git` exposes read-only repository status/diff inspection and
+`ShadowCheckpointStore` for recoverable checkpoints. Checkpoints are external
+JSON snapshots; the harness never commits, stages, resets, or cleans the user’s
+repository automatically.
+
+Create a checkpoint before a mutation, then record each harness-owned path
+after the mutation:
+
+```rust
+let checkpoint = store.create(&session_id, workspace)?;
+fs::write(workspace.join("src/main.rs"), updated_contents)?;
+store.record_harness_change(&checkpoint.id, &workspace.join("src/main.rs"))?;
+let report = store.undo(&checkpoint.id)?;
+```
+
+Undo restores only recorded paths to their checkpoint baseline. It preflights
+recorded paths and aborts without changing anything when current contents no
+longer match the recorded harness result. Unrelated user edits, untracked
+files, staged index state, and unrelated history remain untouched. Files over
+10 MiB, symlinks, and unsupported Git states are not snapshotted. Changes made
+by the harness but not recorded with `record_harness_change` cannot be safely
+attributed or undone; callers must record them immediately after each
+mutation. A conflict is reported rather than resolved automatically.
+
 ## Session storage
 
 `harness-session` persists execution history as portable JSONL. The host chooses

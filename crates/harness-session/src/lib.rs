@@ -428,6 +428,7 @@ pub fn reconstruct_state(
             | EventPayload::ToolFailed { .. } => state.tool_events += 1,
             EventPayload::FileChanged { .. } => state.files_changed += 1,
             EventPayload::CheckpointCreated { .. } => state.checkpoints_created += 1,
+            EventPayload::CheckpointRestored { .. } => {}
             EventPayload::VerificationStarted { .. } => {}
             EventPayload::VerificationResult { .. } => state.verification_results += 1,
             EventPayload::ContextCompacted { .. } => state.context_compactions += 1,

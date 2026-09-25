@@ -8,6 +8,13 @@ description = "Git and checkpoint contracts for the CogitoAI harness"
 
 [dependencies]
 harness-core.workspace = true
+harness-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
