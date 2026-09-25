@@ -1,0 +1,19 @@
+[package]
+name = "harness-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Runtime boundary for external harness clients"
+
+[dependencies]
+harness-core.workspace = true
+harness-models.workspace = true
+harness-policy.workspace = true
+harness-session.workspace = true
+harness-git.workspace = true
+harness-tools.workspace = true
+harness-verification.workspace = true
+
+[lints]
+workspace = true

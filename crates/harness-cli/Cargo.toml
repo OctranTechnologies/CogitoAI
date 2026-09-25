@@ -1,0 +1,14 @@
+[package]
+name = "harness-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line client for the CogitoAI harness"
+
+[dependencies]
+harness-core.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

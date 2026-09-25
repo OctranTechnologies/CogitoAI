@@ -1,0 +1,13 @@
+[package]
+name = "harness-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Model-provider adapters for the CogitoAI harness"
+
+[dependencies]
+harness-core.workspace = true
+
+[lints]
+workspace = true

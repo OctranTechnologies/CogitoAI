@@ -1,0 +1,14 @@
+[package]
+name = "harness-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Filesystem and shell tool contracts for the CogitoAI harness"
+
+[dependencies]
+harness-core.workspace = true
+harness-policy.workspace = true
+
+[lints]
+workspace = true

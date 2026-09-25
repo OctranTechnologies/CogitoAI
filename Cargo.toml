@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+
+[workspace.dependencies]
+harness-core = { path = "crates/harness-core" }
+harness-models = { path = "crates/harness-models" }
+harness-tools = { path = "crates/harness-tools" }
+harness-policy = { path = "crates/harness-policy" }
+harness-session = { path = "crates/harness-session" }
+harness-git = { path = "crates/harness-git" }
+harness-verification = { path = "crates/harness-verification" }
+harness-rpc = { path = "crates/harness-rpc" }
+harness-cli = { path = "crates/harness-cli" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "allow"

@@ -1,0 +1,13 @@
+[package]
+name = "harness-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Git and checkpoint contracts for the CogitoAI harness"
+
+[dependencies]
+harness-core.workspace = true
+
+[lints]
+workspace = true
