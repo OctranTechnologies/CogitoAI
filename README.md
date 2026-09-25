@@ -311,6 +311,28 @@ reconnecting reloads the session list and the runtime remains the source of
 truth. Use Resume on a selected session to rehydrate its persisted conversation
 and event timeline before continuing.
 
+### Code changes and checkpoints
+
+The Changes view adds code-change observability on top of the runtime. It
+lists added, modified, and deleted files with per-file line counts, and opens
+any file in Monaco Editor. Diffs render side-by-side (with an inline toggle)
+and source files render read-only with syntax highlighting; the shell cannot
+edit your files. Monaco is bundled locally, so viewing works with no network
+access.
+
+The checkpoint timeline shows each runtime checkpoint with its ID, timestamp,
+the task that triggered it, and the files it recorded. Restoring a checkpoint
+calls `checkpoint.undo` on the runtime, which applies the existing restore
+safety logic: it reverts only the files that checkpoint recorded, refuses to
+proceed when a file changed since the checkpoint was taken, and leaves every
+other change in the working tree untouched. The desktop never writes to the
+filesystem to undo work. The changes view refreshes from runtime events, so it
+updates after a run finishes and after a restore.
+
+The runtime keeps its own sessions and checkpoints under `.cogito/` inside the
+workspace. Those files are runtime state, not user code, so they are excluded
+from reported code changes.
+
 Frontend and Tauri checks:
 
 ```text

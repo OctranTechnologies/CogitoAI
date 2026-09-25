@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +33,73 @@ pub struct GitStatus {
 pub struct GitDiff {
     pub unstaged: String,
     pub staged: String,
+}
+
+/// Maximum size of a file the desktop may read or diff, in bytes.
+pub const MAX_VIEW_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Path Git treats as "no file" when diffing an untracked file. Windows Git
+/// resolves `/dev/null` to the null device internally, so one constant works
+/// on every platform.
+const NULL_DEVICE: &str = "/dev/null";
+
+/// Directory the harness reserves for its own runtime state (sessions,
+/// checkpoints, and related bookkeeping) inside a user's repository.
+///
+/// These files are runtime internals, not user code, so they must never be
+/// reported as code changes or offered as restorable content.
+pub const RUNTIME_STATE_DIRECTORY: &str = ".cogito";
+
+/// Returns true when a repository-relative path is runtime-owned state rather
+/// than user code.
+pub fn is_runtime_state_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == RUNTIME_STATE_DIRECTORY
+        || normalized.starts_with(&format!("{RUNTIME_STATE_DIRECTORY}/"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+impl FileChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
+/// A read-only view of a worktree file, produced by the runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileView {
+    pub path: String,
+    pub language: String,
+    pub content: String,
+    pub size_bytes: u64,
+    pub is_binary: bool,
+    pub truncated: bool,
+}
+
+/// A read-only before/after view of a single changed file, produced by the runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub language: String,
+    pub kind: FileChangeKind,
+    pub original: String,
+    pub modified: String,
+    pub patch: String,
+    pub additions: usize,
+    pub deletions: usize,
+    pub is_binary: bool,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,6 +152,8 @@ pub enum GitError {
     InvalidPath { path: PathBuf },
     #[error("checkpoint file is too large: {path}")]
     FileTooLarge { path: PathBuf },
+    #[error("file not found: {path}")]
+    FileNotFound { path: PathBuf },
     #[error("restore conflict; no files were changed: {paths:?}")]
     RestoreConflict { paths: Vec<PathBuf> },
     #[error("checkpoint serialization failed: {message}")]
@@ -217,6 +287,215 @@ impl GitClient {
             .filter(|path| !path.is_empty())
             .map(str::to_owned)
             .collect())
+    }
+
+    /// Reads a worktree file for read-only inspection.
+    ///
+    /// The path is always interpreted relative to the repository root; absolute
+    /// paths and `..` traversal are rejected. Files larger than
+    /// [`MAX_VIEW_BYTES`] are truncated rather than rejected so the desktop can
+    /// still show a bounded preview.
+    pub fn read_file(&self, relative: &str) -> Result<FileView, GitError> {
+        let relative = self.validate_relative(relative)?;
+        let absolute = self.root.join(&relative);
+        let metadata = match fs::metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(GitError::FileNotFound {
+                    path: PathBuf::from(relative),
+                })
+            }
+            Err(error) => {
+                return Err(GitError::Io {
+                    message: error.to_string(),
+                })
+            }
+        };
+        if !metadata.is_file() {
+            return Err(GitError::InvalidPath {
+                path: PathBuf::from(relative),
+            });
+        }
+        let bytes = read_capped(&absolute)?;
+        let is_binary = looks_binary(&bytes);
+        Ok(FileView {
+            language: language_for(&relative).to_owned(),
+            content: if is_binary {
+                String::new()
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            },
+            size_bytes: metadata.len(),
+            is_binary,
+            truncated: bytes.len() as u64 >= MAX_VIEW_BYTES,
+            path: relative,
+        })
+    }
+
+    /// Produces a read-only before/after view of one changed file.
+    ///
+    /// `original` is the file content at `HEAD` and `modified` is the current
+    /// worktree content, so the desktop can render a side-by-side diff without
+    /// performing any filesystem or Git work itself. Files outside `HEAD`
+    /// (added) have an empty `original`; files removed from the worktree
+    /// (deleted) have an empty `modified`.
+    pub fn file_change(&self, relative: &str) -> Result<FileChange, GitError> {
+        let relative = self.validate_relative(relative)?;
+        let path = Path::new(&relative).to_string_lossy().replace('\\', "/");
+        let absolute = self.root.join(&relative);
+        let exists_in_head = self.blob_exists(&path)?;
+        let exists_in_worktree = absolute.is_file();
+        let (original, original_truncated) = if exists_in_head {
+            let bytes = self.blob(&path)?;
+            (
+                String::from_utf8_lossy(&bytes).into_owned(),
+                bytes.len() as u64 >= MAX_VIEW_BYTES,
+            )
+        } else {
+            (String::new(), false)
+        };
+        let (modified, modified_truncated) = if exists_in_worktree {
+            let bytes = read_capped(&absolute)?;
+            (
+                String::from_utf8_lossy(&bytes).into_owned(),
+                bytes.len() as u64 >= MAX_VIEW_BYTES,
+            )
+        } else {
+            (String::new(), false)
+        };
+        let kind = match (exists_in_head, exists_in_worktree) {
+            (false, true) => FileChangeKind::Added,
+            (true, false) => FileChangeKind::Deleted,
+            (true, true) => FileChangeKind::Modified,
+            (false, false) => {
+                return Err(GitError::FileNotFound {
+                    path: PathBuf::from(relative),
+                })
+            }
+        };
+        let patch = if exists_in_head {
+            self.head_diff(&path).unwrap_or_default()
+        } else {
+            // Untracked files are invisible to `git diff HEAD`; diff them
+            // against the null device so added files still get a real patch
+            // and accurate line counts.
+            self.no_index_diff(&path).unwrap_or_default()
+        };
+
+        let (additions, deletions) = count_patch_lines(&patch);
+        let is_binary = looks_binary(original.as_bytes()) || looks_binary(modified.as_bytes());
+        Ok(FileChange {
+            path: relative,
+            language: language_for(&path).to_owned(),
+            kind,
+            original: if is_binary { String::new() } else { original },
+            modified: if is_binary { String::new() } else { modified },
+            patch: if is_binary { String::new() } else { patch },
+            additions,
+            deletions,
+            is_binary,
+            truncated: original_truncated || modified_truncated,
+        })
+    }
+
+    fn blob_exists(&self, path: &str) -> Result<bool, GitError> {
+        let output = Command::new("git")
+            .current_dir(&self.root)
+            .args(["cat-file", "-e", &format!("HEAD:{path}")])
+            .output()
+            .map_err(|error| GitError::Command {
+                message: error.to_string(),
+            })?;
+        Ok(output.status.success())
+    }
+
+    fn blob(&self, path: &str) -> Result<Vec<u8>, GitError> {
+        let mut child = Command::new("git")
+            .current_dir(&self.root)
+            .args(["show", &format!("HEAD:{path}")])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| GitError::Command {
+                message: error.to_string(),
+            })?;
+        let mut buffer = Vec::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout
+                .by_ref()
+                .take(MAX_VIEW_BYTES)
+                .read_to_end(&mut buffer);
+        }
+        // The child may still be blocked writing the remainder of a large blob;
+        // drop the pipe by killing it so `wait` cannot deadlock.
+        let _ = child.kill();
+        let _ = child.wait();
+        Ok(buffer)
+    }
+
+    fn head_diff(&self, path: &str) -> Result<String, GitError> {
+        run_git_allow_failure(
+            &self.root,
+            &["diff", "HEAD", "--no-ext-diff", "--no-color", "--", path],
+        )
+    }
+
+    /// Diffs an untracked worktree file against the null device, producing the
+    /// "new file" patch that `git diff HEAD` omits.
+    fn no_index_diff(&self, path: &str) -> Result<String, GitError> {
+        run_git_allow_failure(
+            &self.root,
+            &[
+                "diff",
+                "--no-index",
+                "--no-ext-diff",
+                "--no-color",
+                "--",
+                NULL_DEVICE,
+                path,
+            ],
+        )
+    }
+
+    /// Validates a repository-relative path and rejects traversal attempts.
+    fn validate_relative(&self, relative: &str) -> Result<String, GitError> {
+        let trimmed = relative.trim().replace('\\', "/");
+        if trimmed.is_empty() {
+            return Err(GitError::InvalidPath {
+                path: PathBuf::from(relative),
+            });
+        }
+        if Path::new(&trimmed).is_absolute()
+            || trimmed.contains(':')
+            || trimmed.starts_with('/')
+            || trimmed.starts_with('~')
+        {
+            return Err(GitError::InvalidPath {
+                path: PathBuf::from(relative),
+            });
+        }
+        let mut normalized: Vec<&str> = Vec::new();
+        for component in trimmed.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    return Err(GitError::InvalidPath {
+                        path: PathBuf::from(relative),
+                    })
+                }
+                other => normalized.push(other),
+            }
+        }
+        if normalized.is_empty() {
+            return Err(GitError::InvalidPath {
+                path: PathBuf::from(relative),
+            });
+        }
+        if normalized.first() == Some(&".git") {
+            return Err(GitError::InvalidPath {
+                path: PathBuf::from(relative),
+            });
+        }
+        Ok(normalized.join("/"))
     }
 
     fn relative_path(&self, path: &Path) -> Result<PathBuf, GitError> {
@@ -618,6 +897,113 @@ fn run_git(directory: &Path, args: &[&str]) -> Result<String, GitError> {
     String::from_utf8(output).map_err(|error| GitError::Command {
         message: error.to_string(),
     })
+}
+
+/// Runs git and returns stdout, treating a non-zero exit with output as success.
+///
+/// `git diff` exits with status 1 when differences exist, which is not an error
+/// for a read-only diff request.
+fn run_git_allow_failure(directory: &Path, args: &[&str]) -> Result<String, GitError> {
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .map_err(|error| GitError::Command {
+            message: error.to_string(),
+        })?;
+    if output.status.success() || !output.stdout.is_empty() {
+        return String::from_utf8(output.stdout).map_err(|error| GitError::Command {
+            message: error.to_string(),
+        });
+    }
+    Err(GitError::Command {
+        message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
+}
+
+/// Reads at most [`MAX_VIEW_BYTES`] from the start of a file.
+fn read_capped(path: &Path) -> Result<Vec<u8>, GitError> {
+    let file = fs::File::open(path).map_err(|error| GitError::Io {
+        message: error.to_string(),
+    })?;
+    let mut buffer = Vec::new();
+    file.take(MAX_VIEW_BYTES)
+        .read_to_end(&mut buffer)
+        .map_err(|error| GitError::Io {
+            message: error.to_string(),
+        })?;
+    Ok(buffer)
+}
+
+/// Detects binary content using the same NUL-byte heuristic Git uses.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8000).any(|byte| *byte == 0)
+}
+
+/// Counts added and removed lines in a unified diff, ignoring file headers.
+fn count_patch_lines(patch: &str) -> (usize, usize) {
+    let mut additions = 0;
+    let mut deletions = 0;
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix('+') {
+            if !rest.starts_with("++") {
+                additions += 1;
+            }
+        } else if let Some(rest) = line.strip_prefix('-') {
+            if !rest.starts_with("--") {
+                deletions += 1;
+            }
+        }
+    }
+    (additions, deletions)
+}
+
+/// Maps a path to a Monaco language identifier.
+///
+/// Only identifiers backed by a tokenizer that ships with the desktop bundle are
+/// returned; anything unknown falls back to `plaintext` so the viewer still
+/// renders the file rather than failing.
+fn language_for(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    let extension = name.rsplit_once('.').map(|(_, value)| value).unwrap_or("");
+    match extension {
+        "rs" => "rust",
+        "ts" | "mts" | "cts" | "tsx" => "typescript",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "json" | "jsonc" => "json",
+        "toml" => "ini",
+        "css" => "css",
+        "scss" | "sass" => "scss",
+        "less" => "less",
+        "html" | "htm" | "vue" | "svelte" => "html",
+        "md" | "markdown" => "markdown",
+        "py" => "python",
+        "go" => "go",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
+        "cs" => "csharp",
+        "rb" => "ruby",
+        "php" => "php",
+        "sh" | "bash" | "zsh" => "shell",
+        "ps1" => "powershell",
+        "bat" | "cmd" => "bat",
+        "sql" => "sql",
+        "yml" | "yaml" => "yaml",
+        "xml" | "svg" => "xml",
+        "lua" => "lua",
+        "swift" => "swift",
+        "dart" => "dart",
+        "ex" | "exs" => "elixir",
+        "scala" => "scala",
+        _ => {
+            if name == "dockerfile" {
+                "dockerfile"
+            } else {
+                "plaintext"
+            }
+        }
+    }
 }
 
 fn run_git_optional(directory: &Path, args: &[&str]) -> Result<Option<String>, GitError> {

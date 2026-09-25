@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use harness_agent::{AgentError, AgentTask, ApprovalHandler};
 use harness_core::{discover_workspace, CheckpointId, RunId, SessionId};
-use harness_git::{GitClient, GitError};
+use harness_git::{is_runtime_state_path, GitClient, GitError};
 use harness_session::{EventId, EventSubscriber, EventSubscription, HarnessEvent};
 use harness_tools::{CancellationToken, ToolRequest};
 use serde::Deserialize;
@@ -485,6 +485,8 @@ fn dispatch(request: RpcRequest, state: &Arc<ServerState>, runtime: &Arc<Runtime
         "agent.cancel" => cancel(request.clone(), state),
         "git.status" => git_status(runtime, &request.params),
         "git.diff" => git_diff(runtime, &request.params),
+        "file.read" => file_read(runtime, &request.params),
+        "git.file_diff" => git_file_diff(runtime, &request.params),
         "checkpoint.list" => checkpoint_list(runtime),
         "checkpoint.inspect" => checkpoint_inspect(runtime, &request.params),
         "checkpoint.undo" => checkpoint_undo(runtime, &request.params),
@@ -685,7 +687,20 @@ fn cancel(request: RpcRequest, state: &Arc<ServerState>) -> Result<Value, RpcSer
 
 fn git_status(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
     let client = GitClient::open(&workspace_path(runtime, params)?)?;
-    Ok(serde_json::to_value(client.status()?)?)
+    let mut status = client.status()?;
+    // The harness stores its own sessions and checkpoints inside the repository.
+    // Those are runtime internals, so they are withheld from code-change views
+    // instead of being presented to the user as if they were their own edits.
+    for list in [
+        &mut status.changed_files,
+        &mut status.staged_files,
+        &mut status.unstaged_files,
+        &mut status.untracked_files,
+    ] {
+        list.retain(|path| !is_runtime_state_path(path));
+    }
+    status.is_clean = status.changed_files.is_empty();
+    Ok(serde_json::to_value(status)?)
 }
 
 fn git_diff(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
@@ -696,6 +711,29 @@ fn git_diff(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> 
         |file| client.diff_file(PathBuf::from(file).as_path()),
     )?;
     Ok(serde_json::to_value(diff)?)
+}
+
+/// Reads a worktree file for read-only inspection. The runtime owns all
+/// filesystem access; the desktop never reads files directly.
+fn file_read(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    let client = GitClient::open(&workspace_path(runtime, &json!({}))?)?;
+    let path = relative_file_param(params)?;
+    Ok(serde_json::to_value(client.read_file(&path)?)?)
+}
+
+/// Produces a before/after view of one changed file for diff rendering.
+fn git_file_diff(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    let client = GitClient::open(&workspace_path(runtime, &json!({}))?)?;
+    let path = relative_file_param(params)?;
+    Ok(serde_json::to_value(client.file_change(&path)?)?)
+}
+
+fn relative_file_param(params: &Value) -> Result<String, RpcServerError> {
+    params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| RpcServerError::Runtime("missing path".to_owned()))
 }
 
 fn checkpoint_list(runtime: &Runtime) -> Result<Value, RpcServerError> {

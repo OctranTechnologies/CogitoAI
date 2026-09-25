@@ -276,6 +276,222 @@ fn drives_a_complete_mock_session_through_rpc() {
 }
 
 #[test]
+fn exposes_checkpoints_file_views_and_diffs_and_restores_through_the_runtime() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    // Commit a baseline file so `HEAD` exists and diffs have an "original" side.
+    // `setup` also runs `git init`, but the baseline commit must happen first.
+    std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(root)
+        .status()
+        .unwrap();
+    std::fs::write(root.join("baseline.txt"), "original\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=harness@example.invalid",
+            "-c",
+            "user.name=Harness",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ])
+        .current_dir(root)
+        .status()
+        .unwrap();
+
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "rpc-mock",
+        vec![
+            response(
+                Some((
+                    "write_file",
+                    json!({"path": "baseline.txt", "content": "agent edit\n"}),
+                )),
+                "",
+            ),
+            response(
+                Some((
+                    "write_file",
+                    json!({"path": "created.txt", "content": "new file\n"}),
+                )),
+                "",
+            ),
+            response(None, "edits complete"),
+        ],
+    ));
+    let (runtime, _sessions) = setup(
+        root,
+        ExecutionMode::Normal,
+        provider,
+        Arc::clone(&approvals),
+    );
+    let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
+
+    assert_ok(&client.request("rpc.initialize", json!({})).unwrap());
+    assert_ok(&client.request("workspace.open", json!({})).unwrap());
+    let created = client.request("session.create", json!({})).unwrap();
+    assert_ok(&created);
+    let session_id = created.result.unwrap()["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let accepted = client
+        .request(
+            "agent.send",
+            json!({"task": task(root, Some(SessionId::new(session_id.clone()).unwrap()))}),
+        )
+        .unwrap();
+    assert_ok(&accepted);
+    let mut completed = false;
+    for _ in 0..300 {
+        match client.receive().unwrap() {
+            ServerMessage::Notification(notification)
+                if notification.method == "agent.completed" =>
+            {
+                completed = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(completed, "mock session did not complete");
+
+    // The runtime reports the worktree change.
+    let status = client.request("git.status", json!({})).unwrap();
+    assert_ok(&status);
+    let changed = status.result.unwrap()["changed_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(changed.contains(&"baseline.txt".to_owned()));
+    assert!(changed.contains(&"created.txt".to_owned()));
+    // The runtime's own session/checkpoint files live inside the repository but
+    // must never be reported as user code changes.
+    assert!(
+        !changed.iter().any(|path| path.starts_with(".cogito/")),
+        "runtime state leaked into changed_files: {changed:?}"
+    );
+
+    // An unrelated user edit that the agent never touched.
+    std::fs::write(root.join("unrelated.txt"), "user work\n").unwrap();
+
+    // A checkpoint was recorded for the run, and can be listed and inspected.
+    let checkpoints = client.request("checkpoint.list", json!({})).unwrap();
+    assert_ok(&checkpoints);
+    let listed = checkpoints.result.unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    let checkpoint_id = listed[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(listed[0]["session_id"], session_id);
+    let mut affected = listed[0]["recorded_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    affected.sort();
+    assert_eq!(affected, vec!["baseline.txt", "created.txt"]);
+
+    let inspected = client
+        .request(
+            "checkpoint.inspect",
+            json!({"checkpoint_id": checkpoint_id}),
+        )
+        .unwrap();
+    assert_ok(&inspected);
+
+    // Read-only file view.
+    let read = client
+        .request("file.read", json!({"path": "baseline.txt"}))
+        .unwrap();
+    assert_ok(&read);
+    let read = read.result.unwrap();
+    assert_eq!(read["content"], "agent edit\n");
+    assert_eq!(read["language"], "plaintext");
+
+    // Per-file diff exposes both sides plus line counts for Monaco.
+    let modified = client
+        .request("git.file_diff", json!({"path": "baseline.txt"}))
+        .unwrap();
+    assert_ok(&modified);
+    let modified = modified.result.unwrap();
+    assert_eq!(modified["kind"], "modified");
+    assert_eq!(modified["original"], "original\n");
+    assert_eq!(modified["modified"], "agent edit\n");
+    assert_eq!(modified["additions"], 1);
+    assert_eq!(modified["deletions"], 1);
+
+    let added = client
+        .request("git.file_diff", json!({"path": "created.txt"}))
+        .unwrap();
+    assert_ok(&added);
+    let added = added.result.unwrap();
+    assert_eq!(added["kind"], "added");
+    assert_eq!(added["original"], "");
+    assert_eq!(added["modified"], "new file\n");
+    assert_eq!(added["additions"], 1);
+
+    // Path traversal is rejected at the runtime boundary.
+    let escape = client
+        .request("file.read", json!({"path": "../outside.txt"}))
+        .unwrap();
+    assert!(!escape.ok, "traversal must be rejected");
+
+    // Aggregate diff across the workspace.
+    let aggregate = client.request("git.diff", json!({})).unwrap();
+    assert_ok(&aggregate);
+    assert!(aggregate.result.unwrap()["unstaged"]
+        .as_str()
+        .unwrap()
+        .contains("baseline.txt"));
+
+    // Restore goes through the runtime's own safety logic.
+    let restored = client
+        .request("checkpoint.undo", json!({"checkpoint_id": checkpoint_id}))
+        .unwrap();
+    assert_ok(&restored);
+    let restored = restored.result.unwrap();
+    let mut restored_files = restored["restored_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|path| path.replace('\\', "/"))
+        .map(|path| path.rsplit('/').next().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    restored_files.sort();
+    assert_eq!(restored_files, vec!["baseline.txt", "created.txt"]);
+
+    // The agent's edits were reverted, and unrelated user work survived.
+    assert_eq!(
+        std::fs::read_to_string(root.join("baseline.txt")).unwrap(),
+        "original\n"
+    );
+    assert!(!root.join("created.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("unrelated.txt")).unwrap(),
+        "user work\n"
+    );
+
+    drop(client);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.join().unwrap();
+}
+
+#[test]
 fn approval_requests_are_resolved_by_the_client() {
     let temporary = tempdir().unwrap();
     let root = temporary.path();

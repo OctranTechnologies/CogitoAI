@@ -4,7 +4,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use harness_core::SessionId;
-use harness_git::{CheckpointStore, GitClient, GitError, ShadowCheckpointStore};
+use harness_git::{
+    is_runtime_state_path, CheckpointStore, FileChangeKind, GitClient, GitError,
+    ShadowCheckpointStore,
+};
 use harness_session::{EventBus, EventType};
 use tempfile::tempdir;
 
@@ -198,4 +201,125 @@ fn rejects_paths_outside_checkpoint_repository() {
         .unwrap_err();
 
     assert!(matches!(error, GitError::InvalidPath { .. }));
+}
+
+#[test]
+fn reads_worktree_files_and_classifies_language() {
+    let temporary = repository();
+    let root = temporary.path();
+    fs::write(root.join("lib.rs"), "fn main() {}\n").unwrap();
+    fs::write(root.join("data.json"), "{\"a\":1}\n").unwrap();
+    fs::write(root.join("notes"), "plain\n").unwrap();
+    let client = GitClient::open(root).unwrap();
+
+    let rust = client.read_file("lib.rs").unwrap();
+    assert_eq!(rust.content, "fn main() {}\n");
+    assert_eq!(rust.language, "rust");
+    assert!(!rust.is_binary);
+    assert!(!rust.truncated);
+
+    assert_eq!(client.read_file("data.json").unwrap().language, "json");
+    assert_eq!(client.read_file("notes").unwrap().language, "plaintext");
+}
+
+#[test]
+fn reports_binary_files_without_returning_content() {
+    let temporary = repository();
+    let root = temporary.path();
+    fs::write(root.join("blob.bin"), [0x00u8, 0x01, 0x02, 0x00]).unwrap();
+    let client = GitClient::open(root).unwrap();
+
+    let view = client.read_file("blob.bin").unwrap();
+
+    assert!(view.is_binary);
+    assert!(view.content.is_empty());
+}
+
+#[test]
+fn rejects_traversal_and_absolute_paths_for_file_reads() {
+    let temporary = repository();
+    let client = GitClient::open(temporary.path()).unwrap();
+
+    for path in ["../outside.txt", "nested/../../escape.txt", "/etc/passwd"] {
+        let error = client.read_file(path).unwrap_err();
+        assert!(
+            matches!(error, GitError::InvalidPath { .. }),
+            "expected InvalidPath for {path}, got {error:?}"
+        );
+    }
+    assert!(matches!(
+        client.read_file("missing.txt").unwrap_err(),
+        GitError::FileNotFound { .. }
+    ));
+}
+
+#[test]
+fn classifies_file_changes_as_added_modified_and_deleted() {
+    let temporary = repository();
+    let root = temporary.path();
+    fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+    fs::write(root.join("added.txt"), "new\n").unwrap();
+    fs::remove_file(root.join("other.txt")).unwrap();
+    let client = GitClient::open(root).unwrap();
+
+    let modified = client.file_change("tracked.txt").unwrap();
+    assert_eq!(modified.kind, FileChangeKind::Modified);
+    assert_eq!(modified.original, "base\n");
+    assert_eq!(modified.modified, "changed\n");
+    assert_eq!((modified.additions, modified.deletions), (1, 1));
+    assert!(modified.patch.contains("+changed"));
+    assert!(modified.patch.contains("-base"));
+
+    let added = client.file_change("added.txt").unwrap();
+    assert_eq!(added.kind, FileChangeKind::Added);
+    assert!(added.original.is_empty());
+    assert_eq!(added.modified, "new\n");
+    assert_eq!(added.additions, 1);
+
+    let deleted = client.file_change("other.txt").unwrap();
+    assert_eq!(deleted.kind, FileChangeKind::Deleted);
+    assert_eq!(deleted.original, "other\n");
+    assert!(deleted.modified.is_empty());
+    assert_eq!(deleted.deletions, 1);
+}
+
+#[test]
+fn counts_multiple_hunk_changes_accurately() {
+    let temporary = repository();
+    let root = temporary.path();
+    let mut lines: Vec<String> = (0..40).map(|index| format!("line {index}\n")).collect();
+    fs::write(root.join("wide.txt"), lines.join("")).unwrap();
+    git(root, &["add", "wide.txt"]);
+    git(root, &["commit", "--quiet", "-m", "add wide file"]);
+
+    // Now introduce two edits far enough apart to land in separate hunks.
+    lines[2] = "changed top\n".to_owned();
+    lines[35] = "changed bottom\n".to_owned();
+    fs::write(root.join("wide.txt"), lines.join("")).unwrap();
+    let client = GitClient::open(root).unwrap();
+
+    let change = client.file_change("wide.txt").unwrap();
+
+    assert_eq!(change.additions, 2);
+    assert_eq!(change.deletions, 2);
+    assert!(change.original.contains("line 2\n"));
+    assert!(change.modified.contains("changed top\n"));
+    assert!(!change.modified.contains("line 2\n"));
+}
+
+#[test]
+fn identifies_runtime_state_paths() {
+    assert!(is_runtime_state_path(".cogito"));
+    assert!(is_runtime_state_path(".cogito/sessions/abc.jsonl"));
+    assert!(is_runtime_state_path(
+        ".cogito/checkpoints/checkpoint-1.json"
+    ));
+    assert!(is_runtime_state_path(
+        ".cogito\\checkpoints\\checkpoint-1.json"
+    ));
+
+    assert!(!is_runtime_state_path("src/main.rs"));
+    assert!(!is_runtime_state_path("docs/.cogito-notes.md"));
+    assert!(!is_runtime_state_path(".cogitorc"));
+    assert!(!is_runtime_state_path("src/.cogito/config"));
 }

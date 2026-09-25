@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
@@ -10,6 +10,7 @@ import {
   CircleDot,
   Clock3,
   Code2,
+  FileDiff,
   FolderOpen,
   GitBranch,
   History,
@@ -37,11 +38,23 @@ import {
   type ToolActivity,
   type VerificationActivity,
 } from "./store";
-import type { SessionSummary } from "./lib/rpc";
+import { CheckpointTimeline } from "./components/checkpoint-timeline";
+import type { CheckpointEntry } from "./lib/changes";
+import type { GitStatusSummary, SessionSummary } from "./lib/rpc";
+
+// Monaco and its language tokenizers are a large bundle that are only needed
+// once the user opens the code view, so the changes panel loads on demand and
+// the shell stays responsive on first paint.
+const ChangesPanel = lazy(() =>
+  import("./components/changes-panel").then((module) => ({ default: module.ChangesPanel })),
+);
+
+type CenterView = "conversation" | "changes";
 
 function App() {
   const [address, setAddress] = useState("127.0.0.1:4545");
   const [showContext, setShowContext] = useState(true);
+  const [centerView, setCenterView] = useState<CenterView>("conversation");
   const {
     status,
     clientId,
@@ -58,6 +71,17 @@ function App() {
     composer,
     isLoadingSession,
     lastError,
+    gitStatus,
+    changes,
+    selectedPath,
+    fileChange,
+    fileView,
+    isLoadingChanges,
+    isChangesTruncated,
+    isLoadingFile,
+    checkpoints,
+    restoringCheckpointId,
+    lastRestore,
     connect,
     setWorkspacePath,
     setComposer,
@@ -68,6 +92,10 @@ function App() {
     approve,
     deny,
     cancel,
+    refreshChanges,
+    selectFile,
+    clearSelectedFile,
+    restoreCheckpoint,
     handleServerMessage,
     setRuntimeError,
     markDisconnected,
@@ -136,19 +164,46 @@ function App() {
             canResume={connected && Boolean(activeSessionId)}
             onResume={() => void resumeSession()}
             onCancel={cancel}
+            gitStatus={gitStatus}
+            changeCount={changes.entries.length}
           />
+          <ViewSwitcher
+        view={centerView}
+        onChange={setCenterView}
+        changeCount={changes.entries.length}
+        canRefresh={connected}
+        isRefreshing={isLoadingChanges}
+        onRefresh={() => void refreshChanges()}
+      />
           <div className="flex min-h-0 flex-1">
-            <section className="flex min-w-0 flex-1 flex-col">
-              <MessageStream messages={messages} connected={connected} runPhase={runPhase} />
-              <Composer
-                value={composer}
-                onChange={setComposer}
-                onSubmit={submitMessage}
-                disabled={!connected || running || !workspacePath}
-                running={running}
-                onCancel={cancel}
-              />
-            </section>
+            {centerView === "conversation" ? (
+              <section className="flex min-w-0 flex-1 flex-col">
+                <MessageStream messages={messages} connected={connected} runPhase={runPhase} />
+                <Composer
+                  value={composer}
+                  onChange={setComposer}
+                  onSubmit={submitMessage}
+                  disabled={!connected || running || !workspacePath}
+                  running={running}
+                  onCancel={cancel}
+                />
+              </section>
+            ) : (
+              <Suspense fallback={<PanelLoading label="Loading code view…" />}>
+                <ChangesPanel
+                  entries={changes.entries}
+                  selectedPath={selectedPath}
+                  fileChange={fileChange}
+                  fileView={fileView}
+                  isLoading={isLoadingChanges || isLoadingFile}
+                  isTruncated={isChangesTruncated}
+                  totalChanged={gitStatus?.changed_files.length ?? changes.entries.length}
+                  isGitWorkspace={Boolean(workspace?.repository_root)}
+                  onSelect={(path) => void selectFile(path)}
+                  onClear={clearSelectedFile}
+                />
+              </Suspense>
+            )}
             {showContext ? (
               <ContextPanel
                 tools={toolActivity}
@@ -157,6 +212,11 @@ function App() {
                 approvals={approvals}
                 onApprove={approve}
                 onDeny={deny}
+                checkpoints={checkpoints}
+                restoringId={restoringCheckpointId}
+                lastRestore={lastRestore}
+                restoreDisabled={!connected || running}
+                onRestore={(id) => void restoreCheckpoint(id)}
               />
             ) : null}
           </div>
@@ -167,6 +227,62 @@ function App() {
     </div>
   );
 }
+
+function ViewSwitcher({
+  view,
+  onChange,
+  changeCount,
+  canRefresh,
+  isRefreshing,
+  onRefresh,
+}: {
+  view: CenterView;
+  onChange: (view: CenterView) => void;
+  changeCount: number;
+  canRefresh: boolean;
+  isRefreshing: boolean;
+  onRefresh: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center gap-1 border-b border-ink-800 bg-ink-950/60 px-4 py-1.5" role="tablist" aria-label="Workspace view">
+      <button
+        role="tab"
+        aria-selected={view === "conversation"}
+        className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+          view === "conversation" ? "bg-ink-800 text-ink-100" : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"
+        }`}
+        onClick={() => onChange("conversation")}
+      >
+        <MessageSquare size={12} /> Conversation
+      </button>
+      <button
+        role="tab"
+        aria-selected={view === "changes"}
+        className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+          view === "changes" ? "bg-ink-800 text-ink-100" : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"
+        }`}
+        onClick={() => onChange("changes")}
+      >
+        <FileDiff size={12} /> Changes
+        {changeCount > 0 ? (
+          <span className="rounded bg-ink-700 px-1.5 py-0.5 font-mono text-[9px] text-ink-200">{changeCount}</span>
+        ) : null}
+      </button>
+      {view === "changes" ? (
+        <button
+          className="icon-button ml-auto h-6 w-6"
+          onClick={onRefresh}
+          disabled={!canRefresh || isRefreshing}
+          aria-label="Refresh code changes"
+          title="Re-read code changes from the runtime"
+        >
+          <RotateCcw size={12} className={isRefreshing ? "animate-spin" : ""} />
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 
 function TopBar({
   status,
@@ -323,6 +439,8 @@ function WorkspaceHeader({
   canResume,
   onResume,
   onCancel,
+  gitStatus,
+  changeCount,
 }: {
   workspace: { current_directory: string; repository_root: string | null; languages: string[] } | null;
   session: SessionSummary | undefined;
@@ -332,6 +450,8 @@ function WorkspaceHeader({
   canResume: boolean;
   onResume: () => void;
   onCancel: () => void;
+  gitStatus: GitStatusSummary | null;
+  changeCount: number;
 }) {
   return (
     <div className="flex h-16 shrink-0 items-center justify-between border-b border-ink-800 px-6">
@@ -341,9 +461,13 @@ function WorkspaceHeader({
           <RunBadge phase={runPhase} />
         </div>
         <div className="mt-1 flex items-center gap-3 text-[11px] text-ink-500">
-          <span className="flex items-center gap-1"><GitBranch size={12} />{workspace?.repository_root ? "git workspace" : "local folder"}</span>
+          <span className="flex items-center gap-1">
+            <GitBranch size={12} />
+            {gitStatus?.branch ? gitStatus.branch : workspace?.repository_root ? "git workspace" : "local folder"}
+          </span>
           <span>{workspace?.languages?.length ?? 0} languages</span>
           <span>{session ? `${session.event_count} events` : "new session"}</span>
+          {changeCount > 0 ? <span className="text-signal-400">{changeCount} changed files</span> : null}
         </div>
       </div>
       <div className="flex items-center gap-2">
@@ -476,6 +600,11 @@ function ContextPanel({
   approvals,
   onApprove,
   onDeny,
+  checkpoints,
+  restoringId,
+  lastRestore,
+  restoreDisabled,
+  onRestore,
 }: {
   tools: ToolActivity[];
   verification: VerificationActivity[];
@@ -483,48 +612,65 @@ function ContextPanel({
   approvals: { approval_id: string; tool: { name: string; arguments: Record<string, unknown> } }[];
   onApprove: (id: string) => void;
   onDeny: (id: string) => void;
+  checkpoints: CheckpointEntry[];
+  restoringId: string | null;
+  lastRestore: { checkpoint_id: string; restored_files: string[]; conflicts: string[] } | null;
+  restoreDisabled: boolean;
+  onRestore: (id: string) => void;
 }) {
   return (
     <aside className="hidden w-96 shrink-0 flex-col border-l border-ink-800 bg-ink-900/50 xl:flex">
-      <div className="flex h-16 items-center justify-between border-b border-ink-800 px-4">
+      <div className="flex h-16 shrink-0 items-center justify-between border-b border-ink-800 px-4">
         <div className="flex items-center gap-2"><PanelRight size={15} className="text-ink-500" /><span className="text-xs font-semibold text-ink-200">Runtime context</span></div>
         <span className="mono-label">live</span>
       </div>
-      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-3">
-        {approvals.length > 0 ? (
-          <section className="space-y-2">
-            <p className="mono-label text-warning">Needs approval</p>
-            {approvals.map((approval) => (
-              <div key={approval.approval_id} className="rounded-lg border border-warning/30 bg-warning/5 p-3 shadow-panel">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-ink-100"><ShieldCheck size={14} className="text-warning" />{approval.tool.name}</div>
-                  <span className="mono-label">allow once</span>
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="space-y-5 p-3">
+          {approvals.length > 0 ? (
+            <section className="space-y-2">
+              <p className="mono-label text-warning">Needs approval</p>
+              {approvals.map((approval) => (
+                <div key={approval.approval_id} className="rounded-lg border border-warning/30 bg-warning/5 p-3 shadow-panel">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-ink-100"><ShieldCheck size={14} className="text-warning" />{approval.tool.name}</div>
+                    <span className="mono-label">allow once</span>
+                  </div>
+                  <p className="mt-2 text-[11px] leading-4 text-ink-400">The runtime is waiting for a one-time decision. No permanent policy change will be made.</p>
+                  <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-md bg-ink-950/60 p-2 font-mono text-[10px] leading-4 text-ink-400">{JSON.stringify(approval.tool.arguments, null, 2)}</pre>
+                  <div className="mt-3 flex gap-2">
+                    <button className="primary-button flex-1 justify-center" onClick={() => onApprove(approval.approval_id)}><Check size={13} />Allow once</button>
+                    <button className="quiet-button flex-1 justify-center border-danger/30 text-danger" onClick={() => onDeny(approval.approval_id)}><X size={13} />Deny once</button>
+                  </div>
                 </div>
-                <p className="mt-2 text-[11px] leading-4 text-ink-400">The runtime is waiting for a one-time decision. No permanent policy change will be made.</p>
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-md bg-ink-950/60 p-2 font-mono text-[10px] leading-4 text-ink-400">{JSON.stringify(approval.tool.arguments, null, 2)}</pre>
-                <div className="mt-3 flex gap-2">
-                  <button className="primary-button flex-1 justify-center" onClick={() => onApprove(approval.approval_id)}><Check size={13} />Allow once</button>
-                  <button className="quiet-button flex-1 justify-center border-danger/30 text-danger" onClick={() => onDeny(approval.approval_id)}><X size={13} />Deny once</button>
-                </div>
-              </div>
-            ))}
+              ))}
+            </section>
+          ) : null}
+
+          <section className="flex min-h-0 flex-col">
+            <CheckpointTimeline
+              checkpoints={checkpoints}
+              restoringId={restoringId}
+              lastRestore={lastRestore}
+              disabled={restoreDisabled}
+              onRestore={onRestore}
+            />
           </section>
-        ) : null}
 
-        <section>
-          <div className="mb-2 flex items-center justify-between"><p className="mono-label">Tool activity</p><span className="text-[10px] text-ink-600">{tools.length} calls</span></div>
-          {tools.length === 0 ? <EmptyContext text="Tool calls will appear here." /> : <div className="space-y-1.5">{[...tools].reverse().map((tool) => <ToolActivityCard key={tool.id} tool={tool} />)}</div>}
-        </section>
+          <section>
+            <div className="mb-2 flex items-center justify-between"><p className="mono-label">Tool activity</p><span className="text-[10px] text-ink-600">{tools.length} calls</span></div>
+            {tools.length === 0 ? <EmptyContext text="Tool calls will appear here." /> : <div className="space-y-1.5">{[...tools].reverse().map((tool) => <ToolActivityCard key={tool.id} tool={tool} />)}</div>}
+          </section>
 
-        <section>
-          <div className="mb-2 flex items-center justify-between"><p className="mono-label">Verification</p><span className="text-[10px] text-ink-600">{verification.length} checks</span></div>
-          {verification.length === 0 ? <EmptyContext text="Verification results will appear here." /> : <div className="space-y-1.5">{[...verification].reverse().map((item) => <VerificationCard key={item.id} item={item} />)}</div>}
-        </section>
+          <section>
+            <div className="mb-2 flex items-center justify-between"><p className="mono-label">Verification</p><span className="text-[10px] text-ink-600">{verification.length} checks</span></div>
+            {verification.length === 0 ? <EmptyContext text="Verification results will appear here." /> : <div className="space-y-1.5">{[...verification].reverse().map((item) => <VerificationCard key={item.id} item={item} />)}</div>}
+          </section>
 
-        <section>
-          <div className="mb-2 flex items-center justify-between"><p className="mono-label">Session timeline</p><span className="text-[10px] text-ink-600">chronological</span></div>
-          {timeline.length === 0 ? <EmptyContext text="Session events will appear here." /> : <div className="space-y-0.5">{timeline.map((entry) => <TimelineRow key={entry.id} entry={entry} />)}</div>}
-        </section>
+          <section>
+            <div className="mb-2 flex items-center justify-between"><p className="mono-label">Session timeline</p><span className="text-[10px] text-ink-600">chronological</span></div>
+            {timeline.length === 0 ? <EmptyContext text="Session events will appear here." /> : <div className="space-y-0.5">{timeline.map((entry) => <TimelineRow key={entry.id} entry={entry} />)}</div>}
+          </section>
+        </div>
       </div>
     </aside>
   );
@@ -586,6 +732,15 @@ function TimelineRow({ entry }: { entry: TimelineEntry }) {
 function formatDuration(durationMs: number): string {
   if (durationMs < 1000) return `${durationMs}ms`;
   return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
+function PanelLoading({ label }: { label: string }) {
+  return (
+    <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-[11px] text-ink-500">
+      <LoaderCircle size={13} className="animate-spin" />
+      {label}
+    </div>
+  );
 }
 
 function StatusBar({ status, runPhase, workspacePath, lastError, onClearError }: { status: string; runPhase: RunPhase; workspacePath: string; lastError: string | null; onClearError: () => void }) {

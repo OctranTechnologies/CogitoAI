@@ -63,6 +63,8 @@ pub const METHODS: &[&str] = &[
     "agent.cancel",
     "git.status",
     "git.diff",
+    "file.read",
+    "git.file_diff",
     "checkpoint.list",
     "checkpoint.inspect",
     "checkpoint.undo",

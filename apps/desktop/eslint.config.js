@@ -5,7 +5,9 @@ import reactRefresh from "eslint-plugin-react-refresh";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist", "src-tauri"] },
+  // `vite.config.js`/`.d.ts` and `*.tsbuildinfo` are compiled build artifacts
+  // emitted by `tsc -b`; they are gitignored and must not be linted.
+  { ignores: ["dist", "src-tauri", "vite.config.js", "vite.config.d.ts", "**/*.tsbuildinfo"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

@@ -9,7 +9,11 @@ import {
   RpcTransportError,
   type AgentTask,
   type ApprovalRequest,
+  type CheckpointInfo,
+  type GitDiff,
+  type GitStatusSummary,
   type HarnessEvent,
+  type RestoreReport,
   type RuntimeStatus,
   type ServerMessage,
   type SessionSummary,
@@ -26,8 +30,18 @@ import {
   type ToolActivity,
   type VerificationActivity,
 } from "./lib/events";
+import {
+  deriveCheckpoints,
+  shouldRefreshChanges,
+  summarizeChanges,
+  type ChangeSummary,
+  type CheckpointEntry,
+  type FileChange,
+  type FileView,
+} from "./lib/changes";
 
 export type { ChatMessage, RunPhase, TimelineEntry, ToolActivity, VerificationActivity } from "./lib/events";
+export type { ChangeSummary, CheckpointEntry, FileChange, FileView } from "./lib/changes";
 
 interface SessionInspectReport {
   session: {
@@ -58,6 +72,18 @@ export interface DesktopStore {
   isLoadingWorkspace: boolean;
   isLoadingSession: boolean;
   lastError: string | null;
+  gitStatus: GitStatusSummary | null;
+  changes: ChangeSummary;
+  selectedPath: string | null;
+  fileChange: FileChange | null;
+  fileView: FileView | null;
+  aggregateDiff: GitDiff | null;
+  isLoadingChanges: boolean;
+  isChangesTruncated: boolean;
+  isLoadingFile: boolean;
+  checkpoints: CheckpointEntry[];
+  restoringCheckpointId: string | null;
+  lastRestore: RestoreReport | null;
   connect: (address: string, workspacePath: string) => Promise<void>;
   disconnect: () => Promise<void>;
   setWorkspacePath: (path: string) => void;
@@ -73,10 +99,23 @@ export interface DesktopStore {
   setRuntimeError: (message: string) => void;
   markDisconnected: () => void;
   clearError: () => void;
+  refreshChanges: () => Promise<void>;
+  selectFile: (path: string) => Promise<void>;
+  clearSelectedFile: () => void;
+  restoreCheckpoint: (checkpointId: string) => Promise<void>;
 }
 
 const systemInstructions =
   "You are the CogitoAI coding agent. Follow project instructions and use tools safely.";
+
+/**
+ * Upper bound on per-file diffs requested at once.
+ *
+ * Each file costs the runtime a couple of Git invocations, so an unbounded
+ * request list would make a very dirty repository slow to open. The full file
+ * list is still reported; only the per-file line counts are capped.
+ */
+const MAX_FILE_DIFF_REQUESTS = 120;
 
 function errorMessage(error: unknown): string {
   if (error instanceof RpcTransportError) return error.message;
@@ -127,6 +166,10 @@ function derivedFromEvents(events: HarnessEvent[]) {
   };
 }
 
+function emptyChanges(): ChangeSummary {
+  return summarizeChanges([]);
+}
+
 function emptyRunState() {
   return {
     messages: [] as ChatMessage[],
@@ -162,6 +205,18 @@ export const useDesktopStore = create<DesktopStore>()(
       isLoadingWorkspace: false,
       isLoadingSession: false,
       lastError: null,
+      gitStatus: null,
+      changes: emptyChanges(),
+      selectedPath: null,
+      fileChange: null,
+      fileView: null,
+      aggregateDiff: null,
+      isLoadingChanges: false,
+      isChangesTruncated: false,
+      isLoadingFile: false,
+      checkpoints: [],
+      restoringCheckpointId: null,
+      lastRestore: null,
 
       connect: async (address, workspacePath) => {
         if (get().clientId) await get().disconnect();
@@ -179,6 +234,9 @@ export const useDesktopStore = create<DesktopStore>()(
           if (persistedSession && sessionResult.some((session) => session.id === persistedSession)) {
             await get().resumeSession(persistedSession);
           }
+          // Load existing workspace changes and checkpoints on connect so the
+          // changes panel is populated before any run happens.
+          await get().refreshChanges();
         } catch (error) {
           const clientId = get().clientId;
           if (clientId) await disconnectRuntime(clientId).catch(() => undefined);
@@ -314,6 +372,86 @@ export const useDesktopStore = create<DesktopStore>()(
         }
       },
 
+      refreshChanges: async () => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        set({ isLoadingChanges: true });
+        try {
+          // Git status, the aggregate diff, and the checkpoint list are all
+          // runtime-owned; the desktop only renders what the runtime reports.
+          const [statusResponse, diffResponse, checkpointResponse] = await Promise.all([
+            requestRuntime<GitStatusSummary>(clientId, "git.status", {}),
+            requestRuntime<GitDiff>(clientId, "git.diff", {}),
+            requestRuntime<CheckpointInfo[]>(clientId, "checkpoint.list", {}),
+          ]);
+          const gitStatus = expectResult(statusResponse);
+          const aggregateDiff = expectResult(diffResponse);
+          const checkpoints = expectResult(checkpointResponse);
+
+          // Ask the runtime for a per-file before/after for every changed file.
+          // These are all read-only inspections; the runtime performs no writes.
+          const allPaths = gitStatus.changed_files;
+          const requested = allPaths.slice(0, MAX_FILE_DIFF_REQUESTS);
+          const fileResponses = await Promise.all(
+            requested.map((path) => requestRuntime<FileChange>(clientId, "git.file_diff", { path })),
+          );
+          const fileChanges: FileChange[] = [];
+          for (const response of fileResponses) {
+            if (response.ok && response.result) fileChanges.push(response.result);
+          }
+
+          set({
+            gitStatus,
+            aggregateDiff,
+            changes: summarizeChanges(fileChanges),
+            isChangesTruncated: fileChanges.length < allPaths.length,
+            checkpoints: deriveCheckpoints(checkpoints, get().events),
+            isLoadingChanges: false,
+          });
+        } catch (error) {
+          set({ isLoadingChanges: false, lastError: errorMessage(error) });
+        }
+      },
+
+      selectFile: async (path) => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        set({ isLoadingFile: true, selectedPath: path, fileChange: null, fileView: null });
+        try {
+          // Prefer the diff view; fall back to a plain source view when the
+          // runtime cannot produce a before/after for this file.
+          let change: FileChange | null = null;
+          let view: FileView | null = null;
+          try {
+            change = expectResult(await requestRuntime<FileChange>(clientId, "git.file_diff", { path }));
+          } catch {
+            view = expectResult(await requestRuntime<FileView>(clientId, "file.read", { path }));
+          }
+          set({ fileChange: change, fileView: view, isLoadingFile: false });
+        } catch (error) {
+          set({ isLoadingFile: false, lastError: errorMessage(error) });
+        }
+      },
+
+      clearSelectedFile: () => set({ selectedPath: null, fileChange: null, fileView: null }),
+
+      restoreCheckpoint: async (checkpointId) => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        set({ restoringCheckpointId: checkpointId, lastError: null });
+        try {
+          // Restoration is delegated entirely to the runtime's existing safety
+          // logic; the frontend never touches the filesystem to undo changes.
+          const report = expectResult(
+            await requestRuntime<RestoreReport>(clientId, "checkpoint.undo", { checkpoint_id: checkpointId }),
+          );
+          set({ restoringCheckpointId: null, lastRestore: report });
+          await get().refreshChanges();
+        } catch (error) {
+          set({ restoringCheckpointId: null, lastError: errorMessage(error) });
+        }
+      },
+
       handleServerMessage: (message) => {
         if (message.kind === "response") {
           if (!message.response.ok) {
@@ -358,6 +496,11 @@ export const useDesktopStore = create<DesktopStore>()(
               runPhase: terminal ? "completed" : state.runPhase === "idle" || state.runPhase === "pending" ? "running" : state.runPhase,
             };
           });
+          // Runtime events are the trigger for re-reading git, diff, and
+          // checkpoint state; the frontend never polls the filesystem itself.
+          if (shouldRefreshChanges(event)) {
+            void get().refreshChanges();
+          }
           return;
         }
         if (method === "approval.request") {

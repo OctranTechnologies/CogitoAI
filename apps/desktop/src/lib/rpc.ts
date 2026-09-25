@@ -92,6 +92,38 @@ export interface AgentTask {
   resume_session: string | null;
 }
 
+export interface GitStatusSummary {
+  repository_root: string;
+  branch: string | null;
+  head: string | null;
+  is_clean: boolean;
+  changed_files: string[];
+  staged_files: string[];
+  unstaged_files: string[];
+  untracked_files: string[];
+}
+
+export interface GitDiff {
+  unstaged: string;
+  staged: string;
+}
+
+export interface CheckpointInfo {
+  id: string;
+  session_id: string;
+  working_directory: string;
+  created_at: string;
+  reference: string;
+  baseline_file_count: number;
+  recorded_changes: string[];
+}
+
+export interface RestoreReport {
+  checkpoint_id: string;
+  restored_files: string[];
+  conflicts: string[];
+}
+
 export class RpcTransportError extends Error {
   readonly code: string;
 

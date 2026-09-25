@@ -13,3 +13,4 @@ apps/desktop/.vite
 *.tsbuildinfo
 apps/desktop/vite.config.js
 apps/desktop/vite.config.d.ts
+.cogito
