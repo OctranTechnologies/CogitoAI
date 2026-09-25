@@ -1,0 +1,2 @@
+# CogitoAI
+A coding harness.
