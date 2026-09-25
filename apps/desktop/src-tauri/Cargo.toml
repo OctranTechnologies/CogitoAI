@@ -1,0 +1,22 @@
+[package]
+name = "cogitoai-desktop"
+version = "0.1.0"
+description = "CogitoAI desktop shell"
+authors = ["CogitoAI"]
+edition = "2021"
+license = "MIT"
+rust-version = "1.78"
+
+[lib]
+name = "cogitoai_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+harness-rpc = { path = "../../../crates/harness-rpc" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"

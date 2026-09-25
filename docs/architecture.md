@@ -79,9 +79,11 @@ independent event correlation. A dropped client denies pending approvals and
 cancels the active run. The transport is loopback-only and has no
 authentication or encryption; hosts must not bind it to a public interface.
 
-The desktop client is reserved under `apps/desktop` and is not implemented yet.
-When it is added, it will communicate with the Rust runtime through this
-versioned RPC boundary.
+The desktop shell is under `apps/desktop`. It is implemented with Tauri 2,
+React, TypeScript, Vite, Tailwind, and Zustand. Its Tauri commands own only
+RPC connection plumbing; they do not implement agent logic. The shell connects
+to a running loopback runtime, and session durability remains in the Rust
+JSONL store.
 
 ## Privileged operations and UI clients
 

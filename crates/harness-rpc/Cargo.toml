@@ -8,6 +8,7 @@ description = "Runtime boundary for external harness clients"
 
 [dependencies]
 harness-agent.workspace = true
+harness-context.workspace = true
 harness-core.workspace = true
 harness-models.workspace = true
 harness-policy.workspace = true
@@ -21,7 +22,6 @@ thiserror.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-harness-context.workspace = true
 tempfile = "3"
 
 [lints]

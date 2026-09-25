@@ -2,7 +2,7 @@ pub mod client;
 pub mod protocol;
 pub mod server;
 
-pub use client::{RpcClient, RpcClientError};
+pub use client::{RpcClient, RpcClientError, RpcClientReader, RpcClientWriter};
 pub use protocol::{
     RpcError, RpcNotification, RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION,
 };

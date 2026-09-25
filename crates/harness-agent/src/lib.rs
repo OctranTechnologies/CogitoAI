@@ -418,6 +418,9 @@ impl AgentRunner {
                 Ok(())
             }) {
                 Ok(response) => response,
+                Err(_) if cancellation.is_cancelled() => {
+                    return self.fail(session_id, collector, AgentError::Cancelled);
+                }
                 Err(error) => return self.fail(session_id, collector, AgentError::Model(error)),
             };
             self.flush(&session_id, &collector)?;

@@ -1,0 +1,21 @@
+{
+  "surface": "desktop",
+  "mode": "operate",
+  "direction": "Restrained dark operator console",
+  "tokens": {
+    "ground": "#0b0d10",
+    "surface": "#101318",
+    "surfaceRaised": "#151920",
+    "border": "#1b2029",
+    "text": "#f5f7fa",
+    "textMuted": "#94a0b2",
+    "accent": "#38bdf8",
+    "success": "#5eead4",
+    "warning": "#fbbf24",
+    "danger": "#fb7185"
+  },
+  "typography": {
+    "sans": "ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
+    "mono": "ui-monospace, SFMono-Regular, monospace"
+  }
+}

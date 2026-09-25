@@ -7,7 +7,7 @@ side-effect-free project discovery and configuration loading.
 ## Repository layout
 
 - `crates/`: Rust backend and client crates.
-- `apps/desktop/`: reserved for a Tauri 2 + React + TypeScript desktop client.
+- `apps/desktop/`: Tauri 2 + React + TypeScript desktop shell over `harness-rpc`.
 - `docs/`: architecture and development documentation.
 - `examples/`: small, future-facing usage examples.
 
@@ -268,7 +268,62 @@ build = ["cargo", "build", "--workspace"]
 test = ["cargo", "test", "--workspace"]
 ```
 
-## Local RPC boundary
+## Desktop application
+
+The initial cross-platform desktop shell lives in `apps/desktop`. It uses
+Tauri 2, React, TypeScript, Vite, Tailwind, and Zustand. It is deliberately a
+thin client: React owns UI/session state, Tauri commands only bridge the
+versioned `harness-rpc` TCP protocol, and the Rust runtime remains the sole
+owner of agent execution, tools, policy, approvals, verification, checkpoints,
+and durable sessions.
+
+Prerequisites:
+
+- Rust 1.78 or newer and the Rust target required by Tauri for your platform.
+- Node.js 20 or newer and pnpm 10 or newer.
+- Windows: Microsoft WebView2 Runtime and Visual Studio Build Tools with the
+  desktop C++ workload. macOS: Xcode command-line tools. Linux: the WebKitGTK
+  development packages required by Tauri 2.
+- A running CogitoAI RPC runtime. The desktop does not start or own the runtime
+  process.
+
+Install and run the frontend/Tauri shell:
+
+```text
+cd apps/desktop
+pnpm install
+pnpm tauri dev
+```
+
+For a local mock runtime, use the development binary from another terminal at
+the workspace root:
+
+```text
+cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+```
+
+In the desktop shell, enter the runtime address and a repository path, then
+select Connect. The shell can create/resume sessions, send messages, stream
+runtime events, approve or deny tools, cancel runs, and inspect the contextual
+runtime panel. Closing and reopening the window does not delete or corrupt an
+active session: reconnecting reloads the session list and the runtime remains
+the source of truth.
+
+Frontend and Tauri checks:
+
+```text
+cd apps/desktop
+pnpm typecheck
+pnpm lint
+pnpm test
+pnpm build
+pnpm tauri build --debug
+```
+
+The production host is expected to embed `RpcServer` or start
+`cogito-rpc-dev` for local development. The v0 transport is loopback-only and
+has no authentication or encryption; do not bind it to a public interface.
+
 
 `harness-rpc` provides a versioned, newline-delimited JSON protocol over a
 loopback TCP socket. `RpcServer` binds to `127.0.0.1`; `RpcClient` can connect
