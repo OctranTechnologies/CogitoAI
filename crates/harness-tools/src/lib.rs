@@ -1,16 +1,26 @@
+mod filesystem;
+
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-use harness_core::Error;
+use harness_core::{Error, Id, SessionId};
 use harness_policy::{authorize, Permission, Policy};
+use harness_session::{EventBus, EventPayload, HarnessEvent};
+use serde::{Deserialize, Serialize};
+use thiserror::Error as ThisError;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+pub use filesystem::{
+    ApplyPatchTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, WriteFileTool,
+};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolRequest {
     pub name: String,
-    pub arguments: BTreeMap<String, String>,
+    pub arguments: serde_json::Value,
 }
 
 impl ToolRequest {
-    pub fn new(name: impl Into<String>, arguments: BTreeMap<String, String>) -> Self {
+    pub fn new(name: impl Into<String>, arguments: serde_json::Value) -> Self {
         Self {
             name: name.into(),
             arguments,
@@ -18,22 +28,86 @@ impl ToolRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub arguments_schema: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub output: String,
-    pub metadata: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+    pub changed_files: Vec<PathBuf>,
+    pub truncated: bool,
+}
+
+impl ToolResult {
+    pub fn new(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            metadata: BTreeMap::new(),
+            changed_files: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+#[derive(Debug, ThisError)]
+pub enum ToolError {
+    #[error("invalid arguments for {tool}: {message}")]
+    InvalidArguments { tool: String, message: String },
+    #[error("path is outside the workspace: {path}")]
+    PathOutsideWorkspace { path: PathBuf },
+    #[error("path does not exist: {path}")]
+    NotFound { path: PathBuf },
+    #[error("path is not a file: {path}")]
+    NotFile { path: PathBuf },
+    #[error("path is not a directory: {path}")]
+    NotDirectory { path: PathBuf },
+    #[error("file is binary and cannot be processed: {path}")]
+    BinaryFile { path: PathBuf },
+    #[error("file exceeds the {limit}-byte limit: {path}")]
+    FileTooLarge { path: PathBuf, limit: u64 },
+    #[error("patch context did not match exactly once: {path}")]
+    PatchConflict { path: PathBuf },
+    #[error("no matches found")]
+    NoMatches,
+    #[error("filesystem operation {operation} failed: {message}")]
+    Io { operation: String, message: String },
 }
 
 pub struct ToolContext<'a> {
     pub policy: &'a dyn Policy,
     pub working_directory: &'a std::path::Path,
+    pub event_bus: Option<&'a EventBus>,
+    pub session_id: Option<&'a SessionId>,
+    pub correlation_id: Option<&'a Id>,
+}
+
+impl ToolContext<'_> {
+    pub fn emit(&self, payload: EventPayload) {
+        let (Some(event_bus), Some(session_id)) = (self.event_bus, self.session_id) else {
+            return;
+        };
+        event_bus.publish(&HarnessEvent::new(
+            session_id.clone(),
+            payload,
+            None,
+            self.correlation_id.cloned(),
+        ));
+    }
 }
 
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &str;
+    fn spec(&self) -> ToolSpec;
     fn required_permission(&self) -> Permission;
-    fn execute(&self, context: &ToolContext<'_>, request: ToolRequest)
-        -> Result<ToolResult, Error>;
+    fn execute(
+        &self,
+        context: &ToolContext<'_>,
+        request: ToolRequest,
+    ) -> Result<ToolResult, ToolError>;
 }
 
 #[derive(Default)]
@@ -46,6 +120,17 @@ impl ToolRegistry {
         Self::default()
     }
 
+    pub fn with_workspace_tools() -> Self {
+        let mut registry = Self::new();
+        registry.register(Box::new(ReadFileTool));
+        registry.register(Box::new(WriteFileTool));
+        registry.register(Box::new(ApplyPatchTool));
+        registry.register(Box::new(ListDirectoryTool));
+        registry.register(Box::new(GlobTool));
+        registry.register(Box::new(GrepTool));
+        registry
+    }
+
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
     }
@@ -55,19 +140,84 @@ impl ToolRegistry {
         context: &ToolContext<'_>,
         request: ToolRequest,
     ) -> Result<ToolResult, Error> {
-        let tool = self
-            .tools
-            .iter()
-            .find(|tool| tool.name() == request.name)
-            .ok_or_else(|| Error::Tool {
-                tool: request.name.clone(),
+        let tool_name = request.name.clone();
+        context.emit(EventPayload::ToolRequested {
+            tool: tool_name.clone(),
+            arguments: event_arguments(&request.arguments),
+        });
+        let Some(tool) = self.tools.iter().find(|tool| tool.spec().name == tool_name) else {
+            let error = Error::Tool {
+                tool: tool_name.clone(),
                 message: "tool is not registered".to_owned(),
-            })?;
-        authorize(context.policy, tool.required_permission())?;
-        tool.execute(context, request)
+            };
+            context.emit(EventPayload::ToolFailed {
+                tool: tool_name,
+                error: error.to_string(),
+            });
+            return Err(error);
+        };
+        if let Err(error) = authorize(context.policy, tool.required_permission()) {
+            context.emit(EventPayload::ToolDenied {
+                tool: tool_name.clone(),
+                reason: error.to_string(),
+            });
+            return Err(error);
+        }
+        context.emit(EventPayload::ToolApproved {
+            tool: tool_name.clone(),
+            reason: None,
+        });
+        context.emit(EventPayload::ToolStarted {
+            tool: tool_name.clone(),
+        });
+        let result = tool.execute(context, request);
+        match result {
+            Ok(result) => {
+                context.emit(EventPayload::ToolOutput {
+                    tool: tool_name.clone(),
+                    output: concise_event_value(&result.output),
+                });
+                context.emit(EventPayload::ToolCompleted { tool: tool_name });
+                Ok(result)
+            }
+            Err(error) => {
+                context.emit(EventPayload::ToolFailed {
+                    tool: tool_name,
+                    error: error.to_string(),
+                });
+                Err(Error::Tool {
+                    tool: tool.spec().name,
+                    message: error.to_string(),
+                })
+            }
+        }
     }
 
-    pub fn names(&self) -> Vec<&str> {
-        self.tools.iter().map(|tool| tool.name()).collect()
+    pub fn names(&self) -> Vec<String> {
+        self.tools.iter().map(|tool| tool.spec().name).collect()
     }
+}
+
+fn event_arguments(arguments: &serde_json::Value) -> BTreeMap<String, String> {
+    arguments
+        .as_object()
+        .map(|arguments| {
+            arguments
+                .iter()
+                .map(|(name, value)| (name.clone(), concise_event_value(&value.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn concise_event_value(value: &str) -> String {
+    const MAX_EVENT_VALUE_BYTES: usize = 2_048;
+    if value.len() <= MAX_EVENT_VALUE_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_EVENT_VALUE_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &value[..end])
 }

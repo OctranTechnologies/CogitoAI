@@ -51,6 +51,9 @@ impl Runtime {
         let context = ToolContext {
             policy: self.policy.as_ref(),
             working_directory,
+            event_bus: None,
+            session_id: None,
+            correlation_id: None,
         };
         self.tools.execute(&context, request)
     }

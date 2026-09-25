@@ -9,6 +9,15 @@ description = "Filesystem and shell tool contracts for the CogitoAI harness"
 [dependencies]
 harness-core.workspace = true
 harness-policy.workspace = true
+harness-session.workspace = true
+globset.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

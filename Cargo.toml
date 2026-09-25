@@ -22,11 +22,14 @@ harness-rpc = { path = "crates/harness-rpc" }
 harness-cli = { path = "crates/harness-cli" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+globset = "0.4"
+regex = "1.11"
 thiserror = "2.0"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
+ureq = { version = "2.12", features = ["json"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

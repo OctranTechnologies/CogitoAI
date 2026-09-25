@@ -35,6 +35,15 @@ pub trait Policy: Send + Sync {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DenyAllPolicy;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AllowAllPolicy;
+
+impl Policy for AllowAllPolicy {
+    fn check(&self, _permission: Permission) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+}
+
 impl Policy for DenyAllPolicy {
     fn check(&self, _permission: Permission) -> PolicyDecision {
         PolicyDecision::Deny

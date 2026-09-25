@@ -61,6 +61,59 @@ does not yet expose a completed agent runtime.
 The desktop application is not scaffolded or runnable yet. Its future setup and
 run commands will be added here when the Tauri application exists.
 
+## Model providers
+
+The model boundary is provider-neutral. `harness-models` defines messages,
+content blocks, tool definitions/calls, streaming deltas, usage, finish
+reasons, capabilities, and provider errors without exposing provider request
+types. The deterministic mock provider is the default; the OpenAI adapter is a
+real implementation using `ureq` and an environment-provided API key.
+
+Inspect the selected model and capabilities:
+
+```text
+cargo run -p harness-cli -- model-info
+cargo run -p harness-cli -- --model-provider mock --model test-model model-info
+```
+
+Ask the mock provider, optionally streaming:
+
+```text
+cargo run -p harness-cli -- ask "hello"
+cargo run -p harness-cli -- ask --stream "hello"
+```
+
+For OpenAI, set credentials without placing them in project files:
+
+```text
+$env:OPENAI_API_KEY="<your-key>"
+$env:COGITO_MODEL_PROVIDER="openai"
+$env:COGITO_MODEL="gpt-4o-mini"
+cargo run -p harness-cli -- ask "Summarize this project"
+```
+
+On POSIX shells, use `export OPENAI_API_KEY=...` and equivalent
+`COGITO_MODEL_*` variables. The supported environment settings are
+`COGITO_MODEL_PROVIDER`, `COGITO_MODEL`, `COGITO_MODEL_API_KEY_ENV`, and
+`COGITO_MODEL_BASE_URL`; CLI `--model-provider` and `--model` flags override
+environment selection. `COGITO_MODEL_BASE_URL` can target an OpenAI-compatible
+endpoint. API keys are read only at runtime, are not serialized by the model
+configuration or event types, and are never written to session JSONL.
+
+## Filesystem tools
+
+`harness-tools` exposes a common JSON-schema-based `Tool` contract and the
+initial safe tools: `read_file`, `write_file`, `apply_patch`, `list_directory`,
+`glob`, and `grep`. Invoke them through `ToolRegistry`; the registry checks
+policy and emits `tool.requested`, `tool.approved`/`tool.denied`,
+`tool.started`, `tool.output`, and `tool.completed`/`tool.failed` events.
+
+All paths are relative to the supplied workspace and are canonicalized before
+use. Absolute paths, traversal, and symlink escapes are rejected. Text files
+are limited to 256 KiB, directory/search results are bounded and concise, and
+`apply_patch` requires exactly one matching `old_text` context before writing.
+Binary files are rejected rather than returned as model input.
+
 ## Session storage
 
 `harness-session` persists execution history as portable JSONL. The host chooses
