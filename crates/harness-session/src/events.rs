@@ -82,6 +82,14 @@ pub enum EventType {
     ToolCompleted,
     #[serde(rename = "tool.failed")]
     ToolFailed,
+    #[serde(rename = "process.started")]
+    ProcessStarted,
+    #[serde(rename = "process.stdout")]
+    ProcessStdout,
+    #[serde(rename = "process.stderr")]
+    ProcessStderr,
+    #[serde(rename = "process.exited")]
+    ProcessExited,
     #[serde(rename = "file.changed")]
     FileChanged,
     #[serde(rename = "checkpoint.created")]
@@ -148,6 +156,22 @@ pub enum EventPayload {
     ToolCompleted { tool: String },
     #[serde(rename = "tool.failed")]
     ToolFailed { tool: String, error: String },
+    #[serde(rename = "process.started")]
+    ProcessStarted {
+        command: String,
+        working_directory: PathBuf,
+        timeout_ms: u64,
+    },
+    #[serde(rename = "process.stdout")]
+    ProcessStdout { chunk: String },
+    #[serde(rename = "process.stderr")]
+    ProcessStderr { chunk: String },
+    #[serde(rename = "process.exited")]
+    ProcessExited {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+    },
     #[serde(rename = "file.changed")]
     FileChanged { path: PathBuf, change: FileChange },
     #[serde(rename = "checkpoint.created")]
@@ -189,6 +213,10 @@ impl EventPayload {
             Self::ToolOutput { .. } => EventType::ToolOutput,
             Self::ToolCompleted { .. } => EventType::ToolCompleted,
             Self::ToolFailed { .. } => EventType::ToolFailed,
+            Self::ProcessStarted { .. } => EventType::ProcessStarted,
+            Self::ProcessStdout { .. } => EventType::ProcessStdout,
+            Self::ProcessStderr { .. } => EventType::ProcessStderr,
+            Self::ProcessExited { .. } => EventType::ProcessExited,
             Self::FileChanged { .. } => EventType::FileChanged,
             Self::CheckpointCreated { .. } => EventType::CheckpointCreated,
             Self::VerificationStarted { .. } => EventType::VerificationStarted,

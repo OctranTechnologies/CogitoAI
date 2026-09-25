@@ -114,6 +114,26 @@ are limited to 256 KiB, directory/search results are bounded and concise, and
 `apply_patch` requires exactly one matching `old_text` context before writing.
 Binary files are rejected rather than returned as model input.
 
+## Shell execution
+
+The `shell` tool runs explicitly approved commands through a replaceable
+`ProcessRunner`; the current implementation uses the platform shell. The
+command is selected through the `shell` argument (`auto`, `bash`, `sh`, or
+`cmd`), with `working_directory` constrained to the workspace. `timeout_ms`
+defaults to 30 seconds and is capped at 10 minutes. Captured stdout/stderr are
+bounded to 1 MiB by default/request limits, streamed to the caller, and
+reported with exit status.
+
+`ShellTool` exposes a `CancellationToken`; cancellation and timeout paths
+terminate the child and best-effort process tree, then join output readers.
+There is no auto-approval: the registry requires
+`Permission::ExecuteCommand` policy approval for every shell invocation.
+Commands still run with the host account’s OS permissions, so workspace path
+validation is not a sandbox; Docker, SSH, and remote sandbox runners can be
+added behind `ProcessRunner` without changing the agent loop. Windows uses
+`cmd /C` by default and Unix uses `sh -lc`; process-tree cleanup depends on
+available OS process controls.
+
 ## Session storage
 
 `harness-session` persists execution history as portable JSONL. The host chooses

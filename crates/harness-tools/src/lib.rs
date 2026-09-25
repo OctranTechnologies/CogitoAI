@@ -1,4 +1,5 @@
 mod filesystem;
+mod process;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -10,7 +11,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
 pub use filesystem::{
-    ApplyPatchTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, WriteFileTool,
+    ApplyPatchTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ShellTool, WriteFileTool,
+};
+pub use process::{
+    CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
+    ProcessResult, ProcessRunner,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,6 +81,8 @@ pub enum ToolError {
     NoMatches,
     #[error("filesystem operation {operation} failed: {message}")]
     Io { operation: String, message: String },
+    #[error("process execution failed: {message}")]
+    Process { message: String },
 }
 
 pub struct ToolContext<'a> {
@@ -128,6 +135,7 @@ impl ToolRegistry {
         registry.register(Box::new(ListDirectoryTool));
         registry.register(Box::new(GlobTool));
         registry.register(Box::new(GrepTool));
+        registry.register(Box::new(ShellTool::default()));
         registry
     }
 

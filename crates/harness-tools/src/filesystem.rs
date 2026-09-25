@@ -1,17 +1,158 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use globset::Glob;
 use harness_policy::Permission;
 use regex::RegexBuilder;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolContext, ToolError, ToolRequest, ToolResult, ToolSpec};
+use super::{
+    CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
+    ProcessRunner, Tool, ToolContext, ToolError, ToolRequest, ToolResult, ToolSpec,
+};
 
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_RESULTS: usize = 200;
 const MAX_SCAN_FILES: usize = 20_000;
 const MAX_SCAN_DEPTH: usize = 16;
+
+pub struct ShellTool {
+    runner: Arc<dyn ProcessRunner>,
+    cancellation: CancellationToken,
+}
+
+impl Default for ShellTool {
+    fn default() -> Self {
+        Self {
+            runner: Arc::new(LocalProcessRunner),
+            cancellation: CancellationToken::new(),
+        }
+    }
+}
+
+impl ShellTool {
+    pub fn new(runner: Arc<dyn ProcessRunner>, cancellation: CancellationToken) -> Self {
+        Self {
+            runner,
+            cancellation,
+        }
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+impl Tool for ShellTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "shell".to_owned(),
+            description: "Run an explicitly approved command in the workspace shell".to_owned(),
+            arguments_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "minLength": 1 },
+                    "shell": { "type": "string", "enum": ["auto", "bash", "sh", "cmd"] },
+                    "working_directory": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000 },
+                    "max_output_bytes": { "type": "integer", "minimum": 0, "maximum": 1048576 }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::ExecuteCommand
+    }
+
+    fn execute(
+        &self,
+        context: &ToolContext<'_>,
+        request: ToolRequest,
+    ) -> Result<ToolResult, ToolError> {
+        let command_text = required_string(&request, "command", "shell")?;
+        let shell = optional_string(&request, "shell", "auto")?.to_ascii_lowercase();
+        let (program, args) = shell_invocation(&shell, &command_text)?;
+        let working_directory = optional_string(&request, "working_directory", ".")?;
+        let (_root, working_directory) = resolve_existing(context, &working_directory, "shell")?;
+        let timeout_ms = optional_u64(&request, "timeout_ms", 30_000, 1, 600_000, "shell")?;
+        let max_output_bytes = optional_usize(
+            &request,
+            "max_output_bytes",
+            64 * 1024,
+            0,
+            1024 * 1024,
+            "shell",
+        )?;
+        let event_working_directory = working_directory.clone();
+        let request = ProcessRequest {
+            program: program.to_owned(),
+            args,
+            working_directory,
+            timeout: Duration::from_millis(timeout_ms),
+            max_output_bytes,
+        };
+        let result = self
+            .runner
+            .execute(request, &self.cancellation, &mut |event| {
+                emit_process_event(
+                    context,
+                    &event,
+                    &command_text,
+                    &event_working_directory,
+                    timeout_ms,
+                );
+                Ok(())
+            })
+            .map_err(|error: ProcessError| ToolError::Process {
+                message: error.to_string(),
+            })?;
+        let mut output = String::new();
+        if !result.stdout.is_empty() {
+            output.push_str("stdout:\n");
+            output.push_str(&result.stdout);
+        }
+        if !result.stderr.is_empty() {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str("stderr:\n");
+            output.push_str(&result.stderr);
+        }
+        if result.timed_out {
+            output.push_str("\nprocess timed out");
+        } else if result.cancelled {
+            output.push_str("\nprocess cancelled");
+        }
+        let mut tool_result = ToolResult::new(output);
+        tool_result
+            .metadata
+            .insert("exit_code".to_owned(), json!(result.exit_code));
+        tool_result
+            .metadata
+            .insert("success".to_owned(), json!(result.success));
+        tool_result
+            .metadata
+            .insert("timed_out".to_owned(), json!(result.timed_out));
+        tool_result
+            .metadata
+            .insert("cancelled".to_owned(), json!(result.cancelled));
+        tool_result
+            .metadata
+            .insert("duration_ms".to_owned(), json!(result.duration_ms));
+        tool_result
+            .metadata
+            .insert("stdout_bytes".to_owned(), json!(result.stdout.len()));
+        tool_result
+            .metadata
+            .insert("stderr_bytes".to_owned(), json!(result.stderr.len()));
+        Ok(tool_result)
+    }
+}
 
 pub struct ReadFileTool;
 
@@ -393,6 +534,118 @@ impl Tool for GrepTool {
         result.truncated = truncated;
         Ok(result)
     }
+}
+
+fn shell_invocation(shell: &str, command: &str) -> Result<(&'static str, Vec<String>), ToolError> {
+    match shell {
+        "auto" => {
+            #[cfg(windows)]
+            {
+                Ok(("cmd", vec!["/C".to_owned(), command.to_owned()]))
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(("sh", vec!["-lc".to_owned(), command.to_owned()]))
+            }
+        }
+        "bash" => Ok(("bash", vec!["-lc".to_owned(), command.to_owned()])),
+        "sh" => Ok(("sh", vec!["-lc".to_owned(), command.to_owned()])),
+        "cmd" => Ok(("cmd", vec!["/C".to_owned(), command.to_owned()])),
+        _ => Err(invalid_arguments(
+            "shell",
+            "shell must be one of auto, bash, sh, or cmd",
+        )),
+    }
+}
+
+fn emit_process_event(
+    context: &ToolContext<'_>,
+    event: &ProcessEvent,
+    command: &str,
+    working_directory: &Path,
+    timeout_ms: u64,
+) {
+    match event {
+        ProcessEvent::Started { .. } => {
+            context.emit(harness_session::EventPayload::ProcessStarted {
+                command: command.to_owned(),
+                working_directory: working_directory.to_path_buf(),
+                timeout_ms,
+            })
+        }
+        ProcessEvent::Stdout { chunk } => {
+            context.emit(harness_session::EventPayload::ProcessStdout {
+                chunk: truncate_event(chunk),
+            })
+        }
+        ProcessEvent::Stderr { chunk } => {
+            context.emit(harness_session::EventPayload::ProcessStderr {
+                chunk: truncate_event(chunk),
+            })
+        }
+        ProcessEvent::Exited { result } => {
+            context.emit(harness_session::EventPayload::ProcessExited {
+                exit_code: result.exit_code,
+                timed_out: result.timed_out,
+                cancelled: result.cancelled,
+            })
+        }
+    }
+}
+
+fn optional_u64(
+    request: &ToolRequest,
+    key: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+    tool: &str,
+) -> Result<u64, ToolError> {
+    request.arguments.get(key).map_or(Ok(default), |value| {
+        value
+            .as_u64()
+            .filter(|value| (minimum..=maximum).contains(value))
+            .ok_or_else(|| {
+                invalid_arguments(
+                    tool,
+                    &format!("{key} must be between {minimum} and {maximum}"),
+                )
+            })
+    })
+}
+
+fn optional_usize(
+    request: &ToolRequest,
+    key: &str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+    tool: &str,
+) -> Result<usize, ToolError> {
+    request.arguments.get(key).map_or(Ok(default), |value| {
+        value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (minimum..=maximum).contains(value))
+            .ok_or_else(|| {
+                invalid_arguments(
+                    tool,
+                    &format!("{key} must be between {minimum} and {maximum}"),
+                )
+            })
+    })
+}
+
+fn truncate_event(value: &str) -> String {
+    const MAX_EVENT_BYTES: usize = 2_048;
+    if value.len() <= MAX_EVENT_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_EVENT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &value[..end])
 }
 
 fn required_path(request: &ToolRequest, tool: &str) -> Result<String, ToolError> {

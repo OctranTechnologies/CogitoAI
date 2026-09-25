@@ -256,7 +256,8 @@ fn emits_file_change_lifecycle_events() {
             "apply_patch",
             "list_directory",
             "glob",
-            "grep"
+            "grep",
+            "shell"
         ]
     );
 }

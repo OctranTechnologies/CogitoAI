@@ -440,6 +440,10 @@ pub fn reconstruct_state(
                 terminal = true;
             }
             EventPayload::ModelRequested { .. } | EventPayload::ModelResponse { .. } => {}
+            EventPayload::ProcessStarted { .. }
+            | EventPayload::ProcessStdout { .. }
+            | EventPayload::ProcessStderr { .. }
+            | EventPayload::ProcessExited { .. } => {}
         }
         state.last_event_id = Some(event.event_id.clone());
     }
