@@ -226,6 +226,10 @@ impl ToolRegistry {
         }
     }
 
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        self.tools.iter().map(|tool| tool.spec()).collect()
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.tools.iter().map(|tool| tool.spec().name).collect()
     }

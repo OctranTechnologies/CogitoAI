@@ -411,6 +411,7 @@ pub fn reconstruct_state(
         }
         match &event.payload {
             EventPayload::SessionStarted { .. } => {}
+            EventPayload::AssistantDelta { .. } => {}
             EventPayload::UserMessage { text } => state.messages.push(ConversationMessage {
                 role: MessageRole::User,
                 text: text.clone(),

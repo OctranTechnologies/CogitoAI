@@ -1,10 +1,18 @@
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use harness_agent::{AgentLimits, AgentRunner, AgentTask, ApprovalHandler};
+use harness_context::{ContextBuilder, WorkspaceMetadata};
 use harness_core::{discover_workspace, init_logging, HarnessConfig};
+use harness_git::GitClient;
 use harness_models::{
     provider_from_config, Message, ModelConfig, ModelRequest, ProviderError, StreamDelta,
 };
+use harness_policy::{ExecutionMode, Policy, PolicyEngine};
+use harness_session::{EventBus, JsonlSessionStore};
+use harness_tools::{CancellationToken, ToolRegistry};
 use serde_json::Value;
 
 #[derive(Debug, Parser)]
@@ -36,6 +44,13 @@ enum Command {
         stream: bool,
     },
     ModelInfo,
+    Agent {
+        task: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value = ".cogito/sessions")]
+        session_root: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,6 +66,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Inspect { path, json }) => inspect(path, json),
         Some(Command::Ask { ref prompt, stream }) => ask(&cli, prompt, stream),
         Some(Command::ModelInfo) => model_info(&cli),
+        Some(Command::Agent {
+            ref task,
+            ref path,
+            ref session_root,
+        }) => run_agent(&cli, task.clone(), path.clone(), session_root.clone()),
         None => {
             println!(
                 "CogitoAI harness workspace: {}",
@@ -127,6 +147,104 @@ fn model_info(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         serde_json::to_string_pretty(&provider.capabilities())?
     );
     Ok(())
+}
+
+fn run_agent(
+    cli: &Cli,
+    task: String,
+    path: PathBuf,
+    session_root: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let description = discover_workspace(&path)?;
+    let model_config = model_config(cli)?;
+    let provider = provider_from_config(&model_config)?;
+    let provider: Arc<dyn harness_models::ModelProvider> = Arc::from(provider);
+    let policy: Arc<dyn Policy> = if path.join(".agent/config.toml").is_file() {
+        Arc::new(PolicyEngine::from_file(
+            &path.join(".agent/config.toml"),
+            &path,
+        )?)
+    } else {
+        Arc::new(PolicyEngine::new(ExecutionMode::Normal, &path))
+    };
+    let sessions = Arc::new(JsonlSessionStore::new(session_root)?);
+    let git_status = GitClient::open(&path)
+        .ok()
+        .and_then(|client| client.status().ok());
+    let workspace = WorkspaceMetadata {
+        root: description
+            .repository_root
+            .clone()
+            .or_else(|| Some(description.current_directory.clone())),
+        branch: description.git.branch.clone(),
+        monorepo: description.monorepo.is_monorepo,
+        languages: description
+            .languages
+            .iter()
+            .map(|language| format!("{language:?}"))
+            .collect(),
+        manifests: description
+            .manifests
+            .iter()
+            .map(|manifest| manifest.path.display().to_string())
+            .collect(),
+        details: Default::default(),
+    };
+    let agent_task = AgentTask {
+        workspace_root: path,
+        user_task: task,
+        system_instructions:
+            "You are the CogitoAI coding agent. Follow project instructions and use tools safely."
+                .to_owned(),
+        workspace,
+        instructions: description.instructions,
+        git_status,
+        ..AgentTask::default()
+    };
+    let event_bus = EventBus::new();
+    let _subscription = event_bus.subscribe(Arc::new(|event: &harness_session::HarnessEvent| {
+        if let harness_session::EventPayload::AssistantDelta { text } = &event.payload {
+            print!("{text}");
+            let _ = io::stdout().flush();
+        }
+    }));
+    let runner = AgentRunner::new(
+        provider,
+        model_config.model,
+        ToolRegistry::with_workspace_tools(),
+        policy,
+        sessions,
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(CliApproval),
+    )
+    .with_event_bus(event_bus);
+    let cancellation = CancellationToken::new();
+    let handler_token = cancellation.clone();
+    ctrlc::set_handler(move || handler_token.cancel())?;
+    let outcome = runner.run(&agent_task, &cancellation)?;
+    println!("\n{}", outcome.final_message);
+    println!("session: {}", outcome.session_id);
+    Ok(())
+}
+
+struct CliApproval;
+
+impl ApprovalHandler for CliApproval {
+    fn request(
+        &self,
+        request: &harness_tools::ToolRequest,
+    ) -> Result<bool, harness_agent::AgentError> {
+        eprint!("Approve tool {}? [y/N] ", request.name);
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| harness_agent::AgentError::Core(error.to_string()))?;
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
 }
 
 fn print_summary(description: &harness_core::WorkspaceDescription) {

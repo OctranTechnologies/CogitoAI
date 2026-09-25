@@ -7,7 +7,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use mock::MockProvider;
+pub use mock::{MockProvider, ScriptedMockProvider};
 pub use openai::OpenAiProvider;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

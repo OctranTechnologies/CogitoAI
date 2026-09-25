@@ -1,22 +1,19 @@
 [package]
-name = "harness-cli"
+name = "harness-context"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Command-line client for the CogitoAI harness"
+description = "Bounded, explainable context assembly for the CogitoAI harness"
 
 [dependencies]
-harness-agent.workspace = true
-harness-context.workspace = true
 harness-core.workspace = true
 harness-git.workspace = true
-harness-models.workspace = true
-harness-policy.workspace = true
 harness-session.workspace = true
 harness-tools.workspace = true
-clap.workspace = true
-ctrlc.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
 serde_json.workspace = true
 
 [lints]

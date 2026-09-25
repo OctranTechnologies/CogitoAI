@@ -12,6 +12,8 @@ license = "MIT"
 
 [workspace.dependencies]
 harness-core = { path = "crates/harness-core" }
+harness-context = { path = "crates/harness-context" }
+harness-agent = { path = "crates/harness-agent" }
 harness-models = { path = "crates/harness-models" }
 harness-tools = { path = "crates/harness-tools" }
 harness-policy = { path = "crates/harness-policy" }
@@ -29,6 +31,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
 ureq = { version = "2.12", features = ["json"] }
 
 [workspace.lints.rust]

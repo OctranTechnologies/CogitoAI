@@ -155,6 +155,44 @@ added behind `ProcessRunner` without changing the agent loop. Windows uses
 `cmd /C` by default and Unix uses `sh -lc`; process-tree cleanup depends on
 available OS process controls.
 
+## Context assembly
+
+`harness-context` assembles provider-neutral context from system instructions,
+workspace metadata, precedence-ordered project instructions, Git state, the
+current request, recent conversation, explicitly selected files, and explicitly
+provided tool results. It never scans or loads an entire repository and does
+not perform semantic/vector search.
+
+`ContextBudget` limits individual files, tool-result contributions, retained
+shell output, and the approximate working token budget. `ContextAssembly`
+returns the rendered prompt plus every item with its source, inclusion reason,
+estimated tokens, original size, inclusion status, and applied limits, making
+context decisions inspectable by CLI/RPC/desktop clients.
+
+## Run the agent
+
+Install/build the CLI and configure a real provider:
+
+```text
+cargo build --workspace
+$env:OPENAI_API_KEY="<your-key>"
+$env:COGITO_MODEL_PROVIDER="openai"
+$env:COGITO_MODEL="gpt-4o-mini"
+```
+
+Open a repository and run a task:
+
+```text
+cargo run -p harness-cli -- --workspace . agent --path . "Inspect the project and fix the failing test"
+```
+
+The agent builds bounded context, streams assistant output, evaluates tool
+calls through policy, prompts for approval on `ASK`, persists every event, and
+stops on completion or configured limits. Press `Ctrl+C` to request cancellation.
+Session JSONL files are stored under `.cogito/sessions/` relative to the CLI
+working directory by default; pass `--session-root <path>` to choose another
+location.
+
 ## Git checkpoints
 
 `harness-git` exposes read-only repository status/diff inspection and

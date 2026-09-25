@@ -1,13 +1,12 @@
 [package]
-name = "harness-cli"
+name = "harness-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Command-line client for the CogitoAI harness"
+description = "Provider-independent single-agent execution loop for CogitoAI"
 
 [dependencies]
-harness-agent.workspace = true
 harness-context.workspace = true
 harness-core.workspace = true
 harness-git.workspace = true
@@ -15,9 +14,12 @@ harness-models.workspace = true
 harness-policy.workspace = true
 harness-session.workspace = true
 harness-tools.workspace = true
-clap.workspace = true
-ctrlc.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -62,6 +62,8 @@ pub enum EventType {
     SessionStarted,
     #[serde(rename = "user.message")]
     UserMessage,
+    #[serde(rename = "assistant.delta")]
+    AssistantDelta,
     #[serde(rename = "assistant.message")]
     AssistantMessage,
     #[serde(rename = "model.requested")]
@@ -124,6 +126,8 @@ pub enum EventPayload {
     SessionStarted { workspace_root: PathBuf },
     #[serde(rename = "user.message")]
     UserMessage { text: String },
+    #[serde(rename = "assistant.delta")]
+    AssistantDelta { text: String },
     #[serde(rename = "assistant.message")]
     AssistantMessage { text: String },
     #[serde(rename = "model.requested")]
@@ -222,6 +226,7 @@ impl EventPayload {
         match self {
             Self::SessionStarted { .. } => EventType::SessionStarted,
             Self::UserMessage { .. } => EventType::UserMessage,
+            Self::AssistantDelta { .. } => EventType::AssistantDelta,
             Self::AssistantMessage { .. } => EventType::AssistantMessage,
             Self::ModelRequested { .. } => EventType::ModelRequested,
             Self::ModelResponse { .. } => EventType::ModelResponse,

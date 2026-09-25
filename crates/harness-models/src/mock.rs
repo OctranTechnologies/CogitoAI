@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
 use serde_json::json;
 
 use super::{
@@ -132,6 +135,126 @@ impl ModelProvider for MockProvider {
         }
         Ok(response)
     }
+}
+
+pub struct ScriptedMockProvider {
+    model: String,
+    responses: Mutex<VecDeque<ModelResponse>>,
+}
+
+impl ScriptedMockProvider {
+    pub fn new(model: impl Into<String>, responses: Vec<ModelResponse>) -> Self {
+        Self {
+            model: model.into(),
+            responses: Mutex::new(responses.into()),
+        }
+    }
+
+    fn next_response(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        self.responses
+            .lock()
+            .expect("scripted mock lock poisoned")
+            .pop_front()
+            .map(|mut response| {
+                response.model = self.model.clone();
+                response.usage.get_or_insert_with(|| {
+                    Usage::new(
+                        request
+                            .messages
+                            .iter()
+                            .map(message_text)
+                            .map(|text| text.len() as u32)
+                            .sum(),
+                        1,
+                    )
+                });
+                response
+            })
+            .ok_or_else(|| ProviderError::InvalidResponse {
+                provider: "scripted-mock",
+                reason: "no scripted response remains".to_owned(),
+            })
+    }
+}
+
+impl ModelProvider for ScriptedMockProvider {
+    fn name(&self) -> &str {
+        "scripted-mock"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calling: true,
+            vision: true,
+            reasoning: true,
+            context_window: Some(8_192),
+        }
+    }
+
+    fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        self.next_response(request)
+    }
+
+    fn stream(
+        &self,
+        request: &ModelRequest,
+        on_delta: &mut dyn FnMut(StreamDelta) -> Result<(), ProviderError>,
+    ) -> Result<ModelResponse, ProviderError> {
+        stream_scripted_response(self.next_response(request)?, on_delta)
+    }
+}
+
+fn stream_scripted_response(
+    response: ModelResponse,
+    on_delta: &mut dyn FnMut(StreamDelta) -> Result<(), ProviderError>,
+) -> Result<ModelResponse, ProviderError> {
+    let mut sequence = 0;
+    if let Some(tool_call) = response.tool_calls.first() {
+        on_delta(StreamDelta {
+            sequence,
+            delta: StreamDeltaKind::ToolCall {
+                call: ToolCallDelta {
+                    index: 0,
+                    id: Some(tool_call.id.clone()),
+                    name: Some(tool_call.name.clone()),
+                    arguments_delta: Some(tool_call.arguments.to_string()),
+                },
+            },
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: response.usage.clone(),
+        })?;
+        return Ok(response);
+    }
+    let text = response.text();
+    let chunks = text
+        .as_bytes()
+        .chunks(8)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let is_last = index + 1 == chunks.len();
+        on_delta(StreamDelta {
+            sequence,
+            delta: StreamDeltaKind::Text {
+                text: chunk.clone(),
+            },
+            finish_reason: is_last.then_some(FinishReason::Stop),
+            usage: is_last.then(|| response.usage.clone()).flatten(),
+        })?;
+        sequence += 1;
+    }
+    if chunks.is_empty() {
+        on_delta(StreamDelta {
+            sequence,
+            delta: StreamDeltaKind::Text {
+                text: String::new(),
+            },
+            finish_reason: Some(FinishReason::Stop),
+            usage: response.usage.clone(),
+        })?;
+    }
+    Ok(response)
 }
 
 fn message_text(message: &Message) -> String {
