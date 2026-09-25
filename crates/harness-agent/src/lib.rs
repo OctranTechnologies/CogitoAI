@@ -8,8 +8,8 @@ use harness_core::{Error, SessionId};
 use harness_models::{Message, ModelProvider, ModelRequest, ProviderError, StreamDeltaKind, Usage};
 use harness_policy::{ExecutionMode, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest};
 use harness_session::{
-    ConversationMessage as SessionConversationMessage, EventBus, EventPayload, HarnessEvent,
-    MessageRole, SessionStore,
+    CompactState, ConversationMessage as SessionConversationMessage, EventBus, EventPayload,
+    HarnessEvent, MessageRole, SessionStore,
 };
 use harness_tools::{CancellationToken, ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{VerificationPlan, VerificationRequest, Verifier};
@@ -35,6 +35,91 @@ impl Default for AgentLimits {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    pub threshold_tokens: u32,
+    pub keep_recent_messages: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            threshold_tokens: 24 * 1024,
+            keep_recent_messages: 4,
+        }
+    }
+}
+
+pub struct CompactionRequest<'a> {
+    pub task: &'a str,
+    pub conversation: &'a [SessionConversationMessage],
+    pub tool_results: &'a [ToolContextResult],
+}
+
+pub trait CompactionStrategy: Send + Sync {
+    fn compact(&self, request: &CompactionRequest<'_>) -> Result<CompactState, String>;
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct DeriveCompactionStrategy;
+
+impl CompactionStrategy for DeriveCompactionStrategy {
+    fn compact(&self, request: &CompactionRequest<'_>) -> Result<CompactState, String> {
+        let mut state = CompactState {
+            task: request.task.to_owned(),
+            current_approach: request
+                .conversation
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::Assistant)
+                .map_or_else(|| request.task.to_owned(), |message| message.text.clone()),
+            ..CompactState::default()
+        };
+        for result in request.tool_results {
+            let summary = bounded_summary(&format!("{}: {}", result.name, result.result.output));
+            if result.name.contains("test") || summary.to_ascii_lowercase().contains("test") {
+                state.test_status.push(summary);
+            } else if summary.to_ascii_lowercase().contains("fail")
+                || summary.to_ascii_lowercase().contains("error")
+            {
+                state.failed_attempts.push(summary);
+            } else {
+                state.discoveries.push(summary);
+            }
+            for path in &result.result.changed_files {
+                let path = path.display().to_string();
+                if !state.files_modified.contains(&path) {
+                    state.files_modified.push(path.clone());
+                }
+                if !state.important_files.contains(&path) {
+                    state.important_files.push(path);
+                }
+            }
+        }
+        for message in request.conversation.iter().rev().take(5) {
+            if message.role == MessageRole::Assistant
+                && !message.text.trim().is_empty()
+                && !state.decisions.contains(&message.text)
+            {
+                state.decisions.push(message.text.clone());
+            }
+        }
+        Ok(state)
+    }
+}
+
+fn bounded_summary(value: &str) -> String {
+    const LIMIT: usize = 240;
+    if value.len() <= LIMIT {
+        return value.to_owned();
+    }
+    let mut end = LIMIT;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}…", &value[..end])
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentTask {
     pub workspace_root: PathBuf,
@@ -47,6 +132,7 @@ pub struct AgentTask {
     pub initial_tool_results: Vec<ToolContextResult>,
     pub git_status: Option<harness_git::GitStatus>,
     pub verification_plan: Option<VerificationPlan>,
+    pub resume_session: Option<SessionId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -97,6 +183,8 @@ pub struct AgentRunner {
     limits: AgentLimits,
     approval_handler: Arc<dyn ApprovalHandler>,
     verifier: Option<Arc<dyn Verifier>>,
+    compaction_config: CompactionConfig,
+    compaction_strategy: Arc<dyn CompactionStrategy>,
     event_bus: EventBus,
 }
 
@@ -122,6 +210,8 @@ impl AgentRunner {
             limits,
             approval_handler,
             verifier: None,
+            compaction_config: CompactionConfig::default(),
+            compaction_strategy: Arc::new(DeriveCompactionStrategy),
             event_bus: EventBus::new(),
         }
     }
@@ -136,6 +226,16 @@ impl AgentRunner {
         self
     }
 
+    pub fn with_compaction_config(mut self, config: CompactionConfig) -> Self {
+        self.compaction_config = config;
+        self
+    }
+
+    pub fn with_compaction_strategy(mut self, strategy: Arc<dyn CompactionStrategy>) -> Self {
+        self.compaction_strategy = strategy;
+        self
+    }
+
     pub fn event_bus(&self) -> EventBus {
         self.event_bus.clone()
     }
@@ -146,9 +246,31 @@ impl AgentRunner {
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
         let started_at = Instant::now();
-        let session = self
-            .sessions
-            .create(&task.workspace_root)
+        let session = if let Some(session_id) = &task.resume_session {
+            let existing = self
+                .sessions
+                .load(session_id)
+                .map_err(|error| AgentError::Core(error.to_string()))?;
+            let requested_root = std::fs::canonicalize(&task.workspace_root)
+                .map_err(|error| AgentError::Core(error.to_string()))?;
+            if existing.workspace_root != requested_root {
+                return Err(AgentError::Core(format!(
+                    "session {} belongs to {}, not {}",
+                    session_id,
+                    existing.workspace_root.display(),
+                    requested_root.display()
+                )));
+            }
+            self.sessions
+                .resume(session_id)
+                .map_err(|error| AgentError::Core(error.to_string()))?
+        } else {
+            self.sessions
+                .create(&task.workspace_root)
+                .map_err(|error| AgentError::Core(error.to_string()))?
+        };
+        let previous_state = session
+            .state()
             .map_err(|error| AgentError::Core(error.to_string()))?;
         let session_id = session.id.clone();
         let collector = Arc::new(Mutex::new(Vec::new()));
@@ -174,9 +296,18 @@ impl AgentRunner {
             workspace: task.workspace.clone(),
             instructions: task.instructions.clone(),
             user_request: task.user_task.clone(),
-            conversation: task.recent_conversation.clone(),
+            conversation: if task.recent_conversation.is_empty() {
+                if previous_state.continuation.is_some() {
+                    previous_state.working_messages
+                } else {
+                    previous_state.messages
+                }
+            } else {
+                task.recent_conversation.clone()
+            },
             files: task.selected_files.clone(),
             tool_results: task.initial_tool_results.clone(),
+            compacted_state: previous_state.continuation,
             git_status: task.git_status.clone(),
         };
         self.emit(
@@ -200,12 +331,27 @@ impl AgentRunner {
                 &collector,
             )?;
             turns += 1;
-            let assembly = match self.context_builder.build(&context_input) {
+            let mut assembly = match self.context_builder.build(&context_input) {
                 Ok(assembly) => assembly,
                 Err(error) => {
                     return self.fail(session_id, collector, AgentError::Core(error.to_string()))
                 }
             };
+            if self.compaction_config.threshold_tokens > 0
+                && assembly.estimated_tokens >= self.compaction_config.threshold_tokens
+            {
+                self.compact_context(&session_id, &mut context_input, &collector)?;
+                assembly = match self.context_builder.build(&context_input) {
+                    Ok(assembly) => assembly,
+                    Err(error) => {
+                        return self.fail(
+                            session_id,
+                            collector,
+                            AgentError::Core(error.to_string()),
+                        )
+                    }
+                };
+            }
             let model_request = ModelRequest {
                 model: self.model.clone(),
                 messages: vec![Message::user_text(assembly.prompt)],
@@ -354,6 +500,45 @@ impl AgentRunner {
                 )?;
             }
         }
+    }
+
+    fn compact_context(
+        &self,
+        session_id: &SessionId,
+        context_input: &mut ContextInput,
+        collector: &Arc<Mutex<Vec<HarnessEvent>>>,
+    ) -> Result<(), AgentError> {
+        let request = CompactionRequest {
+            task: &context_input.user_request,
+            conversation: &context_input.conversation,
+            tool_results: &context_input.tool_results,
+        };
+        let compacted = self
+            .compaction_strategy
+            .compact(&request)
+            .map_err(|error| AgentError::Core(format!("context compaction failed: {error}")))?;
+        let removed_items = context_input
+            .conversation
+            .len()
+            .saturating_sub(self.compaction_config.keep_recent_messages)
+            + context_input.tool_results.len();
+        self.emit(
+            session_id,
+            EventPayload::ContextCompacted {
+                removed_items,
+                summary: compacted.render(),
+                state: compacted.clone(),
+            },
+            collector,
+        )?;
+        let keep = self.compaction_config.keep_recent_messages;
+        let split = context_input.conversation.len().saturating_sub(keep);
+        if split > 0 {
+            context_input.conversation.drain(..split);
+        }
+        context_input.tool_results.clear();
+        context_input.compacted_state = Some(compacted);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

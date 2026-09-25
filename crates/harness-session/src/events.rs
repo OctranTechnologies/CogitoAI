@@ -104,12 +104,60 @@ pub enum EventType {
     VerificationStarted,
     #[serde(rename = "verification.result")]
     VerificationResult,
+    #[serde(rename = "session.resumed")]
+    SessionResumed,
     #[serde(rename = "context.compacted")]
     ContextCompacted,
     #[serde(rename = "session.completed")]
     SessionCompleted,
     #[serde(rename = "session.failed")]
     SessionFailed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactState {
+    pub task: String,
+    pub current_approach: String,
+    pub discoveries: Vec<String>,
+    pub important_files: Vec<String>,
+    pub files_modified: Vec<String>,
+    pub decisions: Vec<String>,
+    pub failed_attempts: Vec<String>,
+    pub test_status: Vec<String>,
+    pub remaining_work: Vec<String>,
+}
+
+impl CompactState {
+    pub fn render(&self) -> String {
+        let mut sections = Vec::new();
+        push_section(&mut sections, "task", std::slice::from_ref(&self.task));
+        push_section(
+            &mut sections,
+            "current approach",
+            std::slice::from_ref(&self.current_approach),
+        );
+        push_section(&mut sections, "discoveries", &self.discoveries);
+        push_section(&mut sections, "important files", &self.important_files);
+        push_section(&mut sections, "files modified", &self.files_modified);
+        push_section(&mut sections, "decisions", &self.decisions);
+        push_section(&mut sections, "failed attempts", &self.failed_attempts);
+        push_section(&mut sections, "test status", &self.test_status);
+        push_section(&mut sections, "remaining work", &self.remaining_work);
+        sections.join("\n\n")
+    }
+}
+
+fn push_section(sections: &mut Vec<String>, name: &str, values: &[String]) {
+    if values.is_empty() || values.iter().all(String::is_empty) {
+        return;
+    }
+    let value = values
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    sections.push(format!("### {name}\n{value}"));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -214,10 +262,14 @@ pub enum EventPayload {
         output: String,
         diagnostics: Vec<String>,
     },
+    #[serde(rename = "session.resumed")]
+    SessionResumed { reason: Option<String> },
     #[serde(rename = "context.compacted")]
     ContextCompacted {
         removed_items: usize,
         summary: String,
+        #[serde(default)]
+        state: CompactState,
     },
     #[serde(rename = "session.completed")]
     SessionCompleted { reason: Option<String> },
@@ -251,6 +303,7 @@ impl EventPayload {
             Self::CheckpointRestored { .. } => EventType::CheckpointRestored,
             Self::VerificationStarted { .. } => EventType::VerificationStarted,
             Self::VerificationResult { .. } => EventType::VerificationResult,
+            Self::SessionResumed { .. } => EventType::SessionResumed,
             Self::ContextCompacted { .. } => EventType::ContextCompacted,
             Self::SessionCompleted { .. } => EventType::SessionCompleted,
             Self::SessionFailed { .. } => EventType::SessionFailed,

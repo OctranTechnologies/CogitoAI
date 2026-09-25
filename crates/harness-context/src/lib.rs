@@ -69,6 +69,7 @@ pub struct ContextInput {
     pub conversation: Vec<ConversationMessage>,
     pub files: Vec<ExplicitFile>,
     pub tool_results: Vec<ToolContextResult>,
+    pub compacted_state: Option<harness_session::CompactState>,
     pub git_status: Option<GitStatus>,
 }
 
@@ -82,6 +83,7 @@ pub enum ContextCategory {
     Conversation,
     File,
     ToolResult,
+    CompactionSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -94,6 +96,7 @@ pub enum ContextReason {
     RecentConversation,
     ExplicitlySelectedFile,
     RelevantToolResult,
+    CompactionSummary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -219,6 +222,22 @@ impl ContextBuilder {
                     content: git_text(git_status),
                     required: false,
                     limit: None,
+                },
+            );
+        }
+        if let Some(compacted) = &input.compacted_state {
+            add_item(
+                &mut items,
+                &mut used_tokens,
+                self.budget.clone(),
+                Candidate {
+                    id: "compacted-state".to_owned(),
+                    category: ContextCategory::CompactionSummary,
+                    source: "session.context.compacted".to_owned(),
+                    reason: ContextReason::CompactionSummary,
+                    content: compacted.render(),
+                    required: true,
+                    limit: Some(ContextLimit::ToolResultSize),
                 },
             );
         }
@@ -454,6 +473,7 @@ fn render_prompt(items: &[ContextItem]) -> String {
             ContextCategory::Conversation => "Recent conversation",
             ContextCategory::File => "Selected files",
             ContextCategory::ToolResult => "Relevant tool results",
+            ContextCategory::CompactionSummary => "Compacted working state",
         };
         sections.push(format!(
             "## {heading}\nSource: {}\n{}",

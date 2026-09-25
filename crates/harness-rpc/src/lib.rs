@@ -4,7 +4,9 @@ use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
 use harness_git::{Checkpoint, CheckpointInfo, CheckpointStore, GitError, RestoreReport};
 use harness_models::ModelProvider;
 use harness_policy::Policy;
-use harness_session::{HarnessEvent, Session, SessionStore, SessionSummary};
+use harness_session::{
+    HarnessEvent, Session, SessionLoadReport, SessionState, SessionStore, SessionSummary,
+};
 use harness_tools::{ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{VerificationReport, VerificationRequest, Verifier};
 
@@ -83,6 +85,24 @@ impl Runtime {
 
     pub fn recent_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, Error> {
         self.sessions.recent(limit)
+    }
+
+    pub fn inspect_session(
+        &self,
+        session_id: &harness_core::SessionId,
+    ) -> Result<SessionLoadReport, Error> {
+        self.sessions.load_with_report(session_id)
+    }
+
+    pub fn resume_session(&self, session_id: &harness_core::SessionId) -> Result<Session, Error> {
+        self.sessions.resume(session_id)
+    }
+
+    pub fn session_state(
+        &self,
+        session_id: &harness_core::SessionId,
+    ) -> Result<SessionState, Error> {
+        self.sessions.load(session_id)?.state()
     }
 
     pub fn create_checkpoint(

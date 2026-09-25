@@ -3,15 +3,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use harness_agent::{AgentLimits, AgentRunner, AgentTask, ApprovalHandler};
+use harness_agent::{AgentLimits, AgentRunner, AgentTask, ApprovalHandler, CompactionConfig};
 use harness_context::{ContextBuilder, WorkspaceMetadata};
-use harness_core::{discover_workspace, init_logging, HarnessConfig};
+use harness_core::{discover_workspace, init_logging, HarnessConfig, SessionId};
 use harness_git::GitClient;
 use harness_models::{
     provider_from_config, Message, ModelConfig, ModelRequest, ProviderError, StreamDelta,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
-use harness_session::{EventBus, JsonlSessionStore};
+use harness_session::{EventBus, JsonlSessionStore, SessionStore};
 use harness_tools::{CancellationToken, LocalProcessRunner, ToolRegistry};
 use harness_verification::{CommandVerifier, VerificationPlan};
 use serde_json::Value;
@@ -27,6 +27,10 @@ struct Cli {
     model_provider: Option<String>,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long, default_value = ".cogito/sessions")]
+    session_root: PathBuf,
+    #[arg(long)]
+    compaction_threshold: Option<u32>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -49,8 +53,31 @@ enum Command {
         task: String,
         #[arg(default_value = ".")]
         path: PathBuf,
-        #[arg(long, default_value = ".cogito/sessions")]
-        session_root: PathBuf,
+    },
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    Inspect {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Resume {
+        id: String,
+        task: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -67,11 +94,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Inspect { path, json }) => inspect(path, json),
         Some(Command::Ask { ref prompt, stream }) => ask(&cli, prompt, stream),
         Some(Command::ModelInfo) => model_info(&cli),
-        Some(Command::Agent {
-            ref task,
-            ref path,
-            ref session_root,
-        }) => run_agent(&cli, task.clone(), path.clone(), session_root.clone()),
+        Some(Command::Agent { ref task, ref path }) => {
+            run_agent(&cli, task.clone(), path.clone(), None)
+        }
+        Some(Command::Session { ref command }) => session_command(&cli, command),
         None => {
             println!(
                 "CogitoAI harness workspace: {}",
@@ -150,11 +176,70 @@ fn model_info(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn session_command(cli: &Cli, command: &SessionCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let store = JsonlSessionStore::new(&cli.session_root)?;
+    match command {
+        SessionCommand::List { limit, json } => {
+            let sessions = store.recent(*limit)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else if sessions.is_empty() {
+                println!("no sessions found");
+            } else {
+                for session in sessions {
+                    println!(
+                        "{}  {:?}  events={}  compactions={}  {}",
+                        session.id,
+                        session.status,
+                        session.event_count,
+                        session.context_compactions,
+                        session.workspace_root.display()
+                    );
+                }
+            }
+        }
+        SessionCommand::Inspect { id, json } => {
+            let session_id = SessionId::new(id.clone())?;
+            let report = store.load_with_report(&session_id)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let state = report.session.state()?;
+                println!("session: {}", report.session.id);
+                println!("workspace: {}", report.session.workspace_root.display());
+                println!("status: {:?}", state.status);
+                println!("events: {}", report.session.events.len());
+                println!("compactions: {}", state.context_compactions);
+                println!("messages: {}", state.messages.len());
+                if let Some(continuation) = state.continuation {
+                    println!("continuation:\n{}", continuation.render());
+                }
+                for warning in report.warnings {
+                    println!("warning: line {}: {}", warning.line, warning.reason);
+                }
+            }
+        }
+        SessionCommand::Resume { id, task, path } => {
+            let session_id = SessionId::new(id.clone())?;
+            let existing = store.load(&session_id)?;
+            let path = path
+                .clone()
+                .unwrap_or_else(|| existing.workspace_root.clone());
+            let task = task.clone().unwrap_or_else(|| {
+                "Continue from the compacted session state and finish the remaining work."
+                    .to_owned()
+            });
+            run_agent(cli, task, path, Some(session_id))?;
+        }
+    }
+    Ok(())
+}
+
 fn run_agent(
     cli: &Cli,
     task: String,
     path: PathBuf,
-    session_root: PathBuf,
+    resume_session: Option<SessionId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let description = discover_workspace(&path)?;
     let model_config = model_config(cli)?;
@@ -168,7 +253,7 @@ fn run_agent(
     } else {
         Arc::new(PolicyEngine::new(ExecutionMode::Normal, &path))
     };
-    let sessions = Arc::new(JsonlSessionStore::new(session_root)?);
+    let sessions = Arc::new(JsonlSessionStore::new(&cli.session_root)?);
     let git_status = GitClient::open(&path)
         .ok()
         .and_then(|client| client.status().ok());
@@ -202,6 +287,7 @@ fn run_agent(
         instructions: description.instructions,
         git_status,
         verification_plan: Some(verification_plan),
+        resume_session,
         ..AgentTask::default()
     };
     let event_bus = EventBus::new();
@@ -222,6 +308,12 @@ fn run_agent(
         Arc::new(CliApproval),
     )
     .with_event_bus(event_bus)
+    .with_compaction_config(CompactionConfig {
+        threshold_tokens: cli
+            .compaction_threshold
+            .unwrap_or_else(|| CompactionConfig::default().threshold_tokens),
+        ..CompactionConfig::default()
+    })
     .with_verifier(Arc::new(CommandVerifier::new(Arc::new(LocalProcessRunner))));
     let cancellation = CancellationToken::new();
     let handler_token = cancellation.clone();

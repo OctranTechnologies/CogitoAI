@@ -169,6 +169,16 @@ returns the rendered prompt plus every item with its source, inclusion reason,
 estimated tokens, original size, inclusion status, and applied limits, making
 context decisions inspectable by CLI/RPC/desktop clients.
 
+When the agent's working context reaches its compaction threshold, it derives
+or generates a compact continuation state with task, current approach,
+discoveries, important files, modified files, decisions, failed attempts, test
+status, and remaining work. The state is emitted as `context.compacted`, placed
+back into the working context, and never replaces the JSONL event history. The
+compaction strategy is replaceable through `CompactionStrategy`, so a future
+low-cost model or assistant can produce richer summaries. The default trigger is
+24,000 estimated tokens; use the CLI's `--compaction-threshold <tokens>` option
+to tune it for a workspace.
+
 ## Verification
 
 `harness-verification` turns discovered project commands into structured
@@ -212,8 +222,8 @@ The agent builds bounded context, streams assistant output, evaluates tool
 calls through policy, prompts for approval on `ASK`, persists every event, and
 stops on completion or configured limits. Press `Ctrl+C` to request cancellation.
 Session JSONL files are stored under `.cogito/sessions/` relative to the CLI
-working directory by default; pass `--session-root <path>` to choose another
-location.
+working directory by default; pass the global `--session-root <path>` option to
+choose another location.
 
 ## Git checkpoints
 
@@ -246,10 +256,32 @@ mutation. A conflict is reported rather than resolved automatically.
 `harness-session` persists execution history as portable JSONL. The host chooses
 the session root when constructing `JsonlSessionStore`; each session is stored
 as `<session-root>/<session-id>.jsonl`, with one schema-versioned event per
-line. `load` and `resume` reconstruct sessions from the append-only history,
-and `recent` enumerates sessions from that same directory. A truncated final
-record is reported as a load warning while all earlier events remain intact;
-complete malformed records fail validation and are never rewritten.
+line. `load` reconstructs the complete event history, while `resume` appends
+an explicit `session.resumed` event and reactivates the same session, including
+sessions that previously completed or failed. `recent` lists session metadata
+and compaction counts from the same directory. A truncated final record is
+reported as a load warning while all earlier events remain intact; complete
+malformed records fail validation and are never rewritten.
+
+`context.compacted` events contain both a human-readable summary and the
+structured continuation state. Compaction changes only the working context;
+the complete event/session history remains permanently available for
+inspection. A repeated compaction creates another event and replaces the latest
+working continuation state, so older summaries remain auditable.
+
+Session commands are model-free until a continuation is requested:
+
+```text
+cargo run -p harness-cli -- --session-root .cogito/sessions session list
+cargo run -p harness-cli -- --session-root .cogito/sessions session inspect <session-id>
+cargo run -p harness-cli -- --session-root .cogito/sessions session resume <session-id> "Continue the remaining work"
+```
+
+`session list` shows IDs, status, event counts, and compaction counts.
+`session inspect` shows session metadata, counts, warnings, and the latest
+continuation state. `session resume` reopens the stored workspace and session
+and continues from the persisted compacted state; use `session inspect --json`
+for the complete machine-readable report.
 
 The event model is provider- and UI-independent. `harness-session::EventBus`
 provides in-process live subscriptions for CLI, RPC, and future desktop

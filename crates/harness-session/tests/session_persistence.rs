@@ -5,14 +5,28 @@ use std::sync::{Arc, Mutex};
 
 use harness_core::{Error, Id};
 use harness_session::{
-    EventBus, EventPayload, EventType, FileChange, HarnessEvent, JsonlSessionStore, MessageRole,
-    Session, SessionState, SessionStatus, SessionStore,
+    CompactState, EventBus, EventPayload, EventType, FileChange, HarnessEvent, JsonlSessionStore,
+    MessageRole, Session, SessionState, SessionStatus, SessionStore,
 };
 use tempfile::tempdir;
 
 fn append(store: &JsonlSessionStore, session: &Session, payload: EventPayload) {
     let event = HarnessEvent::new(session.id.clone(), payload, None, None);
     store.append_event(&session.id, event).unwrap();
+}
+
+fn compacted_state(task: &str) -> CompactState {
+    CompactState {
+        task: task.to_owned(),
+        current_approach: "continue implementation".to_owned(),
+        discoveries: vec!["workspace uses Rust".to_owned()],
+        important_files: vec!["src/lib.rs".to_owned()],
+        files_modified: vec!["src/lib.rs".to_owned()],
+        decisions: vec!["use bounded context".to_owned()],
+        failed_attempts: vec![],
+        test_status: vec!["cargo test passed".to_owned()],
+        remaining_work: vec!["resume verification".to_owned()],
+    }
 }
 
 #[test]
@@ -144,6 +158,7 @@ fn persists_reloads_resumes_and_reconstructs_a_mock_session() {
         EventPayload::ContextCompacted {
             removed_items: 2,
             summary: "kept relevant context".to_owned(),
+            state: compacted_state("Keep session state available"),
         },
     );
     append(
@@ -188,15 +203,87 @@ fn persists_reloads_resumes_and_reconstructs_a_mock_session() {
         report.session.state().unwrap().messages[0].role,
         MessageRole::User
     );
-    assert_eq!(store.resume(&session.id).unwrap().events.len(), 16);
+    let resumed = store.resume(&session.id).unwrap();
+    assert_eq!(resumed.events.len(), 17);
+    assert_eq!(resumed.state().unwrap().status, SessionStatus::Active);
     assert_eq!(store.recent(10).unwrap()[0].id, session.id);
-    assert_eq!(observed.lock().unwrap().len(), 15);
+    assert_eq!(observed.lock().unwrap().len(), 16);
     assert_eq!(
         serde_json::from_str::<HarnessEvent>(
             &serde_json::to_string(&report.session.events[1]).unwrap()
         )
         .unwrap(),
         report.session.events[1]
+    );
+}
+
+#[test]
+fn repeated_compaction_preserves_history_and_latest_state() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = JsonlSessionStore::new(temporary.path().join("sessions")).unwrap();
+    let session = store.create(&workspace).unwrap();
+    append(
+        &store,
+        &session,
+        EventPayload::UserMessage {
+            text: "first task".to_owned(),
+        },
+    );
+    append(
+        &store,
+        &session,
+        EventPayload::AssistantMessage {
+            text: "first approach".to_owned(),
+        },
+    );
+    append(
+        &store,
+        &session,
+        EventPayload::ContextCompacted {
+            removed_items: 2,
+            summary: "first continuation".to_owned(),
+            state: compacted_state("first task"),
+        },
+    );
+    append(
+        &store,
+        &session,
+        EventPayload::UserMessage {
+            text: "next task".to_owned(),
+        },
+    );
+    append(
+        &store,
+        &session,
+        EventPayload::ContextCompacted {
+            removed_items: 1,
+            summary: "second continuation".to_owned(),
+            state: compacted_state("next task"),
+        },
+    );
+    append(
+        &store,
+        &session,
+        EventPayload::SessionCompleted { reason: None },
+    );
+
+    let original_event_count = store.load(&session.id).unwrap().events.len();
+    let state = store.load(&session.id).unwrap().state().unwrap();
+    assert_eq!(state.context_compactions, 2);
+    assert_eq!(state.continuation.unwrap().task, "next task");
+    assert_eq!(state.messages.len(), 3);
+    assert_eq!(state.working_messages.len(), 3);
+
+    let resumed = store.resume(&session.id).unwrap();
+    assert_eq!(resumed.events.len(), original_event_count + 1);
+    assert_eq!(resumed.state().unwrap().status, SessionStatus::Active);
+    assert_eq!(
+        resumed.events[1].payload,
+        EventPayload::UserMessage {
+            text: "first task".to_owned(),
+        }
     );
 }
 
@@ -316,9 +403,11 @@ fn serializes_every_event_type_with_schema_compatibility() {
             output: "ok".to_owned(),
             diagnostics: Vec::new(),
         },
+        EventPayload::SessionResumed { reason: None },
         EventPayload::ContextCompacted {
             removed_items: 1,
             summary: "summary".to_owned(),
+            state: CompactState::default(),
         },
         EventPayload::SessionCompleted { reason: None },
         EventPayload::SessionFailed {

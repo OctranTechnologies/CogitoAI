@@ -6,7 +6,7 @@ use harness_context::{
 };
 use harness_core::InstructionFile;
 use harness_git::GitStatus;
-use harness_session::{ConversationMessage, MessageRole};
+use harness_session::{CompactState, ConversationMessage, MessageRole};
 use harness_tools::ToolResult;
 
 fn input() -> ContextInput {
@@ -48,6 +48,7 @@ fn input() -> ContextInput {
             result: ToolResult::new("selected output"),
             is_shell: false,
         }],
+        compacted_state: None,
         git_status: Some(GitStatus {
             repository_root: PathBuf::from("/workspace"),
             branch: Some("main".to_owned()),
@@ -161,6 +162,38 @@ fn instruction_precedence_is_preserved_in_prompt() {
             .filter(|item| item.category == ContextCategory::Instruction)
             .count(),
         2
+    );
+}
+
+#[test]
+fn includes_compacted_working_state_in_prompt() {
+    let mut input = input();
+    input.compacted_state = Some(CompactState {
+        task: "Keep the session resumable".to_owned(),
+        current_approach: "Persist a continuation state".to_owned(),
+        discoveries: vec!["The original event log is durable".to_owned()],
+        important_files: vec!["src/lib.rs".to_owned()],
+        files_modified: vec!["src/lib.rs".to_owned()],
+        decisions: vec!["Use a replaceable strategy".to_owned()],
+        failed_attempts: vec![],
+        test_status: vec!["workspace tests pass".to_owned()],
+        remaining_work: vec!["Resume verification".to_owned()],
+    });
+
+    let assembly = ContextBuilder::default().build(&input).unwrap();
+
+    assert!(assembly.prompt.contains("Compacted working state"));
+    assert!(assembly.prompt.contains("Keep the session resumable"));
+    assert!(assembly
+        .prompt
+        .contains("The original event log is durable"));
+    assert_eq!(
+        assembly
+            .items
+            .iter()
+            .find(|item| item.category == ContextCategory::CompactionSummary)
+            .map(|item| item.reason.clone()),
+        Some(harness_context::ContextReason::CompactionSummary)
     );
 }
 

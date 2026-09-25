@@ -1,9 +1,15 @@
+use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use harness_agent::{AgentLimits, AgentRunner, AgentTask, ApprovalHandler, DenyApprovalHandler};
-use harness_context::{ContextBuilder, WorkspaceMetadata};
-use harness_models::{ContentBlock, ModelResponse, ScriptedMockProvider, ToolCall, Usage};
+use harness_agent::{
+    AgentLimits, AgentRunner, AgentTask, ApprovalHandler, CompactionConfig, DenyApprovalHandler,
+};
+use harness_context::{ContextBudget, ContextBuilder, WorkspaceMetadata};
+use harness_models::{
+    ContentBlock, ModelCapabilities, ModelProvider, ModelRequest, ModelResponse, ProviderError,
+    ScriptedMockProvider, StreamDelta, StreamDeltaKind, ToolCall, Usage,
+};
 use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
 use harness_session::{JsonlSessionStore, SessionStatus, SessionStore};
 use harness_tools::{CancellationToken, LocalProcessRunner, ToolRegistry};
@@ -41,6 +47,71 @@ fn response(text: &str, tool: Option<(&str, serde_json::Value)>) -> ModelRespons
     };
     response.model = "scripted".to_owned();
     response
+}
+
+struct RecordingProvider {
+    responses: Mutex<VecDeque<ModelResponse>>,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+impl RecordingProvider {
+    fn new(requests: Arc<Mutex<Vec<ModelRequest>>>, responses: Vec<ModelResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into_iter().collect()),
+            requests,
+        }
+    }
+
+    fn response(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        self.requests
+            .lock()
+            .expect("model request lock poisoned")
+            .push(request.clone());
+        self.responses
+            .lock()
+            .expect("model response lock poisoned")
+            .pop_front()
+            .ok_or(ProviderError::Transport {
+                provider: "recording",
+            })
+    }
+}
+
+impl ModelProvider for RecordingProvider {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            streaming: true,
+            tool_calling: true,
+            vision: false,
+            reasoning: false,
+            context_window: Some(4096),
+        }
+    }
+
+    fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        self.response(request)
+    }
+
+    fn stream(
+        &self,
+        request: &ModelRequest,
+        on_delta: &mut dyn FnMut(StreamDelta) -> Result<(), ProviderError>,
+    ) -> Result<ModelResponse, ProviderError> {
+        let response = self.response(request)?;
+        on_delta(StreamDelta {
+            sequence: 0,
+            delta: StreamDeltaKind::Text {
+                text: response.text(),
+            },
+            finish_reason: Some(response.finish_reason.clone()),
+            usage: response.usage.clone(),
+        })?;
+        Ok(response)
+    }
 }
 
 struct ApproveAll;
@@ -285,4 +356,113 @@ fn verification_failure_is_persisted_and_agent_continues() {
         event.event_type == harness_session::EventType::VerificationResult
             && matches!(&event.payload, harness_session::EventPayload::VerificationResult { output, .. } if output.contains("verification failure"))
     }));
+}
+
+#[test]
+fn long_mock_session_compacts_resumes_and_preserves_history() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let sessions = Arc::new(JsonlSessionStore::new(temporary.path().join("sessions")).unwrap());
+    let session_store: Arc<dyn SessionStore> = sessions.clone();
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let first_provider = Arc::new(RecordingProvider::new(
+        Arc::clone(&first_requests),
+        vec![response("first run summary", None)],
+    ));
+    let first_task = AgentTask {
+        workspace_root: workspace.to_path_buf(),
+        user_task: "Implement durable context compaction and resume".to_owned(),
+        ..task(workspace)
+    };
+    let first_runner = AgentRunner::new(
+        first_provider,
+        "recording",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(AllowAllPolicy),
+        Arc::clone(&session_store),
+        ContextBuilder::new(ContextBudget {
+            max_working_context_tokens: 1024,
+            ..ContextBudget::default()
+        }),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    )
+    .with_compaction_config(CompactionConfig {
+        threshold_tokens: 1,
+        keep_recent_messages: 1,
+    });
+
+    let first_outcome = first_runner
+        .run(&first_task, &CancellationToken::new())
+        .unwrap();
+    let after_first = sessions.load(&first_outcome.session_id).unwrap();
+    let first_compaction = after_first
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            harness_session::EventPayload::ContextCompacted { state, .. } => Some(state),
+            _ => None,
+        })
+        .expect("compaction event");
+    assert_eq!(
+        first_compaction.task,
+        "Implement durable context compaction and resume"
+    );
+    let original_event_count = after_first.events.len();
+
+    let second_requests = Arc::new(Mutex::new(Vec::new()));
+    let second_provider = Arc::new(RecordingProvider::new(
+        Arc::clone(&second_requests),
+        vec![response("resumed run summary", None)],
+    ));
+    let second_task = AgentTask {
+        workspace_root: workspace.to_path_buf(),
+        user_task: "Continue the remaining verification work".to_owned(),
+        resume_session: Some(first_outcome.session_id.clone()),
+        ..task(workspace)
+    };
+    let second_runner = AgentRunner::new(
+        second_provider,
+        "recording",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(AllowAllPolicy),
+        Arc::clone(&session_store),
+        ContextBuilder::new(ContextBudget {
+            max_working_context_tokens: 1024,
+            ..ContextBudget::default()
+        }),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    )
+    .with_compaction_config(CompactionConfig {
+        threshold_tokens: 1,
+        keep_recent_messages: 1,
+    });
+    let second_outcome = second_runner
+        .run(&second_task, &CancellationToken::new())
+        .unwrap();
+
+    let prompt = second_requests.lock().expect("model request lock poisoned")[0].messages[0]
+        .content[0]
+        .clone();
+    let text = match prompt {
+        harness_models::ContentBlock::Text { text } => text,
+        _ => panic!("expected text model prompt"),
+    };
+    assert!(text.contains("Compacted working state"));
+    assert!(text.contains("first run summary"));
+
+    let resumed = sessions.load(&second_outcome.session_id).unwrap();
+    assert!(resumed.events.len() > original_event_count);
+    assert!(resumed
+        .events
+        .iter()
+        .any(|event| matches!(event.payload, harness_session::EventPayload::UserMessage { ref text } if text == "Implement durable context compaction and resume")));
+    assert!(resumed.events.iter().any(|event| {
+        matches!(
+            event.payload,
+            harness_session::EventPayload::SessionResumed { .. }
+        )
+    }));
+    assert_eq!(resumed.state().unwrap().context_compactions, 2);
 }

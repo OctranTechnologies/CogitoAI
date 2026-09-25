@@ -11,7 +11,9 @@ pub mod bus;
 pub mod events;
 
 pub use bus::{EventBus, EventSubscriber, EventSubscription};
-pub use events::{EventId, EventPayload, EventType, FileChange, HarnessEvent, Timestamp};
+pub use events::{
+    CompactState, EventId, EventPayload, EventType, FileChange, HarnessEvent, Timestamp,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Session {
@@ -64,6 +66,8 @@ pub struct SessionState {
     pub checkpoints_created: usize,
     pub verification_results: usize,
     pub context_compactions: usize,
+    pub continuation: Option<CompactState>,
+    pub working_messages: Vec<ConversationMessage>,
     pub last_event_id: Option<EventId>,
 }
 
@@ -81,6 +85,7 @@ pub struct SessionSummary {
     pub created_at: Timestamp,
     pub last_updated_at: Timestamp,
     pub event_count: usize,
+    pub context_compactions: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,7 +94,7 @@ pub struct SessionWarning {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionLoadReport {
     pub session: Session,
     pub warnings: Vec<SessionWarning>,
@@ -99,7 +104,25 @@ pub trait SessionStore: Send + Sync {
     fn create(&self, workspace_root: &Path) -> Result<Session, Error>;
     fn append_event(&self, session_id: &SessionId, event: HarnessEvent) -> Result<(), Error>;
     fn load(&self, session_id: &SessionId) -> Result<Session, Error>;
+    fn load_with_report(&self, session_id: &SessionId) -> Result<SessionLoadReport, Error> {
+        Ok(SessionLoadReport {
+            session: self.load(session_id)?,
+            warnings: Vec::new(),
+        })
+    }
     fn resume(&self, session_id: &SessionId) -> Result<Session, Error> {
+        self.load(session_id)?;
+        self.append_event(
+            session_id,
+            HarnessEvent::new(
+                session_id.clone(),
+                EventPayload::SessionResumed {
+                    reason: Some("session resume requested".to_owned()),
+                },
+                None,
+                None,
+            ),
+        )?;
         self.load(session_id)
     }
     fn recent(&self, limit: usize) -> Result<Vec<SessionSummary>, Error>;
@@ -265,6 +288,7 @@ impl SessionStore for JsonlSessionStore {
                 created_at: session.created_at,
                 last_updated_at: session.last_updated_at,
                 event_count: session.events.len(),
+                context_compactions: state.context_compactions,
             });
         }
         sessions.sort_by(|left, right| {
@@ -400,26 +424,44 @@ pub fn reconstruct_state(
         checkpoints_created: 0,
         verification_results: 0,
         context_compactions: 0,
+        continuation: None,
+        working_messages: Vec::new(),
         last_event_id: None,
     };
     let mut terminal = false;
     for event in events {
-        if terminal {
+        if terminal && !matches!(event.payload, EventPayload::SessionResumed { .. }) {
             return Err(Error::InvalidEvent {
                 reason: "events cannot follow a terminal session event".to_owned(),
             });
         }
+        if matches!(event.payload, EventPayload::SessionResumed { .. }) {
+            terminal = false;
+            state.status = SessionStatus::Active;
+        }
         match &event.payload {
             EventPayload::SessionStarted { .. } => {}
             EventPayload::AssistantDelta { .. } => {}
-            EventPayload::UserMessage { text } => state.messages.push(ConversationMessage {
-                role: MessageRole::User,
-                text: text.clone(),
-            }),
-            EventPayload::AssistantMessage { text } => state.messages.push(ConversationMessage {
-                role: MessageRole::Assistant,
-                text: text.clone(),
-            }),
+            EventPayload::UserMessage { text } => {
+                let message = ConversationMessage {
+                    role: MessageRole::User,
+                    text: text.clone(),
+                };
+                state.messages.push(message.clone());
+                if state.continuation.is_some() {
+                    state.working_messages.push(message);
+                }
+            }
+            EventPayload::AssistantMessage { text } => {
+                let message = ConversationMessage {
+                    role: MessageRole::Assistant,
+                    text: text.clone(),
+                };
+                state.messages.push(message.clone());
+                if state.continuation.is_some() {
+                    state.working_messages.push(message);
+                }
+            }
             EventPayload::ToolRequested { .. }
             | EventPayload::ToolApproved { .. }
             | EventPayload::ToolDenied { .. }
@@ -432,7 +474,23 @@ pub fn reconstruct_state(
             EventPayload::CheckpointRestored { .. } => {}
             EventPayload::VerificationStarted { .. } => {}
             EventPayload::VerificationResult { .. } => state.verification_results += 1,
-            EventPayload::ContextCompacted { .. } => state.context_compactions += 1,
+            EventPayload::ContextCompacted {
+                state: compacted, ..
+            } => {
+                state.context_compactions += 1;
+                state.continuation = Some(compacted.clone());
+                state.working_messages = state
+                    .messages
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+            }
+            EventPayload::SessionResumed { .. } => {}
             EventPayload::SessionCompleted { .. } => {
                 state.status = SessionStatus::Completed;
                 terminal = true;
