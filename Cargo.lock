@@ -299,7 +299,12 @@ dependencies = [
 name = "harness-policy"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "harness-core",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

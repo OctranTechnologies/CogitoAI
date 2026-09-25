@@ -2,10 +2,11 @@ mod filesystem;
 mod process;
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 
 use harness_core::{Error, Id, SessionId};
-use harness_policy::{authorize, Permission, Policy};
+use harness_policy::{OperationKind, Permission, Policy, PolicyDecision, PolicyRequest};
 use harness_session::{EventBus, EventPayload, HarnessEvent};
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
@@ -110,6 +111,7 @@ impl ToolContext<'_> {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn required_permission(&self) -> Permission;
+    fn operation(&self) -> OperationKind;
     fn execute(
         &self,
         context: &ToolContext<'_>,
@@ -164,17 +166,40 @@ impl ToolRegistry {
             });
             return Err(error);
         };
-        if let Err(error) = authorize(context.policy, tool.required_permission()) {
-            context.emit(EventPayload::ToolDenied {
-                tool: tool_name.clone(),
-                reason: error.to_string(),
-            });
-            return Err(error);
-        }
-        context.emit(EventPayload::ToolApproved {
+        let policy_request = build_policy_request(context, &tool_name, tool.as_ref(), &request);
+        let evaluation = context.policy.evaluate(&policy_request);
+        context.emit(EventPayload::PolicyDecision {
             tool: tool_name.clone(),
-            reason: None,
+            action: evaluation.decision.to_string(),
+            reason: evaluation.reason.clone(),
+            rule: evaluation.rule.clone(),
+            operation: policy_request.operation_name().to_owned(),
+            mode: format!("{:?}", policy_request.mode).to_ascii_lowercase(),
         });
+        match evaluation.decision {
+            PolicyDecision::Deny => {
+                let error = Error::PermissionDenied {
+                    capability: format!("{} {}", policy_request.operation_name(), tool_name),
+                };
+                context.emit(EventPayload::ToolDenied {
+                    tool: tool_name,
+                    reason: error.to_string(),
+                });
+                return Err(error);
+            }
+            PolicyDecision::Ask => {
+                return Err(Error::PermissionRequired {
+                    capability: format!("{} {}", policy_request.operation_name(), tool_name),
+                    reason: evaluation.reason,
+                });
+            }
+            PolicyDecision::Allow => {
+                context.emit(EventPayload::ToolApproved {
+                    tool: tool_name.clone(),
+                    reason: Some(evaluation.rule),
+                });
+            }
+        }
         context.emit(EventPayload::ToolStarted {
             tool: tool_name.clone(),
         });
@@ -203,6 +228,40 @@ impl ToolRegistry {
 
     pub fn names(&self) -> Vec<String> {
         self.tools.iter().map(|tool| tool.spec().name).collect()
+    }
+}
+
+fn build_policy_request(
+    context: &ToolContext<'_>,
+    tool_name: &str,
+    tool: &dyn Tool,
+    request: &ToolRequest,
+) -> PolicyRequest {
+    let workspace_root = fs::canonicalize(context.working_directory)
+        .unwrap_or_else(|_| context.working_directory.to_path_buf());
+    let operation = tool.operation();
+    let path_argument = request
+        .arguments
+        .get("path")
+        .or_else(|| request.arguments.get("working_directory"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            matches!(operation, OperationKind::Read | OperationKind::Search).then(|| ".".to_owned())
+        });
+    let path = path_argument.map(|path| workspace_root.join(path));
+    let command = request
+        .arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    PolicyRequest {
+        tool_name: tool_name.to_owned(),
+        operation,
+        workspace_root,
+        path,
+        command,
+        mode: context.policy.mode(),
     }
 }
 

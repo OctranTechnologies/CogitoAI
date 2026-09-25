@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use globset::Glob;
-use harness_policy::Permission;
+use harness_policy::{OperationKind, Permission};
 use regex::RegexBuilder;
 use serde_json::{json, Value};
 
@@ -67,6 +67,10 @@ impl Tool for ShellTool {
 
     fn required_permission(&self) -> Permission {
         Permission::ExecuteCommand
+    }
+
+    fn operation(&self) -> OperationKind {
+        OperationKind::Command
     }
 
     fn execute(
@@ -174,6 +178,10 @@ impl Tool for ReadFileTool {
         Permission::ReadWorkspace
     }
 
+    fn operation(&self) -> OperationKind {
+        OperationKind::Read
+    }
+
     fn execute(
         &self,
         context: &ToolContext<'_>,
@@ -214,6 +222,10 @@ impl Tool for WriteFileTool {
 
     fn required_permission(&self) -> Permission {
         Permission::WriteWorkspace
+    }
+
+    fn operation(&self) -> OperationKind {
+        OperationKind::Write
     }
 
     fn execute(
@@ -283,6 +295,10 @@ impl Tool for ApplyPatchTool {
         Permission::WriteWorkspace
     }
 
+    fn operation(&self) -> OperationKind {
+        OperationKind::Patch
+    }
+
     fn execute(
         &self,
         context: &ToolContext<'_>,
@@ -348,6 +364,10 @@ impl Tool for ListDirectoryTool {
         Permission::ReadWorkspace
     }
 
+    fn operation(&self) -> OperationKind {
+        OperationKind::Read
+    }
+
     fn execute(
         &self,
         context: &ToolContext<'_>,
@@ -411,6 +431,10 @@ impl Tool for GlobTool {
         Permission::ReadWorkspace
     }
 
+    fn operation(&self) -> OperationKind {
+        OperationKind::Read
+    }
+
     fn execute(
         &self,
         context: &ToolContext<'_>,
@@ -472,6 +496,10 @@ impl Tool for GrepTool {
 
     fn required_permission(&self) -> Permission {
         Permission::ReadWorkspace
+    }
+
+    fn operation(&self) -> OperationKind {
+        OperationKind::Read
     }
 
     fn execute(

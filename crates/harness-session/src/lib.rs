@@ -443,7 +443,8 @@ pub fn reconstruct_state(
             EventPayload::ProcessStarted { .. }
             | EventPayload::ProcessStdout { .. }
             | EventPayload::ProcessStderr { .. }
-            | EventPayload::ProcessExited { .. } => {}
+            | EventPayload::ProcessExited { .. }
+            | EventPayload::PolicyDecision { .. } => {}
         }
         state.last_event_id = Some(event.event_id.clone());
     }

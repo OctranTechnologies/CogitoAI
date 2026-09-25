@@ -12,6 +12,8 @@ pub enum Error {
     NotFound { kind: &'static str, id: crate::Id },
     #[error("permission denied for {capability}")]
     PermissionDenied { capability: String },
+    #[error("permission approval required for {capability}: {reason}")]
+    PermissionRequired { capability: String, reason: String },
     #[error("model provider {provider} failed: {message}")]
     Provider { provider: String, message: String },
     #[error("tool {tool} failed: {message}")]

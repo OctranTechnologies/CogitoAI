@@ -45,7 +45,28 @@ package_manager = "pnpm"
 [commands]
 test = ["pnpm", "test"]
 build = ["pnpm", "run", "build"]
+
+[policy]
+mode = "normal"
+
+[[policy.rules]]
+name = "deny-credentials"
+action = "deny"
+paths = [".env*", ".ssh/**", "**/*.key"]
+
+[[policy.rules]]
+name = "ask-generated-files"
+action = "ask"
+paths = ["generated/**"]
 ```
+
+The policy engine reads the `[policy]` section through
+`PolicyEngine::from_file`; explicit `deny` rules always win, followed by
+priority-ordered rules and then mode defaults. The modes are `read-only`,
+`safe`, `normal`, and `auto`; `read-only` allows reads/searches only, `safe`
+asks for mutations and commands, `normal` allows project edits and known safe
+commands, and `auto` allows configured categories while preserving explicit
+denies.
 
 Supported project instruction files are loaded in this deterministic
 precedence order: `AGENTS.md`, `CLAUDE.md`, `README.md`, `CONTRIBUTING.md`, and

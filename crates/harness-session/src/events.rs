@@ -90,6 +90,8 @@ pub enum EventType {
     ProcessStderr,
     #[serde(rename = "process.exited")]
     ProcessExited,
+    #[serde(rename = "policy.decision")]
+    PolicyDecision,
     #[serde(rename = "file.changed")]
     FileChanged,
     #[serde(rename = "checkpoint.created")]
@@ -172,6 +174,15 @@ pub enum EventPayload {
         timed_out: bool,
         cancelled: bool,
     },
+    #[serde(rename = "policy.decision")]
+    PolicyDecision {
+        tool: String,
+        action: String,
+        reason: String,
+        rule: String,
+        operation: String,
+        mode: String,
+    },
     #[serde(rename = "file.changed")]
     FileChanged { path: PathBuf, change: FileChange },
     #[serde(rename = "checkpoint.created")]
@@ -217,6 +228,7 @@ impl EventPayload {
             Self::ProcessStdout { .. } => EventType::ProcessStdout,
             Self::ProcessStderr { .. } => EventType::ProcessStderr,
             Self::ProcessExited { .. } => EventType::ProcessExited,
+            Self::PolicyDecision { .. } => EventType::PolicyDecision,
             Self::FileChanged { .. } => EventType::FileChanged,
             Self::CheckpointCreated { .. } => EventType::CheckpointCreated,
             Self::VerificationStarted { .. } => EventType::VerificationStarted,

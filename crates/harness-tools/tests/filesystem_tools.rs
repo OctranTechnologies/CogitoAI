@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use harness_core::{Id, SessionId};
-use harness_policy::{AllowAllPolicy, DenyAllPolicy};
+use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
 use harness_session::{EventBus, EventType};
 use harness_tools::{ToolContext, ToolRegistry, ToolRequest};
 use serde_json::json;
@@ -213,6 +213,7 @@ fn emits_tool_lifecycle_events_through_the_common_registry() {
         events.lock().unwrap().as_slice(),
         &[
             EventType::ToolRequested,
+            EventType::PolicyDecision,
             EventType::ToolApproved,
             EventType::ToolStarted,
             EventType::ToolOutput,
@@ -293,7 +294,98 @@ fn emits_denied_event_without_executing_a_tool() {
     assert!(result.is_err());
     assert_eq!(
         events.lock().unwrap().as_slice(),
-        &[EventType::ToolRequested, EventType::ToolDenied]
+        &[
+            EventType::ToolRequested,
+            EventType::PolicyDecision,
+            EventType::ToolDenied,
+        ]
     );
     assert!(!workspace.join("blocked.txt").exists());
+}
+
+#[test]
+fn safe_mode_asks_before_mutation_and_auto_mode_denies_secret_paths() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    fs::write(workspace.join(".env"), "SECRET=value").unwrap();
+    let registry = ToolRegistry::with_workspace_tools();
+    let bus = EventBus::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let _subscription = bus.subscribe(Arc::new(move |event: &harness_session::HarnessEvent| {
+        captured.lock().unwrap().push(event.event_type);
+    }));
+    let session_id = SessionId::new("policy-session").unwrap();
+    let safe = PolicyEngine::new(ExecutionMode::Safe, workspace);
+    let context = ToolContext {
+        policy: &safe,
+        working_directory: workspace,
+        event_bus: Some(&bus),
+        session_id: Some(&session_id),
+        correlation_id: None,
+    };
+    let result = registry.execute(
+        &context,
+        request("write_file", json!({ "path": "new.txt", "content": "new" })),
+    );
+    assert!(matches!(
+        result,
+        Err(harness_core::Error::PermissionRequired { .. })
+    ));
+    assert!(!workspace.join("new.txt").exists());
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &[EventType::ToolRequested, EventType::PolicyDecision]
+    );
+
+    let auto = PolicyEngine::new(ExecutionMode::Auto, workspace);
+    let context = ToolContext {
+        policy: &auto,
+        working_directory: workspace,
+        event_bus: Some(&bus),
+        session_id: Some(&session_id),
+        correlation_id: None,
+    };
+    let result = registry.execute(&context, request("read_file", json!({ "path": ".env" })));
+    assert!(matches!(
+        result,
+        Err(harness_core::Error::PermissionDenied { .. })
+    ));
+}
+
+#[test]
+fn every_mutable_tool_is_checked_by_policy() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    fs::write(workspace.join("file.txt"), "before").unwrap();
+    let registry = ToolRegistry::with_workspace_tools();
+    let context = ToolContext {
+        policy: &DenyAllPolicy,
+        working_directory: workspace,
+        event_bus: None,
+        session_id: None,
+        correlation_id: None,
+    };
+    let requests = [
+        request(
+            "write_file",
+            json!({ "path": "file.txt", "content": "after" }),
+        ),
+        request(
+            "apply_patch",
+            json!({ "path": "file.txt", "old_text": "before", "new_text": "after" }),
+        ),
+        request("shell", json!({ "command": "echo denied" })),
+    ];
+
+    for request in requests {
+        assert!(matches!(
+            registry.execute(&context, request),
+            Err(harness_core::Error::PermissionDenied { .. })
+        ));
+    }
+    assert_eq!(
+        fs::read_to_string(workspace.join("file.txt")).unwrap(),
+        "before"
+    );
 }
