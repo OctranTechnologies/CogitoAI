@@ -393,6 +393,8 @@ dependencies = [
 name = "harness-rpc"
 version = "0.1.0"
 dependencies = [
+ "harness-agent",
+ "harness-context",
  "harness-core",
  "harness-git",
  "harness-models",
@@ -400,6 +402,11 @@ dependencies = [
  "harness-session",
  "harness-tools",
  "harness-verification",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

@@ -42,9 +42,10 @@ provider implementation.
 
 The actual manifest graph is intentionally narrower than the conceptual
 picture: `harness-core` has no capability dependencies, and `harness-rpc` is
-the only crate that composes the capability crates. `harness-cli` currently
-uses the core configuration contract while the transport/client implementation
-is still being designed.
+the composition root for capability crates. `harness-cli` is a presentation
+client and composes the same runtime services for its single-process commands;
+`harness-rpc` also owns the versioned loopback JSON-lines transport used by
+desktop and integration clients.
 
 ## Crate responsibilities
 
@@ -64,13 +65,23 @@ is still being designed.
 
 `harness-rpc::Runtime` is the composition root. It receives the agent runtime,
 model providers, tool registry, policy, session store, checkpoint store, and
-verifiers, then exposes operations to external clients. A transport such as
-Tauri commands, HTTP, or another RPC protocol should adapt to this boundary;
-it should not bypass it.
+verifiers, then exposes operations to external clients. `RpcServer` adapts
+those operations to a versioned newline-delimited JSON protocol over loopback
+TCP. The server delegates to the same capability crates used by the CLI; it
+does not duplicate the model loop, tool dispatch, policy evaluation, context
+assembly, checkpoint recording, or session reconstruction.
+
+`RpcClient` is a transport client. Agent runs are asynchronous and return a
+`run_id`; the server streams durable `HarnessEvent` values as notifications and
+returns approval, cancellation, and terminal notifications separately. v0 uses
+one active run per server because concurrent mutations do not yet have
+independent event correlation. A dropped client denies pending approvals and
+cancels the active run. The transport is loopback-only and has no
+authentication or encryption; hosts must not bind it to a public interface.
 
 The desktop client is reserved under `apps/desktop` and is not implemented yet.
-When it is added, it will communicate with the Rust runtime through a typed
-Tauri command/API layer.
+When it is added, it will communicate with the Rust runtime through this
+versioned RPC boundary.
 
 ## Privileged operations and UI clients
 

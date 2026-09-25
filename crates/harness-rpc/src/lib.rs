@@ -1,5 +1,17 @@
+pub mod client;
+pub mod protocol;
+pub mod server;
+
+pub use client::{RpcClient, RpcClientError};
+pub use protocol::{
+    RpcError, RpcNotification, RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION,
+};
+pub use server::{ApprovalBroker, RpcApprovalHandler, RpcServer, RpcServerError};
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use harness_agent::{AgentOutcome, AgentRunner, AgentTask};
 use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
 use harness_git::{Checkpoint, CheckpointInfo, CheckpointStore, GitError, RestoreReport};
 use harness_models::ModelProvider;
@@ -18,6 +30,8 @@ pub struct Runtime {
     sessions: Arc<dyn SessionStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     verifiers: Vec<Arc<dyn Verifier>>,
+    agent_runner: Option<Arc<AgentRunner>>,
+    workspace_root: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -38,7 +52,40 @@ impl Runtime {
             sessions,
             checkpoints,
             verifiers,
+            agent_runner: None,
+            workspace_root: None,
         }
+    }
+
+    pub fn with_agent_runner(mut self, agent_runner: Arc<AgentRunner>) -> Self {
+        self.agent_runner = Some(agent_runner);
+        self
+    }
+
+    pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        self.workspace_root = Some(workspace_root);
+        self
+    }
+
+    pub fn run_agent(
+        &self,
+        task: &AgentTask,
+        cancellation: &harness_tools::CancellationToken,
+    ) -> Result<AgentOutcome, harness_agent::AgentError> {
+        self.agent_runner
+            .as_ref()
+            .ok_or_else(|| {
+                harness_agent::AgentError::Core("agent runtime is not configured".to_owned())
+            })?
+            .run(task, cancellation)
+    }
+
+    pub fn agent_event_bus(&self) -> Option<harness_session::EventBus> {
+        self.agent_runner.as_ref().map(|runner| runner.event_bus())
+    }
+
+    pub fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace_root.as_deref()
     }
 
     pub fn run(&self, request: RunRequest) -> Result<RunOutcome, Error> {

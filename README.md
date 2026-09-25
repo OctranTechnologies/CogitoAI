@@ -268,21 +268,49 @@ build = ["cargo", "build", "--workspace"]
 test = ["cargo", "test", "--workspace"]
 ```
 
-## Agent execution details
+## Local RPC boundary
 
-The agent builds bounded context, streams assistant output, evaluates tool calls
-through policy, prompts for approval on `ASK`, persists every event, and stops
-on completion or configured limits. Human output labels tool lifecycle,
-approval, verification, compaction, and completion events; `--json` emits the
-same events as newline-delimited JSON. Session JSONL files are stored under
-`.cogito/sessions/` relative to the CLI working directory by default; pass the
-global `--session-root <path>` option to choose another location.
+`harness-rpc` provides a versioned, newline-delimited JSON protocol over a
+loopback TCP socket. `RpcServer` binds to `127.0.0.1`; `RpcClient` can connect
+from the CLI, a desktop host, or an integration test. Requests contain an
+explicit protocol `version`, `id`, `method`, and JSON `params`. Responses use
+stable `ok`, `result`, and `error.code` fields, while agent progress arrives as
+`agent.event` notifications followed by `agent.completed` or `agent.failed`.
 
-The older `agent` and nested `session` command forms remain aliases for
-compatibility, but new scripts should use `run`, `sessions`, `resume`, and
-`status`.
+The v1 method surface is:
 
-## Git checkpoints
+```text
+rpc.initialize
+workspace.open / workspace.inspect
+config.inspect / config.update
+session.create / session.list / session.inspect / session.state / session.resume
+agent.send / agent.run / agent.approve / agent.deny / agent.cancel
+git.status / git.diff
+checkpoint.list / checkpoint.inspect / checkpoint.undo
+```
+
+`agent.send` and `agent.run` are asynchronous: the server returns a `run_id`
+immediately and continues the existing `AgentRunner` on a worker thread. Event
+notifications contain the durable `HarnessEvent`; the session JSONL file
+remains the source of truth. Approvals are explicit `approval.request`
+notifications, and `agent.approve`/`agent.deny` release the waiting agent.
+Dropping a client denies pending approvals and cancels the active run so a
+worker cannot remain blocked. v0 allows one active agent run per server because
+the current event model has no independent run correlation for concurrent
+mutations.
+
+There is no standalone daemon binary in v0. Desktop applications and other
+frontends embed `RpcServer::bind` (or
+`RpcServer::bind_with_approvals` when they need the RPC approval handler) and
+own the process lifecycle. The server should be launched by the host with a
+fixed loopback address, for example `127.0.0.1:0` to let the OS choose a port,
+and the host should report that port to its client. The socket has no
+authentication or encryption because it is loopback-only; treat any local
+process able to connect as a client of the configured workspace. Do not bind
+the v0 server to a public interface, and do not expose provider keys, full
+checkpoint contents, or unrestricted tool execution through the protocol.
+
+
 
 `harness-git` exposes read-only repository status/diff inspection and
 `ShadowCheckpointStore` for recoverable checkpoints. Checkpoints are external
