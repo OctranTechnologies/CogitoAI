@@ -9,6 +9,10 @@ description = "Session, event, and persistence contracts for the CogitoAI harnes
 [dependencies]
 harness-core.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

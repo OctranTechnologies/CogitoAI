@@ -18,6 +18,10 @@ pub enum Error {
     Tool { tool: String, message: String },
     #[error("verification failed: {message}")]
     Verification { message: String },
+    #[error("invalid event: {reason}")]
+    InvalidEvent { reason: String },
+    #[error("session error: {reason}")]
+    Session { reason: String },
     #[error("logging initialization failed: {0}")]
     Logging(String),
     #[error("i/o error: {0}")]

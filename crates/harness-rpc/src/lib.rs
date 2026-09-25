@@ -4,7 +4,7 @@ use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
 use harness_git::{Checkpoint, CheckpointStore};
 use harness_models::ModelProvider;
 use harness_policy::Policy;
-use harness_session::{Session, SessionStore};
+use harness_session::{HarnessEvent, Session, SessionStore, SessionSummary};
 use harness_tools::{ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{VerificationReport, VerificationRequest, Verifier};
 
@@ -62,8 +62,24 @@ impl Runtime {
             .collect()
     }
 
-    pub fn save_session(&self, session: &Session) -> Result<(), Error> {
-        self.sessions.save(session)
+    pub fn create_session(&self, workspace_root: &std::path::Path) -> Result<Session, Error> {
+        self.sessions.create(workspace_root)
+    }
+
+    pub fn append_session_event(
+        &self,
+        session_id: &harness_core::SessionId,
+        event: HarnessEvent,
+    ) -> Result<(), Error> {
+        self.sessions.append_event(session_id, event)
+    }
+
+    pub fn load_session(&self, session_id: &harness_core::SessionId) -> Result<Session, Error> {
+        self.sessions.load(session_id)
+    }
+
+    pub fn recent_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, Error> {
+        self.sessions.recent(limit)
     }
 
     pub fn create_checkpoint(

@@ -61,6 +61,20 @@ does not yet expose a completed agent runtime.
 The desktop application is not scaffolded or runnable yet. Its future setup and
 run commands will be added here when the Tauri application exists.
 
+## Session storage
+
+`harness-session` persists execution history as portable JSONL. The host chooses
+the session root when constructing `JsonlSessionStore`; each session is stored
+as `<session-root>/<session-id>.jsonl`, with one schema-versioned event per
+line. `load` and `resume` reconstruct sessions from the append-only history,
+and `recent` enumerates sessions from that same directory. A truncated final
+record is reported as a load warning while all earlier events remain intact;
+complete malformed records fail validation and are never rewritten.
+
+The event model is provider- and UI-independent. `harness-session::EventBus`
+provides in-process live subscriptions for CLI, RPC, and future desktop
+clients; durable JSONL remains the portable source of truth.
+
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for crate responsibilities,

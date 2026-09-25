@@ -214,6 +214,8 @@ version = "0.1.0"
 dependencies = [
  "harness-core",
  "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
