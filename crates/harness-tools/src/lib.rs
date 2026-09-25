@@ -4,6 +4,7 @@ mod process;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use harness_core::{Error, Id, SessionId};
 use harness_policy::{OperationKind, Permission, Policy, PolicyDecision, PolicyRequest};
@@ -130,6 +131,10 @@ impl ToolRegistry {
     }
 
     pub fn with_workspace_tools() -> Self {
+        Self::with_workspace_tools_cancellation(CancellationToken::new())
+    }
+
+    pub fn with_workspace_tools_cancellation(cancellation: CancellationToken) -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(ReadFileTool));
         registry.register(Box::new(WriteFileTool));
@@ -137,7 +142,10 @@ impl ToolRegistry {
         registry.register(Box::new(ListDirectoryTool));
         registry.register(Box::new(GlobTool));
         registry.register(Box::new(GrepTool));
-        registry.register(Box::new(ShellTool::default()));
+        registry.register(Box::new(ShellTool::new(
+            Arc::new(LocalProcessRunner),
+            cancellation,
+        )));
         registry
     }
 

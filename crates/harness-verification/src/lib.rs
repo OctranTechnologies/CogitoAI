@@ -54,6 +54,7 @@ pub trait Verifier: Send + Sync {
 #[derive(Clone)]
 pub struct CommandVerifier {
     runner: Arc<dyn ProcessRunner>,
+    cancellation: CancellationToken,
     max_output_bytes: usize,
 }
 
@@ -61,8 +62,14 @@ impl CommandVerifier {
     pub fn new(runner: Arc<dyn ProcessRunner>) -> Self {
         Self {
             runner,
+            cancellation: CancellationToken::new(),
             max_output_bytes: 64 * 1024,
         }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     pub fn with_output_limit(mut self, max_output_bytes: usize) -> Self {
@@ -89,7 +96,7 @@ impl Verifier for CommandVerifier {
                 .runner
                 .execute(
                     process_request,
-                    &CancellationToken::new(),
+                    &self.cancellation,
                     &mut |event| match event {
                         ProcessEvent::Stdout { chunk } => {
                             append_bounded(&mut stdout, &chunk, self.max_output_bytes);

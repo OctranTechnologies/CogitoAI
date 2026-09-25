@@ -326,6 +326,7 @@ dependencies = [
  "harness-tools",
  "harness-verification",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

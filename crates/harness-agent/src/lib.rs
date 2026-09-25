@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use harness_context::{ContextBuilder, ContextInput, ToolContextResult, WorkspaceMetadata};
 use harness_core::{Error, SessionId};
+use harness_git::CheckpointStore;
 use harness_models::{Message, ModelProvider, ModelRequest, ProviderError, StreamDeltaKind, Usage};
 use harness_policy::{ExecutionMode, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest};
 use harness_session::{
@@ -185,6 +186,7 @@ pub struct AgentRunner {
     verifier: Option<Arc<dyn Verifier>>,
     compaction_config: CompactionConfig,
     compaction_strategy: Arc<dyn CompactionStrategy>,
+    checkpoints: Option<Arc<dyn CheckpointStore>>,
     event_bus: EventBus,
 }
 
@@ -212,6 +214,7 @@ impl AgentRunner {
             verifier: None,
             compaction_config: CompactionConfig::default(),
             compaction_strategy: Arc::new(DeriveCompactionStrategy),
+            checkpoints: None,
             event_bus: EventBus::new(),
         }
     }
@@ -233,6 +236,11 @@ impl AgentRunner {
 
     pub fn with_compaction_strategy(mut self, strategy: Arc<dyn CompactionStrategy>) -> Self {
         self.compaction_strategy = strategy;
+        self
+    }
+
+    pub fn with_checkpoints(mut self, checkpoints: Arc<dyn CheckpointStore>) -> Self {
+        self.checkpoints = Some(checkpoints);
         self
     }
 
@@ -273,13 +281,30 @@ impl AgentRunner {
             .state()
             .map_err(|error| AgentError::Core(error.to_string()))?;
         let session_id = session.id.clone();
+        let checkpoint_id = if let Some(checkpoints) = &self.checkpoints {
+            Some(
+                checkpoints
+                    .create(&session_id, &task.workspace_root)
+                    .map_err(|error| AgentError::Core(error.to_string()))?
+                    .id,
+            )
+        } else {
+            None
+        };
         let collector = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&collector);
+        let collected_ids = Arc::new(Mutex::new(HashSet::new()));
+        let collected_event_ids = Arc::clone(&collected_ids);
         let collected_session = session_id.clone();
         let _subscription = self
             .event_bus
             .subscribe(Arc::new(move |event: &HarnessEvent| {
-                if event.session_id == collected_session {
+                if event.session_id == collected_session
+                    && collected_event_ids
+                        .lock()
+                        .expect("agent event ID lock poisoned")
+                        .insert(event.event_id.clone())
+                {
                     collected
                         .lock()
                         .expect("agent event collector poisoned")
@@ -484,6 +509,15 @@ impl AgentRunner {
                     Err(error) => return self.fail(session_id, collector, error),
                 };
                 let changed_files = result.changed_files.clone();
+                if let (Some(checkpoints), Some(checkpoint_id)) =
+                    (&self.checkpoints, &checkpoint_id)
+                {
+                    for path in &changed_files {
+                        checkpoints
+                            .record_harness_change(checkpoint_id, path)
+                            .map_err(|error| AgentError::Core(error.to_string()))?;
+                    }
+                }
                 context_input.tool_results.push(ToolContextResult {
                     name: tool_call.name,
                     result,

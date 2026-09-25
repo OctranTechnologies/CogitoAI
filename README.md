@@ -22,7 +22,75 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Run the CLI and inspect a project without executing project code:
+## Running the CLI
+
+Build the binary and run commands from a clean checkout with `cargo run`:
+
+```text
+cargo build --workspace
+cargo run -p harness-cli -- .
+cargo run -p harness-cli -- run "Inspect the project and report the next step"
+cargo run -p harness-cli -- sessions
+cargo run -p harness-cli -- status
+cargo run -p harness-cli -- diff
+cargo run -p harness-cli -- config
+```
+
+`harness .` inspects the current workspace without running project code. Use a
+positional path or the global `--workspace` option for another repository:
+
+```text
+cargo run -p harness-cli -- --workspace /path/to/project .
+cargo run -p harness-cli -- --workspace /path/to/project run "Fix the failing test" /path/to/project
+```
+
+Use `--json` for machine-readable output. Agent runs emit one JSON event per
+line, including assistant deltas, tool lifecycle events, approvals,
+verification results, and terminal session events. `--yes` auto-approves
+policy prompts for non-interactive or CI workflows.
+
+```text
+cargo run -p harness-cli -- --json sessions
+cargo run -p harness-cli -- --json run "Summarize this repository"
+cargo run -p harness-cli -- --json status
+```
+
+Agent runs are interruptible with `Ctrl+C`; the cancellation token is shared
+with filesystem shell execution and verification commands. A canceled or
+failed run is persisted as a session and can be resumed.
+
+The deterministic mock provider is the default and runs a complete scripted
+workflow (list directory, write a file, and finish) without credentials:
+
+```text
+cargo run -p harness-cli -- --yes run "Create a mock output"
+```
+
+To use OpenAI or another compatible endpoint:
+
+```text
+$env:OPENAI_API_KEY="<your-key>"
+$env:COGITO_MODEL_PROVIDER="openai"
+$env:COGITO_MODEL="gpt-4o-mini"
+cargo run -p harness-cli -- --model-provider openai --model gpt-4o-mini run "Inspect and improve the project"
+```
+
+Session and recovery commands:
+
+```text
+cargo run -p harness-cli -- sessions
+cargo run -p harness-cli -- session inspect <session-id>
+cargo run -p harness-cli -- resume <session-id> "Continue the remaining work"
+cargo run -p harness-cli -- status --session <session-id>
+cargo run -p harness-cli -- diff
+cargo run -p harness-cli -- undo
+```
+
+`undo` restores the latest harness checkpoint, or a checkpoint selected by ID,
+and refuses to overwrite unrelated user changes. Agent mutations are recorded
+in checkpoint snapshots when the workspace is a Git repository.
+
+
 
 ```text
 cargo run -p harness-cli -- inspect
@@ -76,11 +144,10 @@ configuration error rather than being ignored.
 Discovery reads filesystem metadata and read-only Git metadata only. It never
 runs project scripts, package-manager commands, or other project code.
 
-The CLI currently validates workspace configuration and exposes discovery; it
-does not yet expose a completed agent runtime.
-
-The desktop application is not scaffolded or runnable yet. Its future setup and
-run commands will be added here when the Tauri application exists.
+The CLI is a thin presentation layer over the harness session, agent, policy,
+tool, verification, and Git capabilities. The desktop application is not
+scaffolded or runnable yet. Its future setup and run commands will be added
+here when the Tauri application exists.
 
 ## Model providers
 
@@ -201,29 +268,19 @@ build = ["cargo", "build", "--workspace"]
 test = ["cargo", "test", "--workspace"]
 ```
 
-## Run the agent
+## Agent execution details
 
-Install/build the CLI and configure a real provider:
+The agent builds bounded context, streams assistant output, evaluates tool calls
+through policy, prompts for approval on `ASK`, persists every event, and stops
+on completion or configured limits. Human output labels tool lifecycle,
+approval, verification, compaction, and completion events; `--json` emits the
+same events as newline-delimited JSON. Session JSONL files are stored under
+`.cogito/sessions/` relative to the CLI working directory by default; pass the
+global `--session-root <path>` option to choose another location.
 
-```text
-cargo build --workspace
-$env:OPENAI_API_KEY="<your-key>"
-$env:COGITO_MODEL_PROVIDER="openai"
-$env:COGITO_MODEL="gpt-4o-mini"
-```
-
-Open a repository and run a task:
-
-```text
-cargo run -p harness-cli -- --workspace . agent --path . "Inspect the project and fix the failing test"
-```
-
-The agent builds bounded context, streams assistant output, evaluates tool
-calls through policy, prompts for approval on `ASK`, persists every event, and
-stops on completion or configured limits. Press `Ctrl+C` to request cancellation.
-Session JSONL files are stored under `.cogito/sessions/` relative to the CLI
-working directory by default; pass the global `--session-root <path>` option to
-choose another location.
+The older `agent` and nested `session` command forms remain aliases for
+compatibility, but new scripts should use `run`, `sessions`, `resume`, and
+`status`.
 
 ## Git checkpoints
 
