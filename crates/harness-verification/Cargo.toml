@@ -4,10 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Test, lint, and typecheck verification contracts for the CogitoAI harness"
+description = "Structured verification planning and execution for the CogitoAI harness"
 
 [dependencies]
 harness-core.workspace = true
+harness-session.workspace = true
+harness-tools.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

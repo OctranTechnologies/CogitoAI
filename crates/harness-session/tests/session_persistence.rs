@@ -130,8 +130,12 @@ fn persists_reloads_resumes_and_reconstructs_a_mock_session() {
         &session,
         EventPayload::VerificationResult {
             command: "cargo test".to_owned(),
+            category: "GeneralTest".to_owned(),
+            duration_ms: 12,
             passed: true,
+            exit_code: Some(0),
             output: "ok".to_owned(),
+            diagnostics: Vec::new(),
         },
     );
     append(
@@ -305,8 +309,12 @@ fn serializes_every_event_type_with_schema_compatibility() {
         },
         EventPayload::VerificationResult {
             command: "test".to_owned(),
+            category: "GeneralTest".to_owned(),
+            duration_ms: 12,
             passed: true,
+            exit_code: Some(0),
             output: "ok".to_owned(),
+            diagnostics: Vec::new(),
         },
         EventPayload::ContextCompacted {
             removed_items: 1,

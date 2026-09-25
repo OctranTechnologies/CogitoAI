@@ -12,6 +12,7 @@ use harness_session::{
     MessageRole, SessionStore,
 };
 use harness_tools::{CancellationToken, ToolContext, ToolRegistry, ToolRequest, ToolResult};
+use harness_verification::{VerificationPlan, VerificationRequest, Verifier};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -45,6 +46,7 @@ pub struct AgentTask {
     pub selected_files: Vec<harness_context::ExplicitFile>,
     pub initial_tool_results: Vec<ToolContextResult>,
     pub git_status: Option<harness_git::GitStatus>,
+    pub verification_plan: Option<VerificationPlan>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -94,6 +96,7 @@ pub struct AgentRunner {
     context_builder: ContextBuilder,
     limits: AgentLimits,
     approval_handler: Arc<dyn ApprovalHandler>,
+    verifier: Option<Arc<dyn Verifier>>,
     event_bus: EventBus,
 }
 
@@ -118,12 +121,18 @@ impl AgentRunner {
             context_builder,
             limits,
             approval_handler,
+            verifier: None,
             event_bus: EventBus::new(),
         }
     }
 
     pub fn with_event_bus(mut self, event_bus: EventBus) -> Self {
         self.event_bus = event_bus;
+        self
+    }
+
+    pub fn with_verifier(mut self, verifier: Arc<dyn Verifier>) -> Self {
+        self.verifier = Some(verifier);
         self
     }
 
@@ -328,13 +337,112 @@ impl AgentRunner {
                     Ok(result) => result,
                     Err(error) => return self.fail(session_id, collector, error),
                 };
+                let changed_files = result.changed_files.clone();
                 context_input.tool_results.push(ToolContextResult {
                     name: tool_call.name,
                     result,
                     is_shell,
                 });
+                self.run_verification_if_needed(
+                    &session_id,
+                    &task.workspace_root,
+                    task.verification_plan.as_ref(),
+                    self.verifier.as_ref(),
+                    &changed_files,
+                    &mut context_input,
+                    &collector,
+                )?;
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_verification_if_needed(
+        &self,
+        session_id: &SessionId,
+        workspace_root: &std::path::Path,
+        plan: Option<&VerificationPlan>,
+        verifier: Option<&Arc<dyn Verifier>>,
+        changed_files: &[PathBuf],
+        context_input: &mut ContextInput,
+        collector: &Arc<Mutex<Vec<HarnessEvent>>>,
+    ) -> Result<(), AgentError> {
+        if changed_files.is_empty() {
+            return Ok(());
+        }
+        let (Some(plan), Some(verifier)) = (plan, verifier) else {
+            return Ok(());
+        };
+        let plan = plan.targeted();
+        if plan.steps.is_empty() {
+            return Ok(());
+        }
+        self.emit(
+            session_id,
+            EventPayload::VerificationStarted {
+                commands: plan
+                    .steps
+                    .iter()
+                    .map(|step| format_command(&step.command))
+                    .collect(),
+            },
+            collector,
+        )?;
+        let request = VerificationRequest {
+            working_directory: workspace_root.to_path_buf(),
+            plan,
+            max_output_bytes: 64 * 1024,
+        };
+        match verifier.verify(&request) {
+            Ok(reports) => {
+                for report in reports {
+                    self.emit(
+                        session_id,
+                        EventPayload::VerificationResult {
+                            command: report.command.clone(),
+                            category: format!("{:?}", report.category),
+                            duration_ms: report.duration_ms,
+                            passed: report.passed,
+                            exit_code: report.exit_code,
+                            output: report.output.clone(),
+                            diagnostics: report.diagnostics.clone(),
+                        },
+                        collector,
+                    )?;
+                    let summary = format!(
+                        "verification passed={} exit_code={:?} diagnostics={:?}\n{}",
+                        report.passed, report.exit_code, report.diagnostics, report.output
+                    );
+                    context_input.tool_results.push(ToolContextResult {
+                        name: "verification".to_owned(),
+                        result: ToolResult::new(summary),
+                        is_shell: false,
+                    });
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.emit(
+                    session_id,
+                    EventPayload::VerificationResult {
+                        command: "verification".to_owned(),
+                        category: "runner".to_owned(),
+                        duration_ms: 0,
+                        passed: false,
+                        exit_code: None,
+                        output: message.clone(),
+                        diagnostics: vec![message.clone()],
+                    },
+                    collector,
+                )?;
+                context_input.tool_results.push(ToolContextResult {
+                    name: "verification".to_owned(),
+                    result: ToolResult::new(message),
+                    is_shell: false,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn execute_tool(
@@ -490,6 +598,14 @@ fn approval_key(request: &ToolRequest) -> String {
 
 fn approval_key_from_request(request: &PolicyRequest) -> String {
     request.tool_name.clone()
+}
+
+fn format_command(command: &harness_core::CommandSpec) -> String {
+    std::iter::once(&command.program)
+        .chain(command.args.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn usage_tokens(usage: Option<&Usage>) -> u64 {

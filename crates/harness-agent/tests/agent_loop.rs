@@ -6,7 +6,10 @@ use harness_context::{ContextBuilder, WorkspaceMetadata};
 use harness_models::{ContentBlock, ModelResponse, ScriptedMockProvider, ToolCall, Usage};
 use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
 use harness_session::{JsonlSessionStore, SessionStatus, SessionStore};
-use harness_tools::{CancellationToken, ToolRegistry};
+use harness_tools::{CancellationToken, LocalProcessRunner, ToolRegistry};
+use harness_verification::{
+    CommandVerifier, VerificationCategory, VerificationPlan, VerificationStep,
+};
 use tempfile::tempdir;
 
 fn response(text: &str, tool: Option<(&str, serde_json::Value)>) -> ModelResponse {
@@ -232,4 +235,54 @@ fn turn_limit_stops_before_extra_tool_execution() {
         Err(harness_agent::AgentError::LimitExceeded { .. })
     ));
     assert!(!workspace.join("blocked.txt").exists());
+}
+
+#[test]
+fn verification_failure_is_persisted_and_agent_continues() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    std::fs::write(workspace.join("file.txt"), "before").unwrap();
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            response(
+                "",
+                Some((
+                    "write_file",
+                    serde_json::json!({ "path": "file.txt", "content": "after" }),
+                )),
+            ),
+            response("Finished after verification", None),
+        ],
+    ));
+    let policy = Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace));
+    let (runner, sessions) = runner(provider, workspace, policy, Arc::new(ApproveAll));
+    let failing_command = if cfg!(windows) {
+        "echo verification failure & exit /B 7"
+    } else {
+        "echo 'verification failure'; exit 7"
+    };
+    let plan = VerificationPlan {
+        steps: vec![VerificationStep {
+            category: VerificationCategory::Build,
+            command: if cfg!(windows) {
+                harness_core::CommandSpec::new("cmd", ["/C", failing_command])
+            } else {
+                harness_core::CommandSpec::new("sh", ["-c", failing_command])
+            },
+            source: "test".to_owned(),
+        }],
+    };
+    let mut task = task(workspace);
+    task.verification_plan = Some(plan);
+    let runner = runner.with_verifier(Arc::new(CommandVerifier::new(Arc::new(LocalProcessRunner))));
+
+    let outcome = runner.run(&task, &CancellationToken::new()).unwrap();
+
+    assert_eq!(outcome.final_message, "Finished after verification");
+    let session = sessions.load(&outcome.session_id).unwrap();
+    assert!(session.events.iter().any(|event| {
+        event.event_type == harness_session::EventType::VerificationResult
+            && matches!(&event.payload, harness_session::EventPayload::VerificationResult { output, .. } if output.contains("verification failure"))
+    }));
 }

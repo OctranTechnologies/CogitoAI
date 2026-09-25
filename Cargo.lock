@@ -303,6 +303,7 @@ dependencies = [
  "harness-policy",
  "harness-session",
  "harness-tools",
+ "harness-verification",
  "serde",
  "serde_json",
  "tempfile",
@@ -323,6 +324,7 @@ dependencies = [
  "harness-policy",
  "harness-session",
  "harness-tools",
+ "harness-verification",
  "serde_json",
 ]
 
@@ -429,6 +431,11 @@ name = "harness-verification"
 version = "0.1.0"
 dependencies = [
  "harness-core",
+ "harness-session",
+ "harness-tools",
+ "serde",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

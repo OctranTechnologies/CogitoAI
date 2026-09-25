@@ -12,7 +12,8 @@ use harness_models::{
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{EventBus, JsonlSessionStore};
-use harness_tools::{CancellationToken, ToolRegistry};
+use harness_tools::{CancellationToken, LocalProcessRunner, ToolRegistry};
+use harness_verification::{CommandVerifier, VerificationPlan};
 use serde_json::Value;
 
 #[derive(Debug, Parser)]
@@ -190,6 +191,7 @@ fn run_agent(
             .collect(),
         details: Default::default(),
     };
+    let verification_plan = VerificationPlan::all(&description);
     let agent_task = AgentTask {
         workspace_root: path,
         user_task: task,
@@ -199,6 +201,7 @@ fn run_agent(
         workspace,
         instructions: description.instructions,
         git_status,
+        verification_plan: Some(verification_plan),
         ..AgentTask::default()
     };
     let event_bus = EventBus::new();
@@ -218,7 +221,8 @@ fn run_agent(
         AgentLimits::default(),
         Arc::new(CliApproval),
     )
-    .with_event_bus(event_bus);
+    .with_event_bus(event_bus)
+    .with_verifier(Arc::new(CommandVerifier::new(Arc::new(LocalProcessRunner))));
     let cancellation = CancellationToken::new();
     let handler_token = cancellation.clone();
     ctrlc::set_handler(move || handler_token.cancel())?;

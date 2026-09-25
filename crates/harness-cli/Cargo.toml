@@ -15,6 +15,7 @@ harness-models.workspace = true
 harness-policy.workspace = true
 harness-session.workspace = true
 harness-tools.workspace = true
+harness-verification.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 serde_json.workspace = true

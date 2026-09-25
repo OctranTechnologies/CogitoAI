@@ -169,6 +169,28 @@ returns the rendered prompt plus every item with its source, inclusion reason,
 estimated tokens, original size, inclusion status, and applied limits, making
 context decisions inspectable by CLI/RPC/desktop clients.
 
+## Verification
+
+`harness-verification` turns discovered project commands into structured
+verification steps for formatter/check, lint, typecheck, build, targeted tests,
+general tests, and final Git diff. A targeted plan is selected after source
+changes when a test command is known; broad tests are not run automatically in
+that path. Results include command, category, duration, exit code, bounded
+output, and relevant diagnostics, and verification failures are added to the
+next agent context.
+
+Project-local `[commands]` overrides in `.agent/config.toml` are used before
+inferred defaults:
+
+```toml
+[commands]
+format = ["cargo", "fmt", "--all", "--", "--check"]
+lint = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
+typecheck = ["cargo", "check", "--workspace"]
+build = ["cargo", "build", "--workspace"]
+test = ["cargo", "test", "--workspace"]
+```
+
 ## Run the agent
 
 Install/build the CLI and configure a real provider:

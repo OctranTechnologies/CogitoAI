@@ -207,8 +207,12 @@ pub enum EventPayload {
     #[serde(rename = "verification.result")]
     VerificationResult {
         command: String,
+        category: String,
+        duration_ms: u64,
         passed: bool,
+        exit_code: Option<i32>,
         output: String,
+        diagnostics: Vec<String>,
     },
     #[serde(rename = "context.compacted")]
     ContextCompacted {
