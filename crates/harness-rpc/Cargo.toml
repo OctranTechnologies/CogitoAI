@@ -12,6 +12,7 @@ harness-context.workspace = true
 harness-core.workspace = true
 harness-models.workspace = true
 harness-policy.workspace = true
+harness-pty.workspace = true
 harness-session.workspace = true
 harness-git.workspace = true
 harness-tools.workspace = true

@@ -68,4 +68,12 @@ pub const METHODS: &[&str] = &[
     "checkpoint.list",
     "checkpoint.inspect",
     "checkpoint.undo",
+    // Human-operated terminals. `terminal.open` requires `origin: "human"`;
+    // see the server module for the security boundary between these and
+    // agent-controlled command execution.
+    "terminal.list",
+    "terminal.open",
+    "terminal.write",
+    "terminal.resize",
+    "terminal.close",
 ];

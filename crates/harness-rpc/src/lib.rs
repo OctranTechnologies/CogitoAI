@@ -3,13 +3,17 @@ pub mod protocol;
 pub mod server;
 
 pub use client::{RpcClient, RpcClientError, RpcClientReader, RpcClientWriter};
+pub use harness_pty::{
+    ExitReason, PtyError, PtyInfo, PtyManager, PtyRequest, SessionOrigin, TerminalEvent,
+    TerminalSink,
+};
 pub use protocol::{
     RpcError, RpcNotification, RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION,
 };
 pub use server::{ApprovalBroker, RpcApprovalHandler, RpcServer, RpcServerError};
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use harness_agent::{AgentOutcome, AgentRunner, AgentTask};
 use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
@@ -32,6 +36,14 @@ pub struct Runtime {
     verifiers: Vec<Arc<dyn Verifier>>,
     agent_runner: Option<Arc<AgentRunner>>,
     workspace_root: Option<PathBuf>,
+    /// Human-operated terminals.
+    ///
+    /// These are deliberately separate from `tools`: the agent reaches shell
+    /// execution only through `ToolRegistry`, which evaluates every call against
+    /// the policy engine. A terminal is interactive, ungoverned, and reachable
+    /// only from an RPC client acting for a person. See the `harness-pty` module
+    /// documentation for the full boundary.
+    ptys: Arc<Mutex<PtyManager>>,
 }
 
 impl Runtime {
@@ -54,6 +66,9 @@ impl Runtime {
             verifiers,
             agent_runner: None,
             workspace_root: None,
+            // Retargeted by `with_workspace_root`; the placeholder root is
+            // replaced before any terminal can be opened.
+            ptys: Arc::new(Mutex::new(PtyManager::new("."))),
         }
     }
 
@@ -63,8 +78,16 @@ impl Runtime {
     }
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        // Terminals are confined to the open workspace, so the manager is
+        // recreated against the final root.
+        *self.ptys.lock().expect("PTY manager lock poisoned") = PtyManager::new(&workspace_root);
         self.workspace_root = Some(workspace_root);
         self
+    }
+
+    /// Human-operated terminal sessions for the open workspace.
+    pub fn ptys(&self) -> std::sync::MutexGuard<'_, PtyManager> {
+        self.ptys.lock().expect("PTY manager lock poisoned")
     }
 
     pub fn run_agent(

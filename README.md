@@ -333,6 +333,34 @@ The runtime keeps its own sessions and checkpoints under `.cogito/` inside the
 workspace. Those files are runtime state, not user code, so they are excluded
 from reported code changes.
 
+### Terminal
+
+The desktop can open an interactive shell rendered with xterm.js, backed by a
+real pseudo-terminal in the runtime. Output streams both ways, resizing is
+forwarded to the PTY, and Ctrl+C is delivered as a real interrupt.
+
+Terminals are **human-controlled sessions** and are deliberately separate from
+**agent-controlled command execution**:
+
+- Agent commands run through the runtime's tool registry, which evaluates every
+  call against the policy engine (deny / ask / allow) and executes it captured
+  and non-interactively.
+- A terminal is interactive and is intentionally **not** policy-governed, because
+  a person is typing into it directly and is responsible for every command.
+  Prompting someone to approve their own keystrokes would be noise, not safety.
+
+The boundary is enforced rather than merely documented:
+
+- `harness-pty` exposes no tool implementation and is never registered in a
+  `ToolRegistry`, so no model-driven tool call can open or write to a terminal.
+- `terminal.open` requires `origin: "human"`; any other origin is refused. The
+  origin enum has no agent variant to construct.
+- A terminal's working directory must resolve inside the open workspace.
+
+A terminal is bound to its workspace and is closed when the workspace changes or
+the connection drops. The runtime also terminates a client's terminals when that
+client disconnects, so closing the window never leaves an orphaned shell.
+
 Frontend and Tauri checks:
 
 ```text

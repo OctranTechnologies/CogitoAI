@@ -492,6 +492,246 @@ fn exposes_checkpoints_file_views_and_diffs_and_restores_through_the_runtime() {
 }
 
 #[test]
+fn human_terminals_are_separate_from_agent_command_execution() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
+    let (runtime, _sessions) = setup(
+        root,
+        ExecutionMode::Normal,
+        provider,
+        Arc::clone(&approvals),
+    );
+    let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
+
+    assert_ok(&client.request("rpc.initialize", json!({})).unwrap());
+    let initialize = client.request("rpc.initialize", json!({})).unwrap();
+    let advertised = initialize.result.unwrap();
+    let methods: Vec<String> = advertised["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    for method in [
+        "terminal.open",
+        "terminal.write",
+        "terminal.resize",
+        "terminal.close",
+        "terminal.list",
+    ] {
+        assert!(
+            methods.iter().any(|name| name == method),
+            "runtime does not advertise {method}"
+        );
+    }
+
+    assert_ok(&client.request("workspace.open", json!({})).unwrap());
+
+    // A non-human origin is refused: the agent path cannot open a terminal, so
+    // an agent-injected call fails loudly instead of gaining a free shell.
+    let agent_origin = client
+        .request("terminal.open", json!({"origin": "agent"}))
+        .unwrap();
+    assert!(!agent_origin.ok, "agent origin must be rejected");
+    assert!(
+        agent_origin
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("human")),
+        "unexpected error: {:?}",
+        agent_origin.error
+    );
+    let missing_origin = client.request("terminal.open", json!({})).unwrap();
+    assert!(!missing_origin.ok, "a missing origin must be rejected");
+
+    // A human terminal opens confined to the workspace.
+    //
+    // An explicit shell is used because the default PowerShell line editor waits
+    // for cursor-position replies from a terminal emulator before it runs
+    // anything; the desktop satisfies that with xterm.js, but a raw RPC test
+    // client is not a terminal.
+    let opened = client
+        .request(
+            "terminal.open",
+            json!({"origin": "human", "program": test_shell(), "cols": 100, "rows": 30}),
+        )
+        .unwrap();
+    assert_ok(&opened);
+    let opened = opened.result.unwrap();
+    assert_eq!(opened["origin"], "human");
+    assert_eq!(opened["cols"], 100);
+    assert_eq!(opened["rows"], 30);
+    let terminal_id = opened["id"].as_str().unwrap().to_owned();
+    let pid = opened["pid"].as_u64().expect("pid");
+
+    let listed = client.request("terminal.list", json!({})).unwrap();
+    assert_ok(&listed);
+    assert_eq!(listed.result.unwrap().as_array().unwrap().len(), 1);
+
+    // Output is streamed as a notification, not returned by a request.
+    client
+        .request(
+            "terminal.write",
+            json!({"terminal_id": terminal_id, "data": "echo rpc-terminal-marker\r\n"}),
+        )
+        .unwrap();
+    // Windows console processes query the terminal for the cursor position and
+    // block until something answers, which the desktop does through xterm.js.
+    // This test client answers so the shell proceeds.
+    let mut saw_output = false;
+    let mut unanswered = 0_usize;
+    for _ in 0..400 {
+        match client.receive().unwrap() {
+            ServerMessage::Notification(notification)
+                if notification.method == "terminal.output"
+                    && notification.params["terminal_id"] == terminal_id =>
+            {
+                let data = notification.params["data"].as_str().unwrap_or_default();
+                let queries = data.matches("\u{1b}[6n").count();
+                for _ in 0..queries {
+                    unanswered += 1;
+                    client
+                        .request(
+                            "terminal.write",
+                            json!({
+                                "terminal_id": terminal_id,
+                                "data": "\u{1b}[1;1R",
+                            }),
+                        )
+                        .unwrap();
+                }
+                if data.contains("rpc-terminal-marker") {
+                    saw_output = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_output,
+        "expected streamed terminal.output carrying the marker (answered {unanswered} cursor queries)"
+    );
+
+    // Resizing is reported back through the runtime.
+    let resized = client
+        .request(
+            "terminal.resize",
+            json!({"terminal_id": terminal_id, "cols": 120, "rows": 40}),
+        )
+        .unwrap();
+    assert_ok(&resized);
+    assert_eq!(resized.result.unwrap()["cols"], 120);
+
+    // Closing terminates the process and removes the session.
+    let closed = client
+        .request("terminal.close", json!({"terminal_id": terminal_id}))
+        .unwrap();
+    assert_ok(&closed);
+    assert!(
+        wait_longer(|| !process_is_alive(pid as u32)),
+        "terminal process survived close"
+    );
+    let listed = client.request("terminal.list", json!({})).unwrap();
+    assert!(listed.result.unwrap().as_array().unwrap().is_empty());
+
+    let unknown = client
+        .request(
+            "terminal.write",
+            json!({"terminal_id": "pty-missing", "data": "echo hi"}),
+        )
+        .unwrap();
+    assert!(!unknown.ok, "writing to an unknown terminal must fail");
+
+    drop(client);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_disconnecting_client_does_not_leak_its_terminal_processes() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
+    let (runtime, _sessions) = setup(
+        root,
+        ExecutionMode::Normal,
+        provider,
+        Arc::clone(&approvals),
+    );
+    let runtime = Arc::clone(&runtime);
+    let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
+
+    assert_ok(&client.request("workspace.open", json!({})).unwrap());
+    let opened = client
+        .request(
+            "terminal.open",
+            json!({"origin": "human", "program": test_shell()}),
+        )
+        .unwrap();
+    assert_ok(&opened);
+    let opened = opened.result.unwrap();
+    let pid = opened["pid"].as_u64().expect("pid") as u32;
+    assert!(process_is_alive(pid), "terminal did not start");
+
+    // Closing the desktop window drops the connection without a close request.
+    drop(client);
+    assert!(
+        wait_longer(|| !process_is_alive(pid)),
+        "terminal process leaked after the client disconnected"
+    );
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.join().unwrap();
+}
+
+/// Shell used by the terminal RPC tests.
+///
+/// The Windows default (PowerShell) blocks on a cursor-position query until a
+/// terminal emulator answers, which a raw RPC client does not do.
+fn test_shell() -> &'static str {
+    if cfg!(windows) {
+        "cmd.exe"
+    } else {
+        "/bin/sh"
+    }
+}
+
+/// Waits up to ten seconds, for process teardown which can lag the request.
+fn wait_longer<F>(mut condition: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    for _ in 0..500 {
+        if condition() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output();
+    match output {
+        Ok(output) => !String::from_utf8_lossy(&output.stdout).contains("INFO: No tasks"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn process_is_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[test]
 fn approval_requests_are_resolved_by_the_client() {
     let temporary = tempdir().unwrap();
     let root = temporary.path();

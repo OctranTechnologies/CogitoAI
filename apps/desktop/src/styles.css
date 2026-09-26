@@ -49,6 +49,19 @@ textarea:focus-visible,
   background: rgba(56, 189, 248, 0.26);
 }
 
+/* xterm sizes its own viewport through the fit addon, but the host element
+   must fill the panel or the fit calculation measures nothing. */
+.xterm,
+.xterm-viewport,
+.xterm-screen {
+  height: 100%;
+}
+
+.xterm .xterm-viewport {
+  background-color: transparent !important;
+  overflow-y: auto;
+}
+
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;

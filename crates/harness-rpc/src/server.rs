@@ -11,6 +11,7 @@ use std::time::Duration;
 use harness_agent::{AgentError, AgentTask, ApprovalHandler};
 use harness_core::{discover_workspace, CheckpointId, RunId, SessionId};
 use harness_git::{is_runtime_state_path, GitClient, GitError};
+use harness_pty::{PtyError, PtyRequest, SessionOrigin, TerminalEvent};
 use harness_session::{EventId, EventSubscriber, EventSubscription, HarnessEvent};
 use harness_tools::{CancellationToken, ToolRequest};
 use serde::Deserialize;
@@ -69,6 +70,14 @@ impl RpcServer {
             let state = Arc::clone(&state);
             bus.subscribe(Arc::new(EventForwarder { state }))
         });
+        // Terminal output and exits are pushed to every connected client as
+        // notifications, the same way agent events are.
+        let terminal_sink_state = Arc::clone(&state);
+        runtime
+            .ptys()
+            .set_sink(Arc::new(move |event: TerminalEvent| {
+                terminal_sink_state.broadcast_terminal(event);
+            }));
         Ok(Self {
             listener,
             runtime,
@@ -124,6 +133,9 @@ struct ServerState {
     next_run: AtomicU64,
     seen_events: Mutex<Vec<EventId>>,
     approvals: Arc<ApprovalBroker>,
+    /// Terminals opened by each client, so a disconnect can reap its processes
+    /// instead of leaking a shell with no consumer.
+    client_terminals: Mutex<HashMap<u64, Vec<String>>>,
 }
 
 struct ActiveRun {
@@ -140,6 +152,7 @@ impl ServerState {
             next_run: AtomicU64::new(0),
             seen_events: Mutex::new(Vec::new()),
             approvals,
+            client_terminals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -170,6 +183,26 @@ impl ServerState {
         }
     }
 
+    /// Records a terminal as owned by a client so it can be reaped on exit.
+    fn track_terminal(&self, client: u64, terminal_id: &str) {
+        self.client_terminals
+            .lock()
+            .expect("RPC terminal lock poisoned")
+            .entry(client)
+            .or_default()
+            .push(terminal_id.to_owned());
+    }
+
+    fn forget_terminal(&self, client: u64, terminal_id: &str) {
+        let mut terminals = self
+            .client_terminals
+            .lock()
+            .expect("RPC terminal lock poisoned");
+        if let Some(owned) = terminals.get_mut(&client) {
+            owned.retain(|id| id != terminal_id);
+        }
+    }
+
     fn send(&self, id: u64, message: ServerMessage) {
         if let Some(sender) = self
             .clients
@@ -192,6 +225,33 @@ impl ServerState {
         for sender in senders {
             let _ = sender.send(message.clone());
         }
+    }
+
+    /// Broadcasts terminal output and exit notifications.
+    fn broadcast_terminal(&self, event: TerminalEvent) {
+        let (method, params) = match &event {
+            TerminalEvent::Output { terminal_id, data } => (
+                "terminal.output",
+                json!({ "terminal_id": terminal_id, "data": data }),
+            ),
+            TerminalEvent::Exited {
+                terminal_id,
+                exit_code,
+                reason,
+            } => (
+                "terminal.exited",
+                json!({
+                    "terminal_id": terminal_id,
+                    "exit_code": exit_code,
+                    "reason": reason,
+                }),
+            ),
+        };
+        self.broadcast(ServerMessage::Notification(RpcNotification {
+            version: RPC_PROTOCOL_VERSION,
+            method: method.to_owned(),
+            params,
+        }));
     }
 
     fn begin_run(&self, cancellation: CancellationToken) -> Result<RunId, RpcServerError> {
@@ -399,9 +459,20 @@ fn serve_connection(
         thread::spawn(move || write_messages(writer, receiver, writer_state, writer_client));
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    let mut read_failure = None;
     loop {
         line.clear();
-        let read = reader.read_line(&mut line)?;
+        // A read failure is recorded rather than propagated so terminal cleanup
+        // still runs. Closing a client that has unread output resets the
+        // connection instead of sending a clean EOF, and an early return here
+        // would leak that client's shell processes.
+        let read = match reader.read_line(&mut line) {
+            Ok(read) => read,
+            Err(error) => {
+                read_failure = Some(error);
+                break;
+            }
+        };
         if read == 0 {
             break;
         }
@@ -418,7 +489,7 @@ fn serve_connection(
         }
         match serde_json::from_str::<RpcRequest>(&line) {
             Ok(request) => {
-                let response = dispatch(request, &state, &runtime);
+                let response = dispatch(request, &state, &runtime, client_id);
                 state.send(client_id, ServerMessage::Response(response));
             }
             Err(error) => state.send(
@@ -431,10 +502,37 @@ fn serve_connection(
             ),
         }
     }
+    // Cleanup runs on every exit path, including a reset connection, so a
+    // dropped client never leaves an orphaned shell behind.
+    reap_client_terminals(&runtime, &state, client_id);
     state.unregister(client_id);
     drop(state);
     let _ = writer_thread.join();
-    Ok(())
+    match read_failure {
+        Some(error) => Err(RpcServerError::Io(error)),
+        None => Ok(()),
+    }
+}
+
+/// Terminates every terminal a disconnecting client owned.
+///
+/// Without this, closing the desktop window (or dropping a socket) would leave
+/// orphaned shell processes running with nobody to read their output.
+fn reap_client_terminals(runtime: &Runtime, state: &ServerState, client_id: u64) {
+    let owned = {
+        let mut terminals = state
+            .client_terminals
+            .lock()
+            .expect("RPC terminal lock poisoned");
+        terminals.remove(&client_id).unwrap_or_default()
+    };
+    if owned.is_empty() {
+        return;
+    }
+    let manager = runtime.ptys();
+    for terminal_id in owned {
+        let _ = manager.close(&terminal_id);
+    }
 }
 
 fn write_messages(
@@ -454,7 +552,12 @@ fn write_messages(
     state.unregister(client_id);
 }
 
-fn dispatch(request: RpcRequest, state: &Arc<ServerState>, runtime: &Arc<Runtime>) -> RpcResponse {
+fn dispatch(
+    request: RpcRequest,
+    state: &Arc<ServerState>,
+    runtime: &Arc<Runtime>,
+    client_id: u64,
+) -> RpcResponse {
     if request.version != RPC_PROTOCOL_VERSION {
         return error_response(
             request.id,
@@ -490,6 +593,11 @@ fn dispatch(request: RpcRequest, state: &Arc<ServerState>, runtime: &Arc<Runtime
         "checkpoint.list" => checkpoint_list(runtime),
         "checkpoint.inspect" => checkpoint_inspect(runtime, &request.params),
         "checkpoint.undo" => checkpoint_undo(runtime, &request.params),
+        "terminal.list" => terminal_list(runtime),
+        "terminal.open" => terminal_open(runtime, state, client_id, &request.params),
+        "terminal.write" => terminal_write(runtime, &request.params),
+        "terminal.resize" => terminal_resize(runtime, &request.params),
+        "terminal.close" => terminal_close(runtime, state, client_id, &request.params),
         _ => Err(RpcServerError::Runtime(format!(
             "unknown method {}",
             request.method
@@ -734,6 +842,125 @@ fn relative_file_param(params: &Value) -> Result<String, RpcServerError> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| RpcServerError::Runtime("missing path".to_owned()))
+}
+
+// ---------------------------------------------------------------------------
+// Human terminals
+//
+// These are interactive pseudo-terminals driven by a person at the desktop
+// shell. They are **not** the agent's command path: the agent reaches shell
+// execution only through `ToolRegistry` + the policy engine, and no tool can
+// open a terminal. A terminal intentionally bypasses agent policy because a
+// human is directly responsible for every keystroke. `origin` must be "human",
+// so an agent-initiated call fails loudly instead of silently gaining an
+// unrestricted shell.
+// ---------------------------------------------------------------------------
+
+fn terminal_list(runtime: &Runtime) -> Result<Value, RpcServerError> {
+    Ok(serde_json::to_value(runtime.ptys().list())?)
+}
+
+fn terminal_open(
+    runtime: &Runtime,
+    state: &Arc<ServerState>,
+    client_id: u64,
+    params: &Value,
+) -> Result<Value, RpcServerError> {
+    let origin = params
+        .get("origin")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if origin != "human" {
+        return Err(RpcServerError::Runtime(PtyError::InvalidOrigin.to_string()));
+    }
+    let working_directory = workspace_path(runtime, &json!({}))?;
+    let request = PtyRequest {
+        origin: SessionOrigin::Human,
+        program: params
+            .get("program")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        args: params
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        working_directory: params
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or(working_directory),
+        cols: params
+            .get("cols")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(harness_pty::DEFAULT_COLS),
+        rows: params
+            .get("rows")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(harness_pty::DEFAULT_ROWS),
+    };
+    let info = runtime.ptys().open(request).map_err(pty_error)?;
+    state.track_terminal(client_id, &info.id);
+    Ok(serde_json::to_value(info)?)
+}
+
+fn terminal_write(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    let id = terminal_id_param(params)?;
+    let data = params
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcServerError::Runtime("missing data".to_owned()))?;
+    runtime.ptys().write(&id, data).map_err(pty_error)?;
+    Ok(json!({ "written": data.len() }))
+}
+
+fn terminal_resize(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    let id = terminal_id_param(params)?;
+    let dimension = |key: &str, fallback: u16| {
+        params
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(fallback)
+    };
+    let info = runtime
+        .ptys()
+        .resize(&id, dimension("cols", 80), dimension("rows", 24))
+        .map_err(pty_error)?;
+    Ok(serde_json::to_value(info)?)
+}
+
+fn terminal_close(
+    runtime: &Runtime,
+    state: &Arc<ServerState>,
+    client_id: u64,
+    params: &Value,
+) -> Result<Value, RpcServerError> {
+    let id = terminal_id_param(params)?;
+    state.forget_terminal(client_id, &id);
+    runtime.ptys().close(&id).map_err(pty_error)?;
+    Ok(json!({ "closed": true }))
+}
+
+fn terminal_id_param(params: &Value) -> Result<String, RpcServerError> {
+    params
+        .get("terminal_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| RpcServerError::Runtime("missing terminal_id".to_owned()))
+}
+
+/// Maps a PTY failure onto a stable RPC error code.
+fn pty_error(error: PtyError) -> RpcServerError {
+    RpcServerError::Runtime(format!("{}: {error}", error.code()))
 }
 
 fn checkpoint_list(runtime: &Runtime) -> Result<Value, RpcServerError> {

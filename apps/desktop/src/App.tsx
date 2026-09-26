@@ -39,6 +39,7 @@ import {
   type VerificationActivity,
 } from "./store";
 import { CheckpointTimeline } from "./components/checkpoint-timeline";
+import { TerminalPanel } from "./components/terminal-panel";
 import type { CheckpointEntry } from "./lib/changes";
 import type { GitStatusSummary, SessionSummary } from "./lib/rpc";
 
@@ -82,6 +83,8 @@ function App() {
     checkpoints,
     restoringCheckpointId,
     lastRestore,
+    terminal,
+    closeTerminal,
     connect,
     setWorkspacePath,
     setComposer,
@@ -117,6 +120,26 @@ function App() {
   const connected = status === "connected";
   const running = runPhase === "pending" || runPhase === "running" || runPhase === "cancelling";
   const activeSession = sessions.find((session) => session.id === activeSessionId);
+
+  // A terminal is bound to the workspace it was opened against, so it is
+  // closed whenever the workspace changes or the connection goes away rather
+  // than being carried across into a different repository.
+  useEffect(() => {
+    if (!terminal) return;
+    return () => {
+      void closeTerminal();
+    };
+  }, [terminal, workspacePath, connected, closeTerminal]);
+
+  // Closing the window releases the runtime connection, which makes the runtime
+  // terminate this client's terminal processes instead of leaking them.
+  useEffect(() => {
+    const onUnload = () => {
+      if (terminal) void closeTerminal();
+    };
+    window.addEventListener("beforeunload", onUnload);
+    return () => window.removeEventListener("beforeunload", onUnload);
+  }, [terminal, closeTerminal]);
 
   async function chooseWorkspace() {
     const selected = await open({ directory: true, multiple: false, title: "Select workspace" });
@@ -176,6 +199,8 @@ function App() {
         onRefresh={() => void refreshChanges()}
       />
           <div className="flex min-h-0 flex-1">
+            <div className="flex min-w-0 flex-1 flex-col">
+              <div className="flex min-h-0 flex-1">
             {centerView === "conversation" ? (
               <section className="flex min-w-0 flex-1 flex-col">
                 <MessageStream messages={messages} connected={connected} runPhase={runPhase} />
@@ -219,6 +244,9 @@ function App() {
                 onRestore={(id) => void restoreCheckpoint(id)}
               />
             ) : null}
+              </div>
+              <TerminalPanel />
+            </div>
           </div>
         </main>
       </div>

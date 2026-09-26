@@ -63,6 +63,49 @@ file change, when a mutating tool completes, and when a run ends or a
 checkpoint is restored. Use the refresh control to re-read on demand. The
 runtime's own `.cogito/` state is excluded from reported code changes.
 
+## Terminal
+
+The terminal panel opens an interactive shell backed by a runtime pseudo-terminal
+and rendered with xterm.js. Output streams in both directions, resizes are
+forwarded to the PTY, Ctrl+C is delivered as a real interrupt, and closing the
+shell reports its exit.
+
+### Human vs agent command execution
+
+These are two different paths and the panel labels itself accordingly
+("human · not policy governed"):
+
+- **Agent commands** go through the runtime's tool registry, which checks every
+  call against the policy engine and runs it captured and non-interactively.
+- **Terminal sessions** are interactive and intentionally skip agent policy,
+  because a person types into them directly. The runtime enforces the split:
+  `harness-pty` registers no tool, so the agent cannot reach it, and
+  `terminal.open` requires `origin: "human"`.
+
+A terminal is tied to the current workspace and is closed when the workspace
+changes or the runtime connection drops. The runtime reaps a client's terminals
+on disconnect, so closing the window does not leave a shell running.
+
+### Platform prerequisites
+
+PTY support uses the platform's native pseudo-terminal layer, so there are extra
+requirements beyond the Tauri prerequisites above:
+
+- **Windows 10 version 1809 (build 17763) or newer** is required for ConPTY,
+  which the runtime uses to back the shell. Older builds cannot open a terminal.
+  The default shell is PowerShell (`powershell.exe`); it is present on all
+  supported Windows versions.
+- **Linux** requires a PTY-capable environment; the default shell is `/bin/sh`.
+  `portable-pty` needs no extra packages, but a headless container without
+  `/dev/ptmx` cannot create a terminal.
+- **macOS** uses the native `forkpty` implementation and has no extra
+  requirements.
+
+The console host inside a Windows PTY queries the terminal for its cursor
+position and blocks until something answers. xterm.js answers this
+automatically, which is why the terminal must be rendered with a real terminal
+emulator rather than printed to a log view.
+
 ## Checks
 
 ```text

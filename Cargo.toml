@@ -20,6 +20,7 @@ harness-tools = { path = "crates/harness-tools" }
 harness-policy = { path = "crates/harness-policy" }
 harness-session = { path = "crates/harness-session" }
 harness-git = { path = "crates/harness-git" }
+harness-pty = { path = "crates/harness-pty" }
 harness-verification = { path = "crates/harness-verification" }
 harness-rpc = { path = "crates/harness-rpc" }
 harness-cli = { path = "crates/harness-cli" }
