@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
@@ -13,14 +13,12 @@ import {
   FileDiff,
   FolderOpen,
   GitBranch,
-  History,
   LoaderCircle,
   MessageSquare,
   PanelRight,
   Play,
   PlugZap,
   RotateCcw,
-  Send,
   Server,
   Settings2,
   ShieldCheck,
@@ -42,6 +40,26 @@ import {
 import { CheckpointTimeline } from "./components/checkpoint-timeline";
 import { SettingsDialog } from "./components/settings-dialog";
 import { TerminalPanel } from "./components/terminal-panel";
+import { AppRail, type RailTarget } from "./components/app-rail";
+import { ProjectSidebar, type ProjectEntry } from "./components/project-sidebar";
+import { ActivityView, HistoryView, ProjectsView } from "./components/workspace-views";
+import { LandingView } from "./components/landing-view";
+import { PromptComposer } from "./components/prompt-composer";
+import type { SettingsScreen } from "./lib/settings";
+import { readStoredRailTarget, storeRailTarget } from "./lib/shell-prefs";
+import {
+  Badge,
+  Button,
+  CommandMenu,
+  EmptyState,
+  IconButton,
+  ScrollArea,
+  StatusIndicator,
+  Tooltip,
+  toneText,
+  type Tone,
+} from "./components/ui";
+import { cx } from "./components/ui/cx";
 import type { CheckpointEntry } from "./lib/changes";
 import type { GitStatusSummary, SessionSummary } from "./lib/rpc";
 
@@ -59,6 +77,10 @@ function App() {
   const [showContext, setShowContext] = useState(true);
   const [centerView, setCenterView] = useState<CenterView>("conversation");
   const [showSettings, setShowSettings] = useState(false);
+  const [showCommands, setShowCommands] = useState(false);
+  const [railTarget, setRailTarget] = useState<RailTarget>(readStoredRailTarget);
+  const [settingsScreen, setSettingsScreen] = useState<SettingsScreen>("models");
+  const [pendingMode, setPendingMode] = useState<string | null>(null);
   const {
     status,
     clientId,
@@ -87,6 +109,9 @@ function App() {
     restoringCheckpointId,
     lastRestore,
     terminal,
+    settings,
+    updateModel,
+    updatePermissionMode,
     closeTerminal,
     connect,
     setWorkspacePath,
@@ -123,6 +148,9 @@ function App() {
   const connected = status === "connected";
   const running = runPhase === "pending" || runPhase === "running" || runPhase === "cancelling";
   const activeSession = sessions.find((session) => session.id === activeSessionId);
+  // The landing screen is for "no conversation selected". A session that exists
+  // but has not been resumed yet has no transcript, so it still counts as empty.
+  const hasConversation = Boolean(activeSessionId) && messages.length > 0;
 
   // A terminal is bound to the workspace it was opened against, so it is
   // closed whenever the workspace changes or the connection goes away rather
@@ -144,6 +172,19 @@ function App() {
     return () => window.removeEventListener("beforeunload", onUnload);
   }, [terminal, closeTerminal]);
 
+  // The command palette only offers actions that already exist elsewhere in the
+  // shell. It is a faster route to them, not a new capability.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setShowCommands((value) => !value);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   async function chooseWorkspace() {
     const selected = await open({ directory: true, multiple: false, title: "Select workspace" });
     if (typeof selected === "string") setWorkspacePath(selected);
@@ -153,109 +194,313 @@ function App() {
     await connect(address, workspacePath);
   }
 
-  async function submitMessage(event: React.FormEvent) {
-    event.preventDefault();
-    if (composer.trim()) await sendMessage(composer);
+  /**
+   * The rail's selection is the only piece of shell state that outlives a
+   * restart, so it is the only one persisted.
+   */
+  function onRailSelect(target: RailTarget) {
+    setRailTarget(target);
+    storeRailTarget(target);
+    if (target === "models" || target === "settings") {
+      setSettingsScreen(target === "models" ? "models" : "runtime");
+      setShowSettings(true);
+    }
   }
 
+  function onSelectProject(path: string) {
+    if (!path) return;
+    setWorkspacePath(path);
+  }
+
+  // Projects come from the sessions the runtime reports, so the list reflects
+  // real workspaces rather than invented entries.
+  const projects = useMemo<ProjectEntry[]>(() => {
+    const counts = new Map<string, number>();
+    for (const session of sessions) {
+      counts.set(session.workspace_root, (counts.get(session.workspace_root) ?? 0) + 1);
+    }
+    const roots = new Set<string>(counts.keys());
+    if (workspacePath) roots.add(workspacePath);
+    return [...roots].map((path) => ({
+      path,
+      label: path.split(/[\\/]/).filter(Boolean).pop() ?? path,
+      sessionCount: counts.get(path) ?? 0,
+      active: path === workspacePath,
+    }));
+  }, [sessions, workspacePath]);
+
+
+  /**
+   * The composer owns submission so that Enter, Shift+Enter, and the send
+   * button all funnel through the same path; the form event is only used to stop
+   * the browser navigating on a native submit.
+   */
+  async function submitPrompt(text: string) {
+    await sendMessage(text);
+  }
+
+  async function selectModel(model: string) {
+    await updateModel({ model });
+  }
+
+  async function selectMode(mode: string) {
+    if (mode === settings?.permissions.mode) return;
+    setPendingMode(mode);
+    try {
+      await updatePermissionMode(mode);
+    } finally {
+      setPendingMode(null);
+    }
+  }
+
+  // The palette only offers actions that already exist elsewhere in the shell.
+  // It is a faster route to them, not a new capability, and it is built inline
+  // because the handlers it closes over are recreated on every render.
+  const commandItems = [
+    {
+      id: "connect",
+      label: connected ? "Runtime connected" : "Connect to runtime",
+      detail: address,
+      icon: <PlugZap className="size-icon-sm" />,
+      disabled: connected || !workspacePath,
+      onSelect: () => void connectRuntime(),
+    },
+    {
+      id: "workspace",
+      label: "Choose workspace folder",
+      icon: <FolderOpen className="size-icon-sm" />,
+      onSelect: () => void chooseWorkspace(),
+    },
+    {
+      id: "session.new",
+      label: "New session",
+      icon: <Play className="size-icon-sm" />,
+      disabled: !connected || running || isLoadingSession,
+      onSelect: () => void createSession(),
+    },
+    {
+      id: "session.resume",
+      label: "Resume selected session",
+      icon: <RotateCcw className="size-icon-sm" />,
+      disabled: !connected || !activeSessionId || running,
+      onSelect: () => void resumeSession(),
+    },
+    {
+      id: "view.changes",
+      label: "Show code changes",
+      icon: <FileDiff className="size-icon-sm" />,
+      onSelect: () => setCenterView("changes"),
+    },
+    {
+      id: "view.conversation",
+      label: "Show conversation",
+      icon: <MessageSquare className="size-icon-sm" />,
+      onSelect: () => setCenterView("conversation"),
+    },
+    {
+      id: "changes.refresh",
+      label: "Refresh code changes",
+      icon: <RotateCcw className="size-icon-sm" />,
+      disabled: !connected,
+      onSelect: () => void refreshChanges(),
+    },
+    {
+      id: "context.toggle",
+      label: showContext ? "Hide context panel" : "Show context panel",
+      icon: <PanelRight className="size-icon-sm" />,
+      onSelect: () => setShowContext((value) => !value),
+    },
+    {
+      id: "run.cancel",
+      label: "Stop the running task",
+      icon: <Square className="size-icon-sm" />,
+      disabled: !running,
+      onSelect: () => cancel(),
+    },
+    {
+      id: "settings",
+      label: "Open settings",
+      icon: <Settings2 className="size-icon-sm" />,
+      onSelect: () => setShowSettings(true),
+    },
+  ];
+
   return (
-    <div className="flex h-screen min-h-[640px] flex-col bg-ink-950 text-ink-200">
-      <TopBar
-        status={status}
-        address={address}
+    <div className="flex h-screen min-h-[560px] overflow-hidden bg-app text-secondary">
+      <AppRail
+        target={railTarget}
+        onSelect={onRailSelect}
+        profileLabel="Local runtime session"
+        statusSlot={<BrandMark />}
+      />
+      <ProjectSidebar
+        productName="CogitoAI"
+        sessions={sessions}
+        activeSessionId={activeSessionId}
         workspacePath={workspacePath}
-        connected={connected}
-        onAddressChange={setAddress}
-        onWorkspaceChange={setWorkspacePath}
-        onChooseWorkspace={chooseWorkspace}
-        onConnect={connectRuntime}
-        onToggleContext={() => setShowContext((value) => !value)}
-        onOpenSettings={() => setShowSettings(true)}
-        showContext={showContext}
+        status={status}
+        projects={projects}
+        onSelectSession={selectSession}
+        onNewSession={() => void createSession()}
+        onSelectProject={onSelectProject}
+        disabled={!connected || running || isLoadingSession}
+        onSearch={() => setShowCommands(true)}
       />
-      <div className="flex min-h-0 flex-1">
-        <Sidebar
-          sessions={sessions}
-          activeSessionId={activeSessionId}
-          onSelect={selectSession}
-          onNew={createSession}
-          disabled={!connected || running || isLoadingSession}
+      <main className="flex min-w-0 flex-1 flex-col">
+        <WorkspaceTopBar
+          status={status}
+          address={address}
+          connected={connected}
+          onAddressChange={setAddress}
+          onConnect={connectRuntime}
+          onChooseWorkspace={chooseWorkspace}
+          onToggleContext={() => setShowContext((value) => !value)}
+          onOpenCommands={() => setShowCommands(true)}
+          showContext={showContext}
         />
-        <main className="flex min-w-0 flex-1 flex-col">
-          <WorkspaceHeader
-            workspace={workspace}
-            session={activeSession}
-            runPhase={runPhase}
-            running={running}
-            isLoadingSession={isLoadingSession}
-            canResume={connected && Boolean(activeSessionId)}
-            onResume={() => void resumeSession()}
-            onCancel={cancel}
-            gitStatus={gitStatus}
-            changeCount={changes.entries.length}
-          />
-          <ViewSwitcher
-        view={centerView}
-        onChange={setCenterView}
-        changeCount={changes.entries.length}
-        canRefresh={connected}
-        isRefreshing={isLoadingChanges}
-        onRefresh={() => void refreshChanges()}
-      />
-          <div className="flex min-h-0 flex-1">
-            <div className="flex min-w-0 flex-1 flex-col">
-              <div className="flex min-h-0 flex-1">
-            {centerView === "conversation" ? (
-              <section className="flex min-w-0 flex-1 flex-col">
-                <MessageStream messages={messages} connected={connected} runPhase={runPhase} />
-                <Composer
-                  value={composer}
-                  onChange={setComposer}
-                  onSubmit={submitMessage}
-                  disabled={!connected || running || !workspacePath}
-                  running={running}
-                  onCancel={cancel}
-                />
-              </section>
-            ) : (
-              <Suspense fallback={<PanelLoading label="Loading code view…" />}>
-                <ChangesPanel
-                  entries={changes.entries}
-                  selectedPath={selectedPath}
-                  fileChange={fileChange}
-                  fileView={fileView}
-                  isLoading={isLoadingChanges || isLoadingFile}
-                  isTruncated={isChangesTruncated}
-                  totalChanged={gitStatus?.changed_files.length ?? changes.entries.length}
-                  isGitWorkspace={Boolean(workspace?.repository_root)}
-                  onSelect={(path) => void selectFile(path)}
-                  onClear={clearSelectedFile}
-                />
-              </Suspense>
-            )}
-            {showContext ? (
-              <ContextPanel
-                tools={toolActivity}
-                verification={verificationActivity}
-                timeline={timeline}
-                approvals={approvals}
-                onApprove={approve}
-                onDeny={deny}
-                checkpoints={checkpoints}
-                restoringId={restoringCheckpointId}
-                lastRestore={lastRestore}
-                restoreDisabled={!connected || running}
-                onRestore={(id) => void restoreCheckpoint(id)}
-              />
-            ) : null}
+        {railTarget === "home" ? (
+          <>
+            <WorkspaceHeader
+              workspace={workspace}
+              session={activeSession}
+              runPhase={runPhase}
+              running={running}
+              isLoadingSession={isLoadingSession}
+              canResume={connected && Boolean(activeSessionId)}
+              onResume={() => void resumeSession()}
+              onCancel={cancel}
+              gitStatus={gitStatus}
+              changeCount={changes.entries.length}
+            />
+            <ViewSwitcher
+              view={centerView}
+              onChange={setCenterView}
+              changeCount={changes.entries.length}
+              canRefresh={connected}
+              isRefreshing={isLoadingChanges}
+              onRefresh={() => void refreshChanges()}
+            />
+            <div className="flex min-h-0 flex-1">
+              <div className="flex min-w-0 flex-1 flex-col">
+                <div className="flex min-h-0 flex-1">
+                  {centerView === "conversation" ? (
+                    <section className="flex min-w-0 flex-1 flex-col">
+                      {hasConversation ? (
+                        <>
+                          <MessageStream
+                            messages={messages}
+                            connected={connected}
+                            runPhase={runPhase}
+                          />
+                          <div className="shrink-0 border-t border-line bg-app px-6 py-4">
+                            <div className="mx-auto max-w-3xl">
+                              <PromptComposer
+                                value={composer}
+                                onChange={setComposer}
+                                onSubmit={submitPrompt}
+                                disabled={!connected || running || !workspacePath}
+                                running={running}
+                                onCancel={cancel}
+                                models={settings?.models ?? null}
+                                permissions={settings?.permissions ?? null}
+                                onSelectModel={selectModel}
+                                onSelectMode={selectMode}
+                                pendingMode={pendingMode}
+                                workspacePath={workspacePath}
+                                onChooseWorkspace={chooseWorkspace}
+                                connected={connected}
+                              />
+                            </div>
+                          </div>
+                        </>
+                      ) : (
+                        <LandingView
+                          value={composer}
+                          onChange={setComposer}
+                          onSubmit={submitPrompt}
+                          disabled={!connected || running || !workspacePath}
+                          running={running}
+                          onCancel={cancel}
+                          connected={connected}
+                          workspacePath={workspacePath}
+                          onChooseWorkspace={chooseWorkspace}
+                          models={settings?.models ?? null}
+                          permissions={settings?.permissions ?? null}
+                          onSelectModel={selectModel}
+                          onSelectMode={selectMode}
+                          pendingMode={pendingMode}
+                          runtimeError={lastError}
+                        />
+                      )}
+                    </section>
+                  ) : (
+                    <Suspense fallback={<PanelLoading label="Loading code view…" />}>
+                      <ChangesPanel
+                        entries={changes.entries}
+                        selectedPath={selectedPath}
+                        fileChange={fileChange}
+                        fileView={fileView}
+                        isLoading={isLoadingChanges || isLoadingFile}
+                        isTruncated={isChangesTruncated}
+                        totalChanged={gitStatus?.changed_files.length ?? changes.entries.length}
+                        isGitWorkspace={Boolean(workspace?.repository_root)}
+                        onSelect={(path) => void selectFile(path)}
+                        onClear={clearSelectedFile}
+                      />
+                    </Suspense>
+                  )}
+                  {showContext ? (
+                    <ContextPanel
+                      tools={toolActivity}
+                      verification={verificationActivity}
+                      timeline={timeline}
+                      approvals={approvals}
+                      onApprove={approve}
+                      onDeny={deny}
+                      checkpoints={checkpoints}
+                      restoringId={restoringCheckpointId}
+                      lastRestore={lastRestore}
+                      restoreDisabled={!connected || running}
+                      onRestore={(id) => void restoreCheckpoint(id)}
+                    />
+                  ) : null}
+                </div>
+                <TerminalPanel />
               </div>
-              <TerminalPanel />
             </div>
-          </div>
-        </main>
-      </div>
-      <StatusBar status={status} runPhase={runPhase} workspacePath={workspacePath} lastError={lastError} onClearError={clearError} />
-      <SettingsDialog open={showSettings} onClose={() => setShowSettings(false)} />
+          </>
+        ) : railTarget === "history" ? (
+          <HistoryView
+            timeline={timeline}
+            sessions={sessions}
+            onSelectSession={selectSession}
+            activeSessionId={activeSessionId}
+          />
+        ) : railTarget === "activity" ? (
+          <ActivityView tools={toolActivity} verification={verificationActivity} />
+        ) : (
+          <ProjectsView project={settings?.project ?? null} />
+        )}
+        <StatusBar
+          status={status}
+          runPhase={runPhase}
+          workspacePath={workspacePath}
+          lastError={lastError}
+          onClearError={clearError}
+        />
+      </main>
+      <SettingsDialog
+        open={showSettings}
+        initialScreen={settingsScreen}
+        onClose={() => setShowSettings(false)}
+      />
+      <CommandMenu
+        open={showCommands}
+        onClose={() => setShowCommands(false)}
+        items={commandItems}
+        label="Command palette"
+        placeholder="Jump to an action…"
+      />
       {lastError ? <ErrorToast message={lastError} onClose={clearError} /> : null}
     </div>
   );
@@ -276,203 +521,140 @@ function ViewSwitcher({
   isRefreshing: boolean;
   onRefresh: () => void;
 }) {
+  const tab = (id: CenterView, label: string, icon: React.ReactNode, count?: number) => (
+    <button
+      role="tab"
+      aria-selected={view === id}
+      className={cx(
+        "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium",
+        "transition-colors duration-fast",
+        view === id ? "bg-active text-primary" : "text-muted hover:bg-hover hover:text-primary",
+      )}
+      onClick={() => onChange(id)}
+    >
+      {icon}
+      {label}
+      {count !== undefined && count > 0 ? (
+        <span className="rounded-sm bg-active px-1 py-0.5 font-mono text-2xs text-secondary">
+          {count}
+        </span>
+      ) : null}
+    </button>
+  );
+
   return (
-    <div className="flex shrink-0 items-center gap-1 border-b border-ink-800 bg-ink-950/60 px-4 py-1.5" role="tablist" aria-label="Workspace view">
-      <button
-        role="tab"
-        aria-selected={view === "conversation"}
-        className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-          view === "conversation" ? "bg-ink-800 text-ink-100" : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"
-        }`}
-        onClick={() => onChange("conversation")}
-      >
-        <MessageSquare size={12} /> Conversation
-      </button>
-      <button
-        role="tab"
-        aria-selected={view === "changes"}
-        className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-          view === "changes" ? "bg-ink-800 text-ink-100" : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"
-        }`}
-        onClick={() => onChange("changes")}
-      >
-        <FileDiff size={12} /> Changes
-        {changeCount > 0 ? (
-          <span className="rounded bg-ink-700 px-1.5 py-0.5 font-mono text-[9px] text-ink-200">{changeCount}</span>
-        ) : null}
-      </button>
+    <div
+      className="flex shrink-0 items-center gap-1 border-b border-line bg-app px-4 py-1.5"
+      role="tablist"
+      aria-label="Workspace view"
+    >
+      {tab("conversation", "Conversation", <MessageSquare className="size-icon-sm" />)}
+      {tab("changes", "Changes", <FileDiff className="size-icon-sm" />, changeCount)}
       {view === "changes" ? (
-        <button
-          className="icon-button ml-auto h-6 w-6"
-          onClick={onRefresh}
-          disabled={!canRefresh || isRefreshing}
-          aria-label="Refresh code changes"
-          title="Re-read code changes from the runtime"
-        >
-          <RotateCcw size={12} className={isRefreshing ? "animate-spin" : ""} />
-        </button>
+        <Tooltip label="Re-read code changes from the runtime">
+          <IconButton
+            label="Refresh code changes"
+            size="sm"
+            className="ml-auto"
+            onClick={onRefresh}
+            disabled={!canRefresh || isRefreshing}
+          >
+            <RotateCcw className={cx("size-icon-sm", isRefreshing && "animate-spin")} />
+          </IconButton>
+        </Tooltip>
       ) : null}
     </div>
   );
 }
 
-
-function TopBar({
-  status,
-  address,
-  workspacePath,
-  connected,
-  onAddressChange,
-  onWorkspaceChange,
-  onChooseWorkspace,
-  onConnect,
-  onToggleContext,
-  onOpenSettings,
-  showContext,
-}: {
-  status: string;
-  address: string;
-  workspacePath: string;
-  connected: boolean;
-  onAddressChange: (value: string) => void;
-  onWorkspaceChange: (value: string) => void;
-  onChooseWorkspace: () => void;
-  onConnect: () => void;
-  onToggleContext: () => void;
-  onOpenSettings: () => void;
-  showContext: boolean;
-}) {
+/** Product mark for the rail. Uses the harness's own glyph, not a vendor logo. */
+function BrandMark() {
   return (
-    <header className="flex h-14 shrink-0 items-center gap-3 border-b border-ink-800 bg-ink-950/95 px-4">
-      <div className="flex w-56 shrink-0 items-center gap-2">
-        <div className="flex h-7 w-7 items-center justify-center rounded-md bg-signal-500 text-ink-950">
-          <Code2 size={16} strokeWidth={2.4} />
-        </div>
-        <span className="text-sm font-semibold tracking-tight text-ink-100">CogitoAI</span>
-        <span className="mono-label ml-1">v0</span>
-      </div>
-      <div className="flex min-w-0 flex-1 items-center gap-2">
-        <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-ink-800 bg-ink-900 px-2.5">
-          <Server size={14} className="shrink-0 text-ink-500" />
-          <input
-            aria-label="Runtime address"
-            className="min-w-0 flex-1 bg-transparent py-2 font-mono text-xs text-ink-200 outline-none placeholder:text-ink-600"
-            value={address}
-            onChange={(event) => onAddressChange(event.target.value)}
-            placeholder="127.0.0.1:4545"
-          />
-          <StatusPill status={status} />
-        </div>
-        <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-ink-800 bg-ink-900 px-2.5">
-          <FolderOpen size={14} className="shrink-0 text-ink-500" />
-          <input
-            aria-label="Workspace path"
-            className="min-w-0 flex-1 bg-transparent py-2 font-mono text-xs text-ink-200 outline-none placeholder:text-ink-600"
-            value={workspacePath}
-            onChange={(event) => onWorkspaceChange(event.target.value)}
-            placeholder="Choose a repository path"
-          />
-          <button className="icon-button" onClick={onChooseWorkspace} aria-label="Choose workspace" title="Choose workspace">
-            <FolderOpen size={15} />
-          </button>
-        </div>
-        <button className="primary-button" onClick={onConnect} disabled={connected || !workspacePath}>
-          {status === "connecting" ? <LoaderCircle size={14} className="animate-spin" /> : <PlugZap size={14} />}
-          {connected ? "Connected" : "Connect"}
-        </button>
-      </div>
-      <button
-        className="icon-button"
-        onClick={onOpenSettings}
-        aria-label="Open settings"
-        title="Settings"
-      >
-        <Settings2 size={16} />
-      </button>
-      <button
-        className={`icon-button ${showContext ? "bg-ink-800 text-ink-100" : ""}`}
-        onClick={onToggleContext}
-        aria-label="Toggle context panel"
-        title="Toggle context panel"
-      >
-        <PanelRight size={16} />
-      </button>
-    </header>
-  );
-}
-
-function StatusPill({ status }: { status: string }) {
-  const connected = status === "connected";
-  const busy = status === "connecting";
-  return (
-    <span className={`flex shrink-0 items-center gap-1.5 text-[10px] font-medium ${connected ? "text-success" : busy ? "text-warning" : "text-ink-500"}`}>
-      <CircleDot size={11} className={busy ? "animate-pulse" : ""} />
-      {status}
+    <span
+      aria-hidden
+      className="flex size-7 items-center justify-center rounded-md bg-accent text-inverse"
+    >
+      <Code2 className="size-icon-md" strokeWidth={2.4} />
     </span>
   );
 }
 
-function Sidebar({
-  sessions,
-  activeSessionId,
-  onSelect,
-  onNew,
-  disabled,
+/**
+ * Connection controls for the main region.
+ *
+ * In a three-region layout the top bar belongs to the workspace rather than the
+ * application, so it carries only what scopes the current run: which runtime is
+ * connected, and the view-level toggles. Product identity and the workspace
+ * switcher live in the sidebar.
+ */
+function WorkspaceTopBar({
+  status,
+  address,
+  connected,
+  onAddressChange,
+  onConnect,
+  onChooseWorkspace,
+  onToggleContext,
+  onOpenCommands,
+  showContext,
 }: {
-  sessions: SessionSummary[];
-  activeSessionId: string | null;
-  onSelect: (id: string) => void;
-  onNew: () => void;
-  disabled: boolean;
+  status: string;
+  address: string;
+  connected: boolean;
+  onAddressChange: (value: string) => void;
+  onConnect: () => void;
+  onChooseWorkspace: () => void;
+  onToggleContext: () => void;
+  onOpenCommands: () => void;
+  showContext: boolean;
 }) {
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-ink-800 bg-ink-900/60">
-      <div className="flex items-center justify-between border-b border-ink-800 px-4 py-3">
-        <div>
-          <p className="mono-label">Workspace</p>
-          <p className="mt-1 max-w-48 truncate text-xs text-ink-300">Sessions</p>
-        </div>
-        <button className="icon-button" onClick={() => void onNew()} disabled={disabled} aria-label="New session" title="New session">
-          <Play size={15} />
-        </button>
+    <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line bg-app px-3">
+      <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-line bg-panel px-2.5 transition-colors duration-fast focus-within:border-line-stronger">
+        <Server className="size-icon-md shrink-0 text-faint" />
+        <input
+          aria-label="Runtime address"
+          className="min-w-0 flex-1 bg-transparent py-1.5 font-mono text-xs text-secondary outline-none placeholder:text-faint"
+          value={address}
+          onChange={(event) => onAddressChange(event.target.value)}
+          placeholder="127.0.0.1:4545"
+        />
+        <StatusIndicator status={status} />
       </div>
-      <nav className="min-h-0 flex-1 overflow-y-auto p-2" aria-label="Sessions">
-        {sessions.length === 0 ? (
-          <div className="px-3 py-8 text-center text-xs leading-5 text-ink-500">
-            No sessions yet. Connect a runtime and start a task.
-          </div>
-        ) : (
-          sessions.map((session) => (
-            <button
-              key={session.id}
-              className={`group mb-1 flex w-full items-start gap-2 rounded-md px-2.5 py-2 text-left transition-colors ${session.id === activeSessionId ? "bg-ink-800 text-ink-100" : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"}`}
-              onClick={() => onSelect(session.id)}
-            >
-              <MessageSquare size={14} className="mt-0.5 shrink-0 text-ink-500" />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate font-mono text-[11px]">{session.id}</span>
-                <span className="mt-1 flex items-center gap-2 text-[10px] text-ink-500">
-                  <span className={session.status === "Failed" ? "text-danger" : session.status === "Completed" ? "text-success" : "text-signal-400"}>
-                    {session.status}
-                  </span>
-                  <span>{session.event_count} events</span>
-                </span>
-              </span>
-              <ChevronRight size={13} className="mt-1 shrink-0 text-ink-600 group-hover:text-ink-400" />
-            </button>
-          ))
-        )}
-      </nav>
-      <div className="border-t border-ink-800 p-3">
-        <div className="flex items-center gap-2 text-[11px] text-ink-500">
-          <History size={13} />
-          <span>Durable JSONL history</span>
-        </div>
-      </div>
-    </aside>
+
+      <Tooltip label="Choose workspace folder">
+        <IconButton label="Choose workspace" onClick={onChooseWorkspace}>
+          <FolderOpen className="size-icon-lg" />
+        </IconButton>
+      </Tooltip>
+
+      <Button
+        variant="primary"
+        size="sm"
+        onClick={onConnect}
+        disabled={connected}
+        icon={
+          status === "connecting" ? (
+            <LoaderCircle className="size-icon-sm animate-spin" />
+          ) : (
+            <PlugZap className="size-icon-sm" />
+          )
+        }
+      >
+        {connected ? "Connected" : "Connect"}
+      </Button>
+
+      <Tooltip label="Command palette (Ctrl+K)">
+        <IconButton label="Open command palette" onClick={onOpenCommands}>
+          <Code2 className="size-icon-lg" />
+        </IconButton>
+      </Tooltip>
+      <IconButton label="Toggle context panel" onClick={onToggleContext} active={showContext}>
+        <PanelRight className="size-icon-lg" />
+      </IconButton>
+    </header>
   );
 }
-
 function WorkspaceHeader({
   workspace,
   session,
@@ -497,33 +679,51 @@ function WorkspaceHeader({
   changeCount: number;
 }) {
   return (
-    <div className="flex h-16 shrink-0 items-center justify-between border-b border-ink-800 px-6">
+    <div className="flex h-16 shrink-0 items-center justify-between border-b border-line px-6">
       <div className="min-w-0">
         <div className="flex items-center gap-2">
-          <h1 className="truncate text-sm font-semibold text-ink-100">{workspace?.repository_root ?? workspace?.current_directory ?? "No workspace selected"}</h1>
+          <h1 className="truncate text-md font-semibold text-primary">
+            {workspace?.repository_root ?? workspace?.current_directory ?? "No workspace selected"}
+          </h1>
           <RunBadge phase={runPhase} />
         </div>
-        <div className="mt-1 flex items-center gap-3 text-[11px] text-ink-500">
+        <div className="mt-1 flex items-center gap-3 text-2xs text-faint">
           <span className="flex items-center gap-1">
-            <GitBranch size={12} />
+            <GitBranch className="size-icon-sm" />
             {gitStatus?.branch ? gitStatus.branch : workspace?.repository_root ? "git workspace" : "local folder"}
           </span>
           <span>{workspace?.languages?.length ?? 0} languages</span>
           <span>{session ? `${session.event_count} events` : "new session"}</span>
-          {changeCount > 0 ? <span className="text-signal-400">{changeCount} changed files</span> : null}
+          {changeCount > 0 ? (
+            <span className="text-accent">{changeCount} changed files</span>
+          ) : null}
         </div>
       </div>
       <div className="flex items-center gap-2">
         {canResume && !running ? (
-          <button className="quiet-button" onClick={onResume} disabled={isLoadingSession}>
-            {isLoadingSession ? <LoaderCircle size={13} className="animate-spin" /> : <RotateCcw size={13} />}
+          <Button
+            onClick={onResume}
+            disabled={isLoadingSession}
+            icon={
+              isLoadingSession ? (
+                <LoaderCircle className="size-icon-sm animate-spin" />
+              ) : (
+                <RotateCcw className="size-icon-sm" />
+              )
+            }
+          >
             Resume
-          </button>
+          </Button>
         ) : null}
         {running ? (
-          <button className="quiet-button border-danger/30 text-danger hover:border-danger/50 hover:bg-danger/10" onClick={onCancel} disabled={runPhase === "cancelling"}>
-            <Square size={13} fill="currentColor" /> {runPhase === "cancelling" ? "Cancelling" : "Stop run"}
-          </button>
+          <Button
+            variant="danger"
+            onClick={onCancel}
+            disabled={runPhase === "cancelling"}
+            icon={<Square className="size-icon-sm" fill="currentColor" />}
+          >
+            {runPhase === "cancelling" ? "Cancelling" : "Stop run"}
+          </Button>
         ) : null}
       </div>
     </div>
@@ -532,46 +732,69 @@ function WorkspaceHeader({
 
 function RunBadge({ phase }: { phase: RunPhase }) {
   if (phase === "idle") return null;
-  const styles: Record<Exclude<RunPhase, "idle">, string> = {
-    pending: "text-warning",
-    running: "text-signal-400",
-    cancelling: "text-warning",
-    completed: "text-success",
-    failed: "text-danger",
-    cancelled: "text-warning",
-  };
+  const tone: Tone =
+    phase === "completed"
+      ? "success"
+      : phase === "failed"
+        ? "error"
+        : phase === "running"
+          ? "accent"
+          : "warning";
+  const busy = phase === "running" || phase === "pending" || phase === "cancelling";
   return (
-    <span className={`flex items-center gap-1.5 text-[10px] ${styles[phase]}`}>
-      {phase === "running" || phase === "pending" || phase === "cancelling" ? <Activity size={12} className="animate-pulse" /> : phase === "completed" ? <CheckCircle2 size={12} /> : <CircleAlert size={12} />}
+    <Badge tone={tone} indicator={false}>
+      {busy ? (
+        <Activity className="size-icon-xs animate-pulse" />
+      ) : phase === "completed" ? (
+        <CheckCircle2 className="size-icon-xs" />
+      ) : (
+        <CircleAlert className="size-icon-xs" />
+      )}
       {phase}
-    </span>
+    </Badge>
   );
 }
 
-function MessageStream({ messages, connected, runPhase }: { messages: ChatMessage[]; connected: boolean; runPhase: RunPhase }) {
+function MessageStream({
+  messages,
+  connected,
+  runPhase,
+}: {
+  messages: ChatMessage[];
+  connected: boolean;
+  runPhase: RunPhase;
+}) {
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
+    <ScrollArea className="flex-1 px-6 py-6">
       {messages.length === 0 ? (
-        <EmptyState connected={connected} />
+        <EmptyConversation connected={connected} />
       ) : (
         <div className="mx-auto max-w-3xl space-y-5">
-          {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
-          {runPhase === "pending" ? <div className="flex items-center gap-2 text-xs text-ink-500"><LoaderCircle size={13} className="animate-spin" />Runtime accepted the message…</div> : null}
+          {messages.map((message) => (
+            <MessageBubble key={message.id} message={message} />
+          ))}
+          {runPhase === "pending" ? (
+            <p className="flex items-center gap-2 text-xs text-faint">
+              <LoaderCircle className="size-icon-sm animate-spin" />Runtime accepted the message…
+            </p>
+          ) : null}
         </div>
       )}
-    </div>
+    </ScrollArea>
   );
 }
 
-function EmptyState({ connected }: { connected: boolean }) {
+function EmptyConversation({ connected }: { connected: boolean }) {
   return (
     <div className="mx-auto flex h-full max-w-lg flex-col items-center justify-center text-center">
-      <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl border border-ink-700 bg-ink-900 text-signal-400 shadow-panel">
-        <Bot size={22} />
+      <div className="mb-4 flex size-12 items-center justify-center rounded-xl border border-line bg-panel text-accent">
+        <Bot className="size-icon-2xl" />
       </div>
-      <h2 className="text-base font-semibold text-ink-100">Ready when the runtime is</h2>
-      <p className="mt-2 max-w-sm text-sm leading-6 text-ink-500">
-        {connected ? "Send a task to start a durable session. Tool approvals and runtime events will appear here." : "Connect to a running CogitoAI RPC runtime to begin. The desktop shell never runs agent logic itself."}
+      <h2 className="text-md font-semibold text-primary">Ready when the runtime is</h2>
+      <p className="mt-2 max-w-sm text-sm leading-6 text-faint">
+        {connected
+          ? "Send a task to start a durable session. Tool approvals and runtime events will appear here."
+          : "Connect to a running CogitoAI RPC runtime to begin. The desktop shell never runs agent logic itself."}
       </p>
     </div>
   );
@@ -580,59 +803,28 @@ function EmptyState({ connected }: { connected: boolean }) {
 function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
   return (
-    <div className={`flex gap-3 ${isUser ? "justify-end" : "justify-start"}`}>
-      {!isUser ? <div className="mt-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-ink-800 text-signal-400"><Bot size={13} /></div> : null}
-      <div className={`max-w-[82%] rounded-lg px-3.5 py-3 text-sm leading-6 ${isUser ? "bg-signal-500/15 text-ink-100 ring-1 ring-inset ring-signal-500/20" : "bg-ink-900 text-ink-200 ring-1 ring-inset ring-ink-800"}`}>
-        <p className="whitespace-pre-wrap break-words">{message.text || (message.streaming ? "…" : "")}</p>
-        {message.streaming ? <span className="ml-1 inline-block h-4 w-1.5 animate-pulse bg-signal-400 align-middle" /> : null}
+    <div className={cx("flex gap-3", isUser ? "justify-end" : "justify-start")}>
+      {!isUser ? (
+        <div className="mt-1 flex size-control-sm shrink-0 items-center justify-center rounded-md bg-elevated text-accent">
+          <Bot className="size-icon-sm" />
+        </div>
+      ) : null}
+      <div
+        className={cx(
+          "max-w-[82%] rounded-lg px-3.5 py-3 text-sm leading-6",
+          isUser
+            ? "bg-accent/10 text-primary ring-1 ring-inset ring-accent/25"
+            : "bg-panel text-secondary ring-1 ring-inset ring-line",
+        )}
+      >
+        <p className="whitespace-pre-wrap break-words">
+          {message.text || (message.streaming ? "…" : "")}
+        </p>
+        {message.streaming ? (
+          <span className="ml-1 inline-block h-4 w-1.5 animate-pulse bg-accent align-middle" />
+        ) : null}
       </div>
     </div>
-  );
-}
-
-function Composer({
-  value,
-  onChange,
-  onSubmit,
-  disabled,
-  running,
-  onCancel,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  onSubmit: (event: React.FormEvent) => void;
-  disabled: boolean;
-  running: boolean;
-  onCancel: () => void;
-}) {
-  return (
-    <form onSubmit={onSubmit} className="shrink-0 border-t border-ink-800 bg-ink-950/80 px-6 py-4">
-      <div className="mx-auto max-w-3xl rounded-lg border border-ink-700 bg-ink-900 p-2 shadow-panel focus-within:border-ink-600">
-        <textarea
-          aria-label="Message the agent"
-          className="min-h-16 w-full resize-none bg-transparent px-2 py-1 text-sm leading-6 text-ink-100 outline-none placeholder:text-ink-600"
-          placeholder={disabled ? "Connect a runtime to send a message" : "Ask the agent to inspect, change, or verify this workspace…"}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void onSubmit(event);
-          }}
-          disabled={disabled}
-        />
-        <div className="flex items-center justify-between px-1 pt-1">
-          <span className="text-[10px] text-ink-600">⌘↵ to send · runtime events stream on the right</span>
-          {running ? (
-            <button type="button" className="quiet-button border-danger/30 text-danger" onClick={onCancel}>
-              <Square size={12} fill="currentColor" /> Stop
-            </button>
-          ) : (
-            <button type="submit" className="primary-button" disabled={disabled || !value.trim()}>
-              <Send size={13} /> Send
-            </button>
-          )}
-        </div>
-      </div>
-    </form>
   );
 }
 
@@ -662,29 +854,59 @@ function ContextPanel({
   onRestore: (id: string) => void;
 }) {
   return (
-    <aside className="hidden w-96 shrink-0 flex-col border-l border-ink-800 bg-ink-900/50 xl:flex">
-      <div className="flex h-16 shrink-0 items-center justify-between border-b border-ink-800 px-4">
-        <div className="flex items-center gap-2"><PanelRight size={15} className="text-ink-500" /><span className="text-xs font-semibold text-ink-200">Runtime context</span></div>
-        <span className="mono-label">live</span>
+    <aside className="hidden w-96 shrink-0 flex-col border-l border-line bg-panel xl:flex">
+      <div className="flex h-16 shrink-0 items-center justify-between border-b border-line px-4">
+        <div className="flex items-center gap-2">
+          <PanelRight className="size-icon-md text-muted" />
+          <span className="text-sm font-semibold text-secondary">Runtime context</span>
+        </div>
+        <span className="label-mono">live</span>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <ScrollArea className="flex-1">
         <div className="space-y-5 p-3">
           {approvals.length > 0 ? (
             <section className="space-y-2">
-              <p className="mono-label text-warning">Needs approval</p>
+              <p className="label-mono text-warning">Needs approval</p>
               {approvals.map((approval) => (
-                <div key={approval.approval_id} className="rounded-lg border border-warning/30 bg-warning/5 p-3 shadow-panel">
+                <article
+                  key={approval.approval_id}
+                  className="rounded-lg border border-warning/30 bg-warning/5 p-3"
+                >
                   <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 text-xs font-semibold text-ink-100"><ShieldCheck size={14} className="text-warning" />{approval.tool.name}</div>
-                    <span className="mono-label">allow once</span>
+                    <div className="flex items-center gap-2 text-xs font-semibold text-primary">
+                      <ShieldCheck className="size-icon-md text-warning" />
+                      {approval.tool.name}
+                    </div>
+                    <span className="label-mono">allow once</span>
                   </div>
-                  <p className="mt-2 text-[11px] leading-4 text-ink-400">The runtime is waiting for a one-time decision. No permanent policy change will be made.</p>
-                  <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-md bg-ink-950/60 p-2 font-mono text-[10px] leading-4 text-ink-400">{JSON.stringify(approval.tool.arguments, null, 2)}</pre>
+                  <p className="mt-2 text-2xs leading-4 text-muted">
+                    The runtime is waiting for a one-time decision. No permanent policy change will be
+                    made.
+                  </p>
+                  <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-md bg-sunken p-2 font-mono text-2xs leading-4 text-muted">
+                    {JSON.stringify(approval.tool.arguments, null, 2)}
+                  </pre>
                   <div className="mt-3 flex gap-2">
-                    <button className="primary-button flex-1 justify-center" onClick={() => onApprove(approval.approval_id)}><Check size={13} />Allow once</button>
-                    <button className="quiet-button flex-1 justify-center border-danger/30 text-danger" onClick={() => onDeny(approval.approval_id)}><X size={13} />Deny once</button>
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      block
+                      onClick={() => onApprove(approval.approval_id)}
+                      icon={<Check className="size-icon-sm" />}
+                    >
+                      Allow once
+                    </Button>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      block
+                      onClick={() => onDeny(approval.approval_id)}
+                      icon={<X className="size-icon-sm" />}
+                    >
+                      Deny once
+                    </Button>
                   </div>
-                </div>
+                </article>
               ))}
             </section>
           ) : null}
@@ -699,75 +921,183 @@ function ContextPanel({
             />
           </section>
 
-          <section>
-            <div className="mb-2 flex items-center justify-between"><p className="mono-label">Tool activity</p><span className="text-[10px] text-ink-600">{tools.length} calls</span></div>
-            {tools.length === 0 ? <EmptyContext text="Tool calls will appear here." /> : <div className="space-y-1.5">{[...tools].reverse().map((tool) => <ToolActivityCard key={tool.id} tool={tool} />)}</div>}
-          </section>
+          <Section title="Tool activity" meta={`${tools.length} calls`}>
+            {tools.length === 0 ? (
+              <EmptyState>Tool calls will appear here.</EmptyState>
+            ) : (
+              <div className="space-y-1.5">
+                {[...tools].reverse().map((tool) => (
+                  <ToolActivityCard key={tool.id} tool={tool} />
+                ))}
+              </div>
+            )}
+          </Section>
 
-          <section>
-            <div className="mb-2 flex items-center justify-between"><p className="mono-label">Verification</p><span className="text-[10px] text-ink-600">{verification.length} checks</span></div>
-            {verification.length === 0 ? <EmptyContext text="Verification results will appear here." /> : <div className="space-y-1.5">{[...verification].reverse().map((item) => <VerificationCard key={item.id} item={item} />)}</div>}
-          </section>
+          <Section title="Verification" meta={`${verification.length} checks`}>
+            {verification.length === 0 ? (
+              <EmptyState>Verification results will appear here.</EmptyState>
+            ) : (
+              <div className="space-y-1.5">
+                {[...verification].reverse().map((item) => (
+                  <VerificationCard key={item.id} item={item} />
+                ))}
+              </div>
+            )}
+          </Section>
 
-          <section>
-            <div className="mb-2 flex items-center justify-between"><p className="mono-label">Session timeline</p><span className="text-[10px] text-ink-600">chronological</span></div>
-            {timeline.length === 0 ? <EmptyContext text="Session events will appear here." /> : <div className="space-y-0.5">{timeline.map((entry) => <TimelineRow key={entry.id} entry={entry} />)}</div>}
-          </section>
+          <Section title="Session timeline" meta="chronological">
+            {timeline.length === 0 ? (
+              <EmptyState>Session events will appear here.</EmptyState>
+            ) : (
+              <div className="space-y-0.5">
+                {timeline.map((entry) => (
+                  <TimelineRow key={entry.id} entry={entry} />
+                ))}
+              </div>
+            )}
+          </Section>
         </div>
-      </div>
+      </ScrollArea>
     </aside>
   );
 }
 
-function EmptyContext({ text }: { text: string }) {
-  return <p className="rounded-md border border-dashed border-ink-800 p-3 text-xs leading-5 text-ink-600">{text}</p>;
+function Section({
+  title,
+  meta,
+  children,
+}: {
+  title: string;
+  meta: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section>
+      <div className="mb-2 flex items-center justify-between">
+        <p className="label-mono">{title}</p>
+        <span className="text-2xs text-faint">{meta}</span>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/**
+ * Collapsible row shared by tool activity and verification results.
+ *
+ * Both are the same shape: an icon, a label, a status, and expandable detail.
+ * Keeping one implementation means the disclosure behaviour and the type scale
+ * cannot drift between them.
+ */
+function Disclosure({
+  icon,
+  label,
+  meta,
+  tone,
+  busy,
+  children,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  meta?: React.ReactNode;
+  tone: Tone;
+  busy?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <details className="group rounded-lg border border-line bg-elevated open:border-line-strong">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-2.5 py-2 text-2xs">
+        <span className={toneText(tone)}>{icon}</span>
+        <span className="min-w-0 flex-1 truncate text-xs font-medium text-secondary">{label}</span>
+        {meta ? <span className="shrink-0 text-2xs text-faint">{meta}</span> : null}
+        <span className={cx("shrink-0 text-2xs", toneText(tone))}>{busy ? "…" : null}</span>
+        <ChevronRight className="size-icon-sm shrink-0 text-faint transition-transform duration-fast group-open:rotate-90" />
+      </summary>
+      <div className="border-t border-line px-2.5 py-2">{children}</div>
+    </details>
+  );
 }
 
 function ToolActivityCard({ tool }: { tool: ToolActivity }) {
-  const tone = tool.state === "succeeded" ? "text-success" : tool.state === "failed" || tool.state === "denied" ? "text-danger" : tool.state === "running" ? "text-signal-400" : "text-ink-400";
+  const tone: Tone =
+    tool.state === "succeeded"
+      ? "success"
+      : tool.state === "failed" || tool.state === "denied"
+        ? "error"
+        : tool.state === "running"
+          ? "accent"
+          : "neutral";
+  const busy = tool.state === "running" || tool.state === "requested" || tool.state === "awaiting_approval";
   return (
-    <details className="group rounded-lg border border-ink-800 bg-ink-900/80 open:border-ink-700">
-      <summary className="flex cursor-pointer list-none items-center gap-2 px-2.5 py-2 text-[11px]">
-        <Wrench size={12} className={tone} />
-        <span className="min-w-0 flex-1 truncate font-medium text-ink-200">{tool.name}</span>
-        <span className="truncate font-mono text-[10px] text-ink-600">{tool.target || "no target"}</span>
-        {tool.durationMs !== null ? <span className="flex items-center gap-1 text-[10px] text-ink-500"><Clock3 size={10} />{formatDuration(tool.durationMs)}</span> : null}
-        <span className={`text-[10px] ${tone}`}>{tool.state}</span>
-        <ChevronRight size={12} className="text-ink-600 transition-transform group-open:rotate-90" />
-      </summary>
-      <div className="border-t border-ink-800 px-2.5 py-2">
-        {tool.error ? <p className="mb-2 text-[11px] text-danger">{tool.error}</p> : null}
-        <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-4 text-ink-500">{tool.output || "No output was reported."}</pre>
-      </div>
-    </details>
+    <Disclosure
+      icon={<Wrench className="size-icon-sm" />}
+      label={tool.name}
+      tone={tone}
+      busy={busy}
+      meta={
+        <>
+          <span className="truncate font-mono">{tool.target || "no target"}</span>
+          {tool.durationMs !== null ? (
+            <span className="ml-2 inline-flex items-center gap-1">
+              <Clock3 className="size-icon-xs" />
+              {formatDuration(tool.durationMs)}
+            </span>
+          ) : null}
+        </>
+      }
+    >
+      {tool.error ? <p className="mb-2 text-2xs text-error">{tool.error}</p> : null}
+      <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-2xs leading-4 text-muted">
+        {tool.output || "No output was reported."}
+      </pre>
+    </Disclosure>
   );
 }
 
 function VerificationCard({ item }: { item: VerificationActivity }) {
-  const tone = item.state === "passed" ? "text-success" : item.state === "failed" ? "text-danger" : "text-signal-400";
+  const tone: Tone = item.state === "passed" ? "success" : item.state === "failed" ? "error" : "accent";
+  const busy = item.state === "running";
   return (
-    <details className="group rounded-lg border border-ink-800 bg-ink-900/80 open:border-ink-700">
-      <summary className="flex cursor-pointer list-none items-center gap-2 px-2.5 py-2 text-[11px]">
-        {item.state === "passed" ? <CheckCircle2 size={12} className={tone} /> : <CircleDot size={12} className={`${tone} ${item.state === "running" ? "animate-pulse" : ""}`} />}
-        <span className="min-w-0 flex-1 truncate font-medium text-ink-200">{item.category}</span>
-        {item.durationMs !== null ? <span className="text-[10px] text-ink-500">{formatDuration(item.durationMs)}</span> : null}
-        <span className={`text-[10px] ${tone}`}>{item.state}</span>
-        <ChevronRight size={12} className="text-ink-600 transition-transform group-open:rotate-90" />
-      </summary>
-      <div className="border-t border-ink-800 px-2.5 py-2">
-        <p className="break-words font-mono text-[10px] text-ink-400">{item.command}</p>
-        {item.diagnostics.length > 0 ? <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[10px] leading-4 text-danger">{item.diagnostics.join("\n")}</pre> : null}
-      </div>
-    </details>
+    <Disclosure
+      icon={
+        item.state === "passed" ? (
+          <CheckCircle2 className="size-icon-sm" />
+        ) : (
+          <CircleDot className={cx("size-icon-sm", busy && "animate-pulse")} />
+        )
+      }
+      label={item.category}
+      tone={tone}
+      busy={busy}
+      meta={item.durationMs !== null ? formatDuration(item.durationMs) : null}
+    >
+      <p className="break-words font-mono text-2xs text-secondary">{item.command}</p>
+      {item.diagnostics.length > 0 ? (
+        <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-2xs leading-4 text-error">
+          {item.diagnostics.join("\n")}
+        </pre>
+      ) : null}
+    </Disclosure>
   );
 }
 
 function TimelineRow({ entry }: { entry: TimelineEntry }) {
-  const tone = entry.tone === "success" ? "text-success" : entry.tone === "danger" ? "text-danger" : entry.tone === "warning" ? "text-warning" : "text-signal-400";
+  const tone = entry.tone === "success" ? "success" : entry.tone === "danger" ? "error" : entry.tone === "warning" ? "warning" : "accent";
   return (
-    <div className="grid grid-cols-[14px_1fr] gap-2 rounded-md px-2 py-1.5 text-[11px] leading-4 hover:bg-ink-850">
-      {entry.tone === "danger" ? <XCircle size={12} className={tone} /> : entry.tone === "success" ? <CheckCircle2 size={12} className={tone} /> : <CircleDot size={12} className={tone} />}
-      <div className="min-w-0"><p className="truncate font-mono text-ink-300">{entry.eventType}</p>{entry.detail ? <p className="truncate text-ink-600">{entry.detail}</p> : null}</div>
+    <div
+      className="grid grid-cols-[14px_1fr] gap-2 rounded-md px-2 py-1.5 text-2xs leading-4 transition-colors duration-fast hover:bg-hover"
+    >
+      {entry.tone === "danger" ? (
+        <XCircle className={cx("size-icon-sm", toneText(tone))} />
+      ) : entry.tone === "success" ? (
+        <CheckCircle2 className={cx("size-icon-sm", toneText(tone))} />
+      ) : (
+        <CircleDot className={cx("size-icon-sm", toneText(tone))} />
+      )}
+      <div className="min-w-0">
+        <p className="truncate font-mono text-secondary">{entry.eventType}</p>
+        {entry.detail ? <p className="truncate text-faint">{entry.detail}</p> : null}
+      </div>
     </div>
   );
 }
@@ -779,31 +1109,64 @@ function formatDuration(durationMs: number): string {
 
 function PanelLoading({ label }: { label: string }) {
   return (
-    <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-[11px] text-ink-500">
-      <LoaderCircle size={13} className="animate-spin" />
+    <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-2xs text-muted">
+      <LoaderCircle className="size-icon-sm animate-spin" />
       {label}
     </div>
   );
 }
 
-function StatusBar({ status, runPhase, workspacePath, lastError, onClearError }: { status: string; runPhase: RunPhase; workspacePath: string; lastError: string | null; onClearError: () => void }) {
+function StatusBar({
+  status,
+  runPhase,
+  workspacePath,
+  lastError,
+  onClearError,
+}: {
+  status: string;
+  runPhase: RunPhase;
+  workspacePath: string;
+  lastError: string | null;
+  onClearError: () => void;
+}) {
   return (
-    <footer className="flex h-7 shrink-0 items-center gap-4 border-t border-ink-800 bg-ink-950 px-4 text-[10px] text-ink-500">
-      <span className="flex items-center gap-1.5"><span className={`h-1.5 w-1.5 rounded-full ${status === "connected" ? "bg-success" : status === "connecting" ? "bg-warning" : status === "error" ? "bg-danger" : "bg-ink-600"}`} />runtime {status}</span>
-      <span className="flex items-center gap-1.5"><Terminal size={11} />{workspacePath || "no workspace"}</span>
-      <span className="flex items-center gap-1.5"><Activity size={11} />run {runPhase}</span>
+    <footer className="flex h-7 shrink-0 items-center gap-4 border-t border-line bg-app px-4 text-2xs text-faint">
+      <StatusIndicator status={`runtime ${status}`} />
+      <span className="flex items-center gap-1.5">
+        <Terminal className="size-icon-sm" />
+        {workspacePath || "no workspace"}
+      </span>
+      <span className="flex items-center gap-1.5">
+        <Activity className="size-icon-sm" />run {runPhase}
+      </span>
       <span className="ml-auto">v0 shell · runtime owns execution</span>
-      {lastError ? <button className="text-danger hover:text-ink-200" onClick={onClearError}>dismiss error</button> : null}
+      {lastError ? (
+        <button className="text-error transition-colors duration-fast hover:text-primary" onClick={onClearError}>
+          dismiss error
+        </button>
+      ) : null}
     </footer>
   );
 }
 
+/**
+ * Non-blocking error notice.
+ *
+ * Deliberately not a dialog: a runtime error should be readable and dismissible
+ * without interrupting work in progress, so it sits above the status bar and
+ * takes focus only when dismissed deliberately.
+ */
 function ErrorToast({ message, onClose }: { message: string; onClose: () => void }) {
   return (
-    <div className="fixed bottom-10 right-5 z-10 flex max-w-sm items-start gap-3 rounded-lg border border-danger/30 bg-ink-900 px-3 py-3 text-xs text-ink-200 shadow-panel">
-      <CircleAlert size={15} className="mt-0.5 shrink-0 text-danger" />
+    <div
+      role="alert"
+      className="fixed bottom-10 right-5 z-40 flex max-w-sm animate-slide-up items-start gap-3 rounded-lg border border-error/30 bg-overlay px-3 py-3 text-xs text-secondary shadow-overlay"
+    >
+      <CircleAlert className="mt-0.5 size-icon-md shrink-0 text-error" />
       <p className="flex-1 leading-5">{message}</p>
-      <button className="icon-button -mr-1 -mt-1 h-6 w-6" onClick={onClose} aria-label="Dismiss error"><X size={13} /></button>
+      <IconButton label="Dismiss error" size="sm" className="-mr-1 -mt-1" onClick={onClose}>
+        <X className="size-icon-sm" />
+      </IconButton>
     </div>
   );
 }

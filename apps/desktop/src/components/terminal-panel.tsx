@@ -8,28 +8,37 @@ import {
   useDesktopStore,
 } from "../store";
 import { describeExit } from "../lib/terminal";
+import { alpha, color } from "../lib/tokens";
+import { Badge, Button, IconButton, Tooltip } from "./ui";
 
+/**
+ * xterm is configured from JavaScript, so it reads the shared CSS custom
+ * properties through `lib/tokens` rather than holding its own copy of the
+ * palette. The background stays transparent so the panel token shows through
+ * and the terminal matches the rest of the shell.
+ */
 const THEME = {
-  background: "#101318",
-  foreground: "#e7ebf1",
-  cursor: "#38bdf8",
-  cursorAccent: "#101318",
-  black: "#0b0d10",
-  red: "#fb7185",
-  green: "#5eead4",
-  yellow: "#fbbf24",
-  blue: "#38bdf8",
-  magenta: "#c8d0dc",
-  cyan: "#7dd3fc",
-  white: "#e7ebf1",
-  brightBlack: "#3a4554",
-  brightRed: "#fb7185",
-  brightGreen: "#5eead4",
-  brightYellow: "#fbbf24",
-  brightBlue: "#7dd3fc",
-  brightMagenta: "#e7ebf1",
-  brightCyan: "#c8d0dc",
-  brightWhite: "#f5f7fa",
+  background: color("surface-sunken"),
+  foreground: color("text-secondary"),
+  cursor: color("accent"),
+  cursorAccent: color("surface-sunken"),
+  selectionBackground: alpha("accent", 0.3),
+  black: color("surface-sunken"),
+  red: color("error"),
+  green: color("success"),
+  yellow: color("warning"),
+  blue: color("accent"),
+  magenta: color("text-muted"),
+  cyan: color("accent-strong"),
+  white: color("text-secondary"),
+  brightBlack: color("border-strong"),
+  brightRed: color("error"),
+  brightGreen: color("success"),
+  brightYellow: color("warning"),
+  brightBlue: color("accent-strong"),
+  brightMagenta: color("text-primary"),
+  brightCyan: color("accent-strong"),
+  brightWhite: color("text-primary"),
 } as const;
 
 const OPTIONS = {
@@ -121,53 +130,59 @@ export function TerminalPanel() {
   }, []);
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col border-t border-ink-800 bg-ink-950">
-      <div className="flex h-9 shrink-0 items-center justify-between border-b border-ink-800 px-3">
-        <div className="flex items-center gap-2">
-          <TerminalSquare size={13} className="text-ink-500" />
-          <span className="text-[11px] font-medium text-ink-300">Terminal</span>
-          <span
-            className="mono-label"
-            title="This shell is operated by you. Agent commands run separately through runtime policy."
+    <section className="flex min-h-0 flex-1 flex-col border-t border-line bg-app">
+      <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-line px-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <TerminalSquare className="size-icon-sm shrink-0 text-muted" />
+          <span className="text-xs font-medium text-secondary">Terminal</span>
+          <Tooltip
+            label="This shell is operated by you. Agent commands run separately through runtime policy."
           >
-            human · not policy governed
-          </span>
+            <Badge tone="warning">human · not policy governed</Badge>
+          </Tooltip>
         </div>
-        <button
-          className="icon-button h-6 w-6"
-          onClick={() => setIsVisible((value) => !value)}
-          aria-label={isVisible ? "Hide terminal" : "Show terminal"}
-          aria-expanded={isVisible}
-          title={isVisible ? "Hide terminal" : "Show terminal"}
-        >
-          {isVisible ? <X size={13} /> : <TerminalSquare size={13} />}
-        </button>
-        {terminal ? (
-          <button
-            className="quiet-button ml-1 h-6 py-1 text-[10px]"
-            onClick={() => void closeTerminal()}
-            title="Terminate this shell"
+        <div className="flex shrink-0 items-center gap-1">
+          <IconButton
+            label={isVisible ? "Hide terminal" : "Show terminal"}
+            size="sm"
+            aria-expanded={isVisible}
+            onClick={() => setIsVisible((value) => !value)}
           >
-            <X size={11} /> End shell
-          </button>
-        ) : (
-          <button
-            className="quiet-button ml-1 h-6 py-1 text-[10px]"
-            disabled={!connected || !workspacePath || isStartingTerminal}
-            onClick={() => {
-              setIsVisible(true);
-              void startTerminal();
-            }}
-            title="Open an interactive shell in the selected workspace"
-          >
-            {isStartingTerminal ? <LoaderCircle size={11} className="animate-spin" /> : <Play size={11} />}
-            Start shell
-          </button>
-        )}
+            {isVisible ? <X className="size-icon-sm" /> : <TerminalSquare className="size-icon-sm" />}
+          </IconButton>
+          {terminal ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => void closeTerminal()}
+              title="Terminate this shell"
+            >
+              <X className="size-icon-xs" /> End shell
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={!connected || !workspacePath || isStartingTerminal}
+              onClick={() => {
+                setIsVisible(true);
+                void startTerminal();
+              }}
+              title="Open an interactive shell in the selected workspace"
+            >
+              {isStartingTerminal ? (
+                <LoaderCircle className="size-icon-xs animate-spin" />
+              ) : (
+                <Play className="size-icon-xs" />
+              )}
+              Start shell
+            </Button>
+          )}
+        </div>
       </div>
       {isVisible && terminal ? (
         <div
-          className="min-h-0 flex-1 cursor-text overflow-hidden px-2 py-1"
+          className="min-h-0 flex-1 cursor-text overflow-hidden bg-sunken px-2 py-1"
           onClick={focus}
         >
           <div ref={containerRef} className="h-full w-full" />
@@ -179,19 +194,25 @@ export function TerminalPanel() {
   );
 }
 
-function TerminalUnavailable({ isRunning, isStarting }: { isRunning: boolean; isStarting: boolean }) {
-  if (isRunning) {
-    return (
-      <p className="flex items-center gap-2 px-3 py-2 text-[11px] leading-4 text-ink-600">
-        <Info size={12} />A shell is running. Use the toggle above to show it.
-      </p>
-    );
-  }
+function TerminalUnavailable({
+  isRunning,
+  isStarting,
+}: {
+  isRunning: boolean;
+  isStarting: boolean;
+}) {
   return (
-    <p className="flex items-center gap-2 px-3 py-2 text-[11px] leading-4 text-ink-600">
-      {isStarting ? <LoaderCircle size={12} className="animate-spin" /> : <Info size={12} />}
-      Start a terminal to open an interactive shell in the selected workspace. Commands you type here run
-      as you; agent commands are policy-checked separately.
+    <p className="flex items-start gap-2 px-3 py-2 text-xs leading-4 text-faint">
+      {isRunning ? (
+        <Info className="mt-0.5 size-icon-sm shrink-0" />
+      ) : isStarting ? (
+        <LoaderCircle className="mt-0.5 size-icon-sm shrink-0 animate-spin" />
+      ) : (
+        <Info className="mt-0.5 size-icon-sm shrink-0" />
+      )}
+      {isRunning
+        ? "A shell is running. Use the toggle above to show it."
+        : "Start a terminal to open an interactive shell in the selected workspace. Commands you type here run as you; agent commands are policy-checked separately."}
     </p>
   );
 }

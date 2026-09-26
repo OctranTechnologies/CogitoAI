@@ -2,6 +2,8 @@ import { useMemo } from "react";
 import { FileDiff, LoaderCircle } from "lucide-react";
 import { DiffViewer, SourceViewer } from "../lib/code-viewers";
 import type { ChangeEntry, FileChange, FileView } from "../lib/changes";
+import { Button, toneText, type Tone } from "./ui";
+import { cx } from "./ui/cx";
 
 interface ChangesPanelProps {
   entries: ChangeEntry[];
@@ -29,50 +31,70 @@ export function ChangesPanel({
   onClear,
 }: ChangesPanelProps) {
   const groups = useMemo(
-    () => [
-      { key: "added" as const, label: "Added", tone: "text-success", entries: entries.filter((entry) => entry.kind === "added") },
-      { key: "modified" as const, label: "Modified", tone: "text-signal-400", entries: entries.filter((entry) => entry.kind === "modified") },
-      { key: "deleted" as const, label: "Deleted", tone: "text-danger", entries: entries.filter((entry) => entry.kind === "deleted") },
-    ],
+    () =>
+      (
+        [
+          { key: "added", label: "Added", tone: "success" },
+          { key: "modified", label: "Modified", tone: "accent" },
+          { key: "deleted", label: "Deleted", tone: "error" },
+        ] as const
+      )
+        .map((group) => ({
+          ...group,
+          entries: entries.filter((entry) => entry.kind === group.key),
+        })),
     [entries],
   );
 
   return (
     <div className="flex min-h-0 flex-1">
-      <div className="flex w-64 shrink-0 flex-col border-r border-ink-800 bg-ink-900/40">
-        <div className="flex h-10 shrink-0 items-center justify-between border-b border-ink-800 px-3">
-          <p className="mono-label">Changes</p>
-          {isLoading ? <LoaderCircle size={12} className="animate-spin text-ink-500" /> : null}
+      <div className="flex w-64 shrink-0 flex-col border-r border-line bg-panel">
+        <div className="flex h-10 shrink-0 items-center justify-between border-b border-line px-3">
+          <p className="label-mono">Changes</p>
+          {isLoading ? <LoaderCircle className="size-icon-sm animate-spin text-muted" /> : null}
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto py-1">
+        <div className="scroll-area flex-1 py-1">
           {entries.length === 0 ? (
-            <p className="px-3 py-6 text-center text-[11px] leading-5 text-ink-600">
-              {isGitWorkspace ? "No code changes in this workspace." : "Open a Git repository to see code changes."}
+            <p className="px-3 py-6 text-center text-2xs leading-5 text-faint">
+              {isGitWorkspace
+                ? "No code changes in this workspace."
+                : "Open a Git repository to see code changes."}
             </p>
           ) : (
             groups.map((group) =>
               group.entries.length === 0 ? null : (
                 <section key={group.key} className="mb-1">
-                  <p className={`px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide ${group.tone}`}>
+                  <p
+                    className={cx(
+                      "flex items-center gap-1.5 px-3 py-1.5 text-2xs font-medium uppercase tracking-wide",
+                      toneText(group.tone as Tone),
+                    )}
+                  >
                     {group.label}
-                    <span className="ml-1.5 text-ink-600">{group.entries.length}</span>
+                    <span className="text-faint">{group.entries.length}</span>
                   </p>
                   {group.entries.map((entry) => (
                     <button
                       key={entry.path}
                       onClick={() => onSelect(entry.path)}
-                      className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left font-mono text-[11px] transition-colors ${
+                      className={cx(
+                        "flex w-full items-center gap-1.5 px-3 py-1.5 text-left font-mono text-xs",
+                        "transition-colors duration-fast",
                         entry.path === selectedPath
-                          ? "bg-signal-500/10 text-ink-100"
-                          : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"
-                      }`}
+                          ? "bg-accent/10 text-primary"
+                          : "text-muted hover:bg-hover hover:text-primary",
+                      )}
                     >
                       <span className="min-w-0 flex-1 truncate" title={entry.path}>
                         {entry.path}
                       </span>
-                      {entry.isBinary ? <span className="text-[9px] text-ink-600">bin</span> : null}
-                      {entry.additions > 0 ? <span className="text-[9px] text-success">+{entry.additions}</span> : null}
-                      {entry.deletions > 0 ? <span className="text-[9px] text-danger">-{entry.deletions}</span> : null}
+                      {entry.isBinary ? <span className="text-2xs text-faint">bin</span> : null}
+                      {entry.additions > 0 ? (
+                        <span className="text-2xs text-success">+{entry.additions}</span>
+                      ) : null}
+                      {entry.deletions > 0 ? (
+                        <span className="text-2xs text-error">-{entry.deletions}</span>
+                      ) : null}
                     </button>
                   ))}
                 </section>
@@ -89,16 +111,16 @@ export function ChangesPanel({
         ) : fileView ? (
           <SourceViewer file={fileView} path={fileView.path} />
         ) : isLoading ? (
-          <div className="flex flex-1 items-center justify-center gap-2 text-[11px] text-ink-500">
-            <LoaderCircle size={13} className="animate-spin" /> Loading {selectedPath}…
+          <div className="flex flex-1 items-center justify-center gap-2 text-2xs text-muted">
+            <LoaderCircle className="size-icon-sm animate-spin" /> Loading {selectedPath}…
           </div>
         ) : (
           <ChangesEmptyState onClear={onClear} />
         )}
         {isTruncated ? (
-          <p className="mt-2 shrink-0 text-[10px] text-warning">
-            Showing line counts for the first {entries.length} of {totalChanged} changed files. The runtime
-            reports the complete list; refreshing reports more as they are inspected.
+          <p className="mt-2 shrink-0 text-2xs text-warning">
+            Showing line counts for the first {entries.length} of {totalChanged} changed files. The
+            runtime reports the complete list; refreshing reports more as they are inspected.
           </p>
         ) : null}
       </div>
@@ -109,15 +131,16 @@ export function ChangesPanel({
 function ChangesEmptyState({ onClear }: { onClear?: () => void }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
-      <FileDiff size={20} className="text-ink-600" />
-      <p className="text-xs font-medium text-ink-300">Select a file to inspect its changes</p>
-      <p className="max-w-sm text-[11px] leading-4 text-ink-600">
-        Diffs and source are read from the runtime and shown read-only. The desktop never edits your files.
+      <FileDiff className="size-icon-xl text-faint" />
+      <p className="text-xs font-medium text-secondary">Select a file to inspect its changes</p>
+      <p className="max-w-sm text-2xs leading-4 text-faint">
+        Diffs and source are read from the runtime and shown read-only. The desktop never edits your
+        files.
       </p>
       {onClear ? (
-        <button className="quiet-button mt-1" onClick={onClear}>
+        <Button size="sm" className="mt-1" onClick={onClear}>
           Close viewer
-        </button>
+        </Button>
       ) : null}
     </div>
   );

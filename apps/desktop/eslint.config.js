@@ -26,4 +26,14 @@ export default tseslint.config(
       "@typescript-eslint/no-explicit-any": "error",
     },
   },
+  // Build-time Node scripts run outside the browser, so they need the Node
+  // globals rather than the browser set applied above.
+  {
+    files: ["scripts/**/*.mjs", "*.config.{js,mjs}"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: { ...globals.node },
+    },
+  },
 );

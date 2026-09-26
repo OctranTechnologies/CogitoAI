@@ -2,13 +2,111 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ---------------------------------------------------------------------------
+   Design tokens
+
+   Every colour is stored as bare RGB channels rather than a hex string. That
+   lets Tailwind apply its own alpha modifier, so `bg-panel/80` resolves at
+   build time to `rgb(var(--surface-panel) / 0.8)`. A hex value here would make
+   `/80` silently invalid.
+
+   These are the only place a literal colour is allowed. Components reference
+   semantic names (`bg-panel`, `text-muted`, `border-line`), never a raw value.
+   Monaco and xterm receive colour through JavaScript, so they read the same
+   variables at runtime via `lib/tokens.ts` rather than keeping their own copy.
+--------------------------------------------------------------------------- */
+
 :root {
   color-scheme: dark;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #0b0d10;
-  color: #e7ebf1;
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
+
+  /* Surfaces, from furthest back to closest to the user. */
+  --surface-app: 10 12 15; /* window background, darkest */
+  --surface-panel: 15 18 23; /* sidebars, panels, headers */
+  --surface-elevated: 21 25 32; /* cards, raised rows, inputs */
+  --surface-overlay: 26 31 39; /* menus, popovers, dialogs */
+  --surface-sunken: 8 10 12; /* code blocks, terminal, insets */
+  --surface-hover: 25 30 38; /* hover fill */
+  --surface-active: 32 39 49; /* selected or pressed fill */
+  --surface-scrim: 4 5 7; /* modal backdrop */
+
+  /* Borders and separators. Deliberately low contrast. */
+  --border-subtle: 23 27 33; /* hairline dividers, resting card edges */
+  --border-default: 32 39 49; /* interactive control edges */
+  --border-strong: 48 57 70; /* hover and focus edges */
+
+  /* Text. Four steps is enough; more invites inconsistency. */
+  --text-primary: 232 236 242; /* headings, values, anything read first */
+  --text-secondary: 196 205 218; /* body copy, labels */
+  --text-muted: 143 155 173; /* supporting detail */
+  --text-faint: 100 112 131; /* hints, placeholders, disabled */
+  --text-inverse: 8 10 12; /* text on an accent fill */
+
+  /* Accent. One hue, used sparingly for focus and primary action only. */
+  --accent: 56 189 248;
+  --accent-strong: 125 211 252;
+  --accent-dim: 14 165 233;
+
+  /* Status. */
+  --success: 94 234 212;
+  --warning: 251 191 36;
+  --error: 251 113 133;
+  --info: 56 189 248;
+
+  /* Geometry. */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-full: 999px;
+
+  /* Motion. Kept short so the interface feels immediate rather than animated. */
+  --duration-fast: 90ms;
+  --duration-base: 140ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0.2, 1);
+
+  /* Elevation. One soft shadow; depth otherwise comes from borders. */
+  --shadow-overlay: 0 12px 32px rgb(0 0 0 / 0.36);
+  --shadow-panel: 0 1px 2px rgb(0 0 0 / 0.24);
+
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
+}
+
+/* Light theme is not selectable in v0. The variables are declared so that
+   enabling it later is a data-attribute change rather than a redesign, and so
+   that a component never has to hardcode a value to stay legible. */
+[data-theme="light"] {
+  color-scheme: light;
+
+  --surface-app: 247 248 250;
+  --surface-panel: 255 255 255;
+  --surface-elevated: 255 255 255;
+  --surface-overlay: 255 255 255;
+  --surface-sunken: 241 243 246;
+  --surface-hover: 240 242 246;
+  --surface-active: 232 236 242;
+  --surface-scrim: 24 28 36;
+
+  --border-subtle: 226 230 236;
+  --border-default: 210 216 224;
+  --border-strong: 176 185 197;
+
+  --text-primary: 17 22 30;
+  --text-secondary: 45 53 66;
+  --text-muted: 92 103 119;
+  --text-faint: 128 138 154;
+  --text-inverse: 255 255 255;
+
+  --accent: 3 122 189;
+  --accent-strong: 2 100 158;
+  --accent-dim: 14 165 233;
+
+  --success: 13 124 108;
+  --warning: 161 98 7;
+  --error: 190 42 62;
+
+  --shadow-overlay: 0 12px 32px rgb(15 23 42 / 0.14);
+  --shadow-panel: 0 1px 2px rgb(15 23 42 / 0.06);
 }
 
 * {
@@ -26,40 +124,44 @@ body,
 
 body {
   overflow: hidden;
-  background:
-    radial-gradient(circle at 80% -10%, rgba(14, 165, 233, 0.09), transparent 34rem),
-    #0b0d10;
+  background-color: rgb(var(--surface-app));
+  color: rgb(var(--text-secondary));
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
 }
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
+  color: inherit;
 }
 
-button:focus-visible,
-input:focus-visible,
-textarea:focus-visible,
-[tabindex]:focus-visible {
-  outline: 2px solid #38bdf8;
-  outline-offset: 2px;
+/* A single visible focus treatment for every interactive element. Removing the
+   default outline is only safe because this replaces it. */
+:focus-visible {
+  outline: var(--focus-ring-width) solid rgb(var(--accent));
+  outline-offset: var(--focus-ring-offset);
+  border-radius: var(--radius-sm);
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
 }
 
 ::selection {
-  background: rgba(56, 189, 248, 0.26);
+  background: rgb(var(--accent) / 0.26);
 }
 
-/* xterm sizes its own viewport through the fit addon, but the host element
-   must fill the panel or the fit calculation measures nothing. */
-.xterm,
-.xterm-viewport,
-.xterm-screen {
-  height: 100%;
-}
-
-.xterm .xterm-viewport {
-  background-color: transparent !important;
-  overflow-y: auto;
+/* Scrollbars are part of the visual language, not the browser default. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--border-default)) transparent;
 }
 
 ::-webkit-scrollbar {
@@ -72,37 +174,58 @@ textarea:focus-visible,
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #28303c;
+  background: rgb(var(--border-default));
   border: 3px solid transparent;
   background-clip: padding-box;
-  border-radius: 999px;
+  border-radius: var(--radius-full);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3a4554;
+  background: rgb(var(--border-strong));
   border: 3px solid transparent;
   background-clip: padding-box;
 }
 
+/* xterm sizes its own viewport through the fit addon, but the host element
+   must fill the panel or the fit calculation measures nothing. The background
+   stays transparent so the panel token shows through. */
+.xterm,
+.xterm-viewport,
+.xterm-screen {
+  height: 100%;
+}
+
+.xterm .xterm-viewport {
+  background-color: transparent !important;
+  overflow-y: auto;
+}
+
+/* Monaco renders into a host element we cannot tokenise directly, so its
+   chrome is aligned to the panel surface here. */
+.monaco-editor,
+.monaco-editor-background,
+.monaco-editor .margin {
+  background-color: rgb(var(--surface-panel)) !important;
+}
+
 @layer components {
-  .panel-surface {
-    @apply border border-ink-800/90 bg-ink-900/90 shadow-panel;
+  /* Uppercase micro-label used for section headings throughout the shell. */
+  .label-mono {
+    @apply font-mono text-2xs font-medium uppercase tracking-widest text-faint;
   }
 
-  .mono-label {
-    @apply font-mono text-[10px] uppercase tracking-[0.16em] text-ink-500;
+  /* Monospace run for code, commands, ids, durations, and tool output. */
+  .code {
+    @apply font-mono text-xs text-secondary;
   }
 
-  .icon-button {
-    @apply inline-flex h-8 w-8 items-center justify-center rounded-md text-ink-400 transition-colors hover:bg-ink-800 hover:text-ink-200 disabled:cursor-not-allowed disabled:opacity-40;
-  }
-
-  .quiet-button {
-    @apply inline-flex items-center gap-2 rounded-md border border-ink-700 bg-ink-850 px-3 py-2 text-xs font-medium text-ink-300 transition-colors hover:border-ink-600 hover:bg-ink-800 hover:text-ink-100 disabled:cursor-not-allowed disabled:opacity-40;
-  }
-
-  .primary-button {
-    @apply inline-flex items-center gap-2 rounded-md bg-signal-500 px-3 py-2 text-xs font-semibold text-ink-950 transition-colors hover:bg-signal-400 disabled:cursor-not-allowed disabled:opacity-40;
+  /* Scroll container. Written as plain CSS rather than `@apply` because these
+     are layout properties, and the shared scrollbar treatment above applies to
+     the element regardless of which utility set the overflow. */
+  .scroll-area {
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 }
 

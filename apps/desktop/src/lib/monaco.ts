@@ -1,5 +1,6 @@
 import { loader } from "@monaco-editor/react";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
+import { alpha, color, hex } from "./tokens";
 
 // The desktop shell is an offline application, so Monaco must be served from
 // the local bundle. The default loader fetches the editor from a CDN, which
@@ -73,41 +74,50 @@ monaco.languages.setLanguageConfiguration("json", {
 
 export const MONACO_THEME = "cogito-dark";
 
-monaco.editor.defineTheme(MONACO_THEME, {
-  base: "vs-dark",
-  inherit: true,
-  rules: [
-    { token: "comment", foreground: "5c6b7f", fontStyle: "italic" },
-    { token: "keyword", foreground: "7dd3fc" },
-    { token: "string", foreground: "5eead4" },
-    { token: "number", foreground: "fbbf24" },
-    { token: "key", foreground: "7dd3fc" },
-    { token: "type", foreground: "c8d0dc" },
-  ],
-  colors: {
-    "editor.background": "#101318",
-    "editor.foreground": "#e7ebf1",
-    "editorLineNumber.foreground": "#3a4554",
-    "editorLineNumber.activeForeground": "#94a0b2",
-    "editor.selectionBackground": "#1e3a4d",
-    "editor.lineHighlightBackground": "#151920",
-    "editorCursor.foreground": "#38bdf8",
-    "editorIndentGuide.background1": "#1b2029",
-    "editorGutter.background": "#101318",
-    "diffEditor.insertedTextBackground": "#0f3d33aa",
-    "diffEditor.removedTextBackground": "#4a1f2baa",
-    "diffEditor.insertedLineBackground": "#0f3d3355",
-    "diffEditor.removedLineBackground": "#4a1f2b55",
-    "diffEditor.diagramFill": "#0ea5e933",
-    "diffEditor.diagramInsertedFill": "#5eead455",
-    "diffEditor.diagramRemovedFill": "#fb718555",
-    "editorWidget.background": "#151920",
-    "editorWidget.border": "#28303c",
-    "scrollbarSlider.background": "#28303c99",
-    "scrollbarSlider.hoverBackground": "#3a4554aa",
-    "scrollbarSlider.activeBackground": "#3a4554",
-  },
-});
+/**
+ * Monaco is configured from JavaScript, so it cannot use the Tailwind classes the
+ * rest of the interface uses. It reads the same CSS custom properties through
+ * `lib/tokens` instead of keeping a second copy of the palette, which is what
+ * lets a theme change reach the editor.
+ */
+function defineMonacoTheme() {
+  monaco.editor.defineTheme(MONACO_THEME, {
+    base: "vs-dark",
+    inherit: true,
+    rules: [
+      { token: "comment", foreground: hex("text-faint"), fontStyle: "italic" },
+      { token: "keyword", foreground: hex("accent-strong") },
+      { token: "string", foreground: hex("success") },
+      { token: "number", foreground: hex("warning") },
+      { token: "key", foreground: hex("accent-strong") },
+      { token: "type", foreground: hex("text-secondary") },
+    ],
+    colors: {
+      "editor.background": color("surface-panel"),
+      "editor.foreground": color("text-primary"),
+      "editorLineNumber.foreground": color("border-strong"),
+      "editorLineNumber.activeForeground": color("text-muted"),
+      "editor.selectionBackground": alpha("accent", 0.22),
+      "editor.lineHighlightBackground": color("surface-elevated"),
+      "editorCursor.foreground": color("accent"),
+      "editorIndentGuide.background1": color("border-subtle"),
+      "editorGutter.background": color("surface-panel"),
+      "diffEditor.insertedTextBackground": alpha("success", 0.16),
+      "diffEditor.removedTextBackground": alpha("error", 0.16),
+      "diffEditor.insertedLineBackground": alpha("success", 0.07),
+      "diffEditor.removedLineBackground": alpha("error", 0.07),
+      "diffEditor.diagramInsertedFill": alpha("success", 0.28),
+      "diffEditor.diagramRemovedFill": alpha("error", 0.28),
+      "editorWidget.background": color("surface-elevated"),
+      "editorWidget.border": color("border-default"),
+      "scrollbarSlider.background": alpha("border-default", 0.7),
+      "scrollbarSlider.hoverBackground": alpha("border-strong", 0.7),
+      "scrollbarSlider.activeBackground": color("border-strong"),
+    },
+  });
+}
+
+defineMonacoTheme();
 
 /** Read-only Monaco options shared by the source and diff viewers. */
 export const READ_ONLY_OPTIONS: monaco.editor.IStandaloneEditorConstructionOptions = {

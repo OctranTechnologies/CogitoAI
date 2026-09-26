@@ -22,6 +22,8 @@ import {
   formatCommand,
   type SettingsScreen,
 } from "../lib/settings";
+import { Badge, Button, IconButton, Modal, toneText, type Tone } from "./ui";
+import { cx } from "./ui/cx";
 
 const SCREEN_ICONS: Record<SettingsScreen, typeof Settings2> = {
   models: Settings2,
@@ -32,126 +34,197 @@ const SCREEN_ICONS: Record<SettingsScreen, typeof Settings2> = {
 };
 
 /** Read-only settings dialog covering the five v0 configuration screens. */
-export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function SettingsDialog({
+  open,
+  onClose,
+  initialScreen = "models",
+}: {
+  open: boolean;
+  onClose: () => void;
+  /** Lets the navigation rail open the dialog on a chosen screen. */
+  initialScreen?: SettingsScreen;
+}) {
   const settings = useDesktopStore((state) => state.settings);
   const isLoading = useDesktopStore((state) => state.isLoadingSettings);
   const error = useDesktopStore((state) => state.settingsError);
   const refreshSettings = useDesktopStore((state) => state.refreshSettings);
   const clearSettingsError = useDesktopStore((state) => state.clearSettingsError);
-  const [screen, setScreen] = useState<SettingsScreen>("models");
+  const [screen, setScreen] = useState<SettingsScreen>(initialScreen);
+
+  // Follow the requested screen each time it is opened, so the rail entry that
+  // was pressed is the screen that appears.
+  useEffect(() => {
+    if (open) setScreen(initialScreen);
+  }, [open, initialScreen]);
 
   // Reload on open so a change made elsewhere in the runtime is picked up.
   useEffect(() => {
     if (open) void refreshSettings();
   }, [open, refreshSettings]);
 
-  if (!open) return null;
-
   return (
-    <div className="fixed inset-0 z-20 flex items-center justify-center bg-ink-950/80 p-6">
-      <div
-        className="flex h-[min(720px,90vh)] w-[min(1080px,96vw)] flex-col overflow-hidden rounded-xl border border-ink-800 bg-ink-900 shadow-panel"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Settings"
-      >
-        <div className="flex h-12 shrink-0 items-center justify-between border-b border-ink-800 px-4">
-          <div className="flex items-center gap-2">
-            <Settings2 size={15} className="text-ink-400" />
-            <h2 className="text-sm font-semibold text-ink-100">Settings</h2>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              className="icon-button h-7 w-7"
-              onClick={() => void refreshSettings()}
-              disabled={isLoading}
-              aria-label="Reload settings"
-              title="Reload settings from the runtime"
-            >
-              <RefreshCw size={13} className={isLoading ? "animate-spin" : ""} />
-            </button>
-            <button className="icon-button h-7 w-7" onClick={onClose} aria-label="Close settings">
-              <X size={14} />
-            </button>
-          </div>
-        </div>
-
-        <div className="flex min-h-0 flex-1">
-          <nav className="w-52 shrink-0 border-r border-ink-800 p-2" aria-label="Settings sections">
-            {SETTINGS_SCREENS.map((entry) => {
-              const Icon = SCREEN_ICONS[entry.id];
-              return (
-                <button
-                  key={entry.id}
-                  onClick={() => {
-                    setScreen(entry.id);
-                    clearSettingsError();
-                  }}
-                  aria-current={screen === entry.id ? "page" : undefined}
-                  className={`mb-0.5 flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] transition-colors ${
-                    screen === entry.id
-                      ? "bg-ink-800 text-ink-100"
-                      : "text-ink-400 hover:bg-ink-850 hover:text-ink-200"
-                  }`}
-                >
-                  <Icon size={14} className="shrink-0" />
-                  {entry.label}
-                </button>
-              );
-            })}
-          </nav>
-
-          <div className="min-w-0 flex-1 overflow-y-auto p-5">
-            {error ? (
-              <div
-                role="alert"
-                className="mb-4 flex items-start gap-2 rounded-lg border border-danger/30 bg-danger/5 p-3 text-[11px] leading-4 text-danger"
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Settings"
+      description="Read from and applied through the runtime. The desktop never edits configuration itself."
+      width="max-w-5xl"
+    >
+      <div className="flex h-[min(680px,80vh)] min-h-0">
+        <nav className="w-52 shrink-0 border-r border-line p-2" aria-label="Settings sections">
+          {SETTINGS_SCREENS.map((entry) => {
+            const Icon = SCREEN_ICONS[entry.id];
+            const active = screen === entry.id;
+            return (
+              <button
+                key={entry.id}
+                onClick={() => {
+                  setScreen(entry.id);
+                  clearSettingsError();
+                }}
+                aria-current={active ? "page" : undefined}
+                className={cx(
+                  "mb-0.5 flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm",
+                  "transition-colors duration-fast",
+                  active ? "bg-active text-primary" : "text-muted hover:bg-hover hover:text-primary",
+                )}
               >
-                <CircleAlert size={14} className="mt-0.5 shrink-0" />
-                <span className="flex-1">{error}</span>
-                <button onClick={clearSettingsError} aria-label="Dismiss">
-                  <X size={12} />
-                </button>
-              </div>
-            ) : null}
+                <Icon className="size-icon-md shrink-0" />
+                {entry.label}
+              </button>
+            );
+          })}
+        </nav>
 
-            {!settings ? (
-              <div className="flex h-full items-center justify-center gap-2 text-[12px] text-ink-500">
-                {isLoading ? <LoaderCircle size={14} className="animate-spin" /> : null}
-                {isLoading ? "Loading settings…" : "Settings are unavailable until a runtime is connected."}
-              </div>
-            ) : (
-              <>
-                {screen === "models" ? <ModelsScreen /> : null}
-                {screen === "runtime" ? <RuntimeScreen /> : null}
-                {screen === "permissions" ? <PermissionsScreen /> : null}
-                {screen === "project" ? <ProjectScreen /> : null}
-                {screen === "verification" ? <VerificationScreen /> : null}
-              </>
-            )}
-          </div>
+        <div className="scroll-area min-w-0 flex-1 p-5">
+          {error ? (
+            <div
+              role="alert"
+              className="mb-4 flex items-start gap-2 rounded-lg border border-error/30 bg-error/5 p-3 text-xs leading-4 text-error"
+            >
+              <CircleAlert className="mt-0.5 size-icon-md shrink-0" />
+              <span className="flex-1">{error}</span>
+              <IconButton label="Dismiss" size="sm" onClick={clearSettingsError}>
+                <X className="size-icon-sm" />
+              </IconButton>
+            </div>
+          ) : null}
+
+          {!settings ? (
+            <div className="flex h-full items-center justify-center gap-2 text-sm text-faint">
+              {isLoading ? <LoaderCircle className="size-icon-md animate-spin" /> : null}
+              {isLoading
+                ? "Loading settings…"
+                : "Settings are unavailable until a runtime is connected."}
+            </div>
+          ) : (
+            <>
+              {screen === "models" ? <ModelsScreen /> : null}
+              {screen === "runtime" ? <RuntimeScreen /> : null}
+              {screen === "permissions" ? <PermissionsScreen /> : null}
+              {screen === "project" ? <ProjectScreen /> : null}
+              {screen === "verification" ? <VerificationScreen /> : null}
+            </>
+          )}
         </div>
+      </div>
+      <SettingsFooter
+        isLoading={isLoading}
+        onRefresh={() => void refreshSettings()}
+        onClose={onClose}
+      />
+    </Modal>
+  );
+}
+
+function SettingsFooter({
+  isLoading,
+  onRefresh,
+  onClose,
+}: {
+  isLoading: boolean;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between border-t border-line px-5 py-2.5">
+      <span className="text-2xs text-faint">The runtime owns execution and credentials.</span>
+      <div className="flex items-center gap-2">
+        <Button
+          size="sm"
+          onClick={onRefresh}
+          disabled={isLoading}
+          icon={
+            <RefreshCw className={cx("size-icon-sm", isLoading && "animate-spin")} />
+          }
+        >
+          Reload
+        </Button>
+        <Button size="sm" variant="primary" onClick={onClose}>
+          Done
+        </Button>
       </div>
     </div>
   );
 }
 
-function Screen({ title, description, children }: { title: string; description: string; children: React.ReactNode }) {
+function Screen({
+  title,
+  description,
+  children,
+}: {
+  title: string;
+  description: string;
+  children: React.ReactNode;
+}) {
   return (
     <section>
-      <h3 className="text-sm font-semibold text-ink-100">{title}</h3>
-      <p className="mt-1 text-[11px] leading-4 text-ink-500">{description}</p>
+      <h3 className="text-md font-semibold text-primary">{title}</h3>
+      <p className="mt-1 text-xs leading-4 text-muted">{description}</p>
       <div className="mt-4 space-y-3">{children}</div>
     </section>
   );
 }
 
+/** Label/value row. The two-column grid keeps long values aligned. */
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="grid grid-cols-[10rem_1fr] items-baseline gap-3 rounded-md border border-ink-800 bg-ink-950/40 px-3 py-2">
-      <span className="text-[11px] text-ink-500">{label}</span>
-      <span className={`break-words text-[12px] text-ink-200 ${mono ? "font-mono" : ""}`}>{value}</span>
+    <div className="grid grid-cols-[10rem_1fr] items-baseline gap-3 rounded-md border border-line bg-sunken px-3 py-2">
+      <span className="text-xs text-faint">{label}</span>
+      <span
+        className={cx(
+          "break-words text-sm text-secondary",
+          mono && "font-mono text-xs",
+        )}
+      >
+        {value}
+      </span>
     </div>
+  );
+}
+
+/** Text input paired with a label, matching the Field grid. */
+function LabelledInput({
+  label,
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  ariaLabel: string;
+}) {
+  return (
+    <label className="grid grid-cols-[10rem_1fr] items-center gap-3">
+      <span className="text-xs text-faint">{label}</span>
+      <input
+        className="rounded-md border border-line-strong bg-app px-2.5 py-1.5 font-mono text-sm text-primary outline-none transition-colors duration-fast focus:border-accent"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        aria-label={ariaLabel}
+      />
+    </label>
   );
 }
 
@@ -182,6 +255,8 @@ function ModelsScreen() {
     setSaved(ok);
   }
 
+  const testTone: Tone = modelTest?.ok ? "success" : modelTest?.skipped ? "warning" : "error";
+
   return (
     <Screen
       title="Models"
@@ -192,36 +267,33 @@ function ModelsScreen() {
       <Field label="Capabilities" value={describeCapabilities(settings.models.capabilities)} />
       <Field label="Base URL" value={settings.models.base_url} mono />
 
-      <div className="rounded-lg border border-ink-800 bg-ink-950/40 p-3">
+      <div className="rounded-lg border border-line bg-sunken p-3">
         <div className="flex items-center gap-2">
-          <KeyRound size={13} className="text-ink-500" />
-          <span className="text-[11px] font-medium text-ink-300">Credential</span>
+          <KeyRound className="size-icon-sm text-faint" />
+          <span className="text-xs font-medium text-secondary">Credential</span>
         </div>
-        <p className="mt-1.5 text-[11px] leading-4 text-ink-400">
+        <p className="mt-1.5 text-xs leading-4 text-muted">
           {describeCredential(settings.models.credential)}
         </p>
-        <p className="mt-1 text-[10px] leading-4 text-ink-600">
-          Secrets are read from the runtime environment and are never sent to this app, so they cannot be
-          displayed or edited here.
+        <p className="mt-1 text-2xs leading-4 text-faint">
+          Secrets are read from the runtime environment and are never sent to this app, so they cannot
+          be displayed or edited here.
         </p>
       </div>
 
       <div className="grid grid-cols-1 gap-2">
-        <label className="grid grid-cols-[10rem_1fr] items-center gap-3">
-          <span className="text-[11px] text-ink-500">Model name</span>
-          <input
-            className="rounded-md border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[12px] text-ink-100 outline-none focus:border-signal-500"
-            value={model}
-            onChange={(event) => {
-              setModel(event.target.value);
-              setSaved(false);
-            }}
-            aria-label="Model name"
-          />
-        </label>
+        <LabelledInput
+          label="Model name"
+          value={model}
+          onChange={(value) => {
+            setModel(value);
+            setSaved(false);
+          }}
+          ariaLabel="Model name"
+        />
         {settings.models.available_models.length > 0 ? (
           <div className="grid grid-cols-[10rem_1fr] items-start gap-3">
-            <span className="text-[11px] text-ink-500">Known models</span>
+            <span className="text-xs text-faint">Known models</span>
             <div className="flex flex-wrap gap-1">
               {settings.models.available_models.map((name) => (
                 <button
@@ -230,11 +302,13 @@ function ModelsScreen() {
                     setModel(name);
                     setSaved(false);
                   }}
-                  className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${
+                  className={cx(
+                    "rounded-sm px-1.5 py-0.5 font-mono text-2xs",
+                    "transition-colors duration-fast",
                     name === model
-                      ? "bg-signal-500/20 text-signal-400"
-                      : "bg-ink-850 text-ink-400 hover:text-ink-200"
-                  }`}
+                      ? "bg-accent/15 text-accent"
+                      : "bg-elevated text-muted hover:text-primary",
+                  )}
                 >
                   {name}
                 </button>
@@ -242,55 +316,60 @@ function ModelsScreen() {
             </div>
           </div>
         ) : null}
-        <label className="grid grid-cols-[10rem_1fr] items-center gap-3">
-          <span className="text-[11px] text-ink-500">Base URL</span>
-          <input
-            className="rounded-md border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[12px] text-ink-100 outline-none focus:border-signal-500"
-            value={baseUrl}
-            onChange={(event) => {
-              setBaseUrl(event.target.value);
-              setSaved(false);
-            }}
-            aria-label="Base URL"
-          />
-        </label>
-        <label className="grid grid-cols-[10rem_1fr] items-center gap-3">
-          <span className="text-[11px] text-ink-500">Key variable</span>
-          <input
-            className="rounded-md border border-ink-700 bg-ink-950 px-2.5 py-1.5 font-mono text-[12px] text-ink-100 outline-none focus:border-signal-500"
-            value={apiKeyEnv}
-            onChange={(event) => {
-              setApiKeyEnv(event.target.value);
-              setSaved(false);
-            }}
-            aria-label="API key environment variable name"
-          />
-        </label>
+        <LabelledInput
+          label="Base URL"
+          value={baseUrl}
+          onChange={(value) => {
+            setBaseUrl(value);
+            setSaved(false);
+          }}
+          ariaLabel="Base URL"
+        />
+        <LabelledInput
+          label="Key variable"
+          value={apiKeyEnv}
+          onChange={(value) => {
+            setApiKeyEnv(value);
+            setSaved(false);
+          }}
+          ariaLabel="API key environment variable name"
+        />
       </div>
 
       <div className="flex items-center gap-2 pt-1">
-        <button className="primary-button" onClick={() => void save()}>
-          <Save size={13} /> Apply model
-        </button>
-        <button className="quiet-button" onClick={() => void testModelConnection()}>
-          <CircleDot size={13} /> Test connection
-        </button>
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={() => void save()}
+          icon={<Save className="size-icon-sm" />}
+        >
+          Apply model
+        </Button>
+        <Button
+          size="sm"
+          onClick={() => void testModelConnection()}
+          icon={<CircleDot className="size-icon-sm" />}
+        >
+          Test connection
+        </Button>
         {saved ? (
-          <span className="flex items-center gap-1 text-[11px] text-success">
-            <CheckCircle2 size={12} /> Applied
-          </span>
+          <Badge tone="success">
+            <CheckCircle2 className="size-icon-xs" /> Applied
+          </Badge>
         ) : null}
       </div>
 
       {modelTest ? (
         <div
-          className={`rounded-md border p-2.5 text-[11px] leading-4 ${
-            modelTest.ok
-              ? "border-success/30 bg-success/5 text-success"
-              : modelTest.skipped
-                ? "border-warning/30 bg-warning/5 text-warning"
-                : "border-danger/30 bg-danger/5 text-danger"
-          }`}
+          className={cx(
+            "rounded-md border p-2.5 text-xs leading-4",
+            testTone === "success"
+              ? "border-success/30 bg-success/5"
+              : testTone === "warning"
+                ? "border-warning/30 bg-warning/5"
+                : "border-error/30 bg-error/5",
+            toneText(testTone),
+          )}
         >
           {modelTest.message}
         </div>
@@ -310,7 +389,11 @@ function RuntimeScreen() {
       <Field label="Logs" value={settings.runtime.log_target} />
       <Field
         label="Providers"
-        value={settings.runtime.provider_names.length > 0 ? settings.runtime.provider_names.join(", ") : "none"}
+        value={
+          settings.runtime.provider_names.length > 0
+            ? settings.runtime.provider_names.join(", ")
+            : "none"
+        }
       />
       <Field label="Credentials" value={`from ${settings.runtime.credential_source}`} />
     </Screen>
@@ -327,37 +410,44 @@ function PermissionsScreen() {
       title="Permissions"
       description="The execution mode governs what the agent may do without asking. Human terminal sessions are separate and are not governed here."
     >
-      <div className="rounded-lg border border-ink-800 bg-ink-950/40 p-3">
+      <div className="rounded-lg border border-line bg-sunken p-3">
         <div className="flex items-center gap-2">
-          <ShieldCheck size={14} className="text-signal-400" />
-          <span className="text-[12px] font-medium text-ink-100">{settings.permissions.mode}</span>
+          <ShieldCheck className="size-icon-md text-accent" />
+          <span className="text-sm font-medium text-primary">{settings.permissions.mode}</span>
         </div>
-        <p className="mt-1.5 text-[11px] leading-4 text-ink-400">
+        <p className="mt-1.5 text-xs leading-4 text-muted">
           {settings.permissions.mode_description}
         </p>
       </div>
 
       <div className="flex flex-wrap gap-1.5">
-        {settings.permissions.available_modes.map((mode) => (
-          <button
-            key={mode}
-            onClick={async () => {
-              if (mode === settings.permissions.mode) return;
-              setPending(mode);
-              await updatePermissionMode(mode);
-              setPending(null);
-            }}
-            disabled={pending !== null || mode === settings.permissions.mode}
-            className={`rounded-md border px-2.5 py-1.5 font-mono text-[11px] transition-colors disabled:opacity-50 ${
-              mode === settings.permissions.mode
-                ? "border-signal-500/50 bg-signal-500/15 text-signal-400"
-                : "border-ink-700 bg-ink-850 text-ink-300 hover:border-ink-600 hover:text-ink-100"
-            }`}
-          >
-            {pending === mode ? <LoaderCircle size={12} className="mr-1 inline animate-spin" /> : null}
-            {mode}
-          </button>
-        ))}
+        {settings.permissions.available_modes.map((mode) => {
+          const active = mode === settings.permissions.mode;
+          return (
+            <button
+              key={mode}
+              onClick={async () => {
+                if (active) return;
+                setPending(mode);
+                await updatePermissionMode(mode);
+                setPending(null);
+              }}
+              disabled={pending !== null || active}
+              className={cx(
+                "rounded-md border px-2.5 py-1.5 font-mono text-xs",
+                "transition-colors duration-fast disabled:opacity-50",
+                active
+                  ? "border-accent/50 bg-accent/10 text-accent"
+                  : "border-line-strong bg-elevated text-secondary hover:border-line-stronger hover:text-primary",
+              )}
+            >
+              {pending === mode ? (
+                <LoaderCircle className="mr-1 inline size-icon-sm animate-spin" />
+              ) : null}
+              {mode}
+            </button>
+          );
+        })}
       </div>
 
       <RuleList
@@ -394,43 +484,36 @@ function RuleList({
 }: {
   title: string;
   hint: string;
-  rules: { name: string; action: string; reason: string; tools: string[]; operations: string[] }[];
+  rules: {
+    name: string;
+    action: string;
+    reason: string;
+    tools: string[];
+    operations: string[];
+  }[];
   emptyText?: string;
 }) {
   return (
     <div>
-      <p className="text-[11px] font-medium text-ink-300">{title}</p>
-      <p className="mt-0.5 text-[10px] text-ink-600">{hint}</p>
+      <p className="text-xs font-medium text-secondary">{title}</p>
+      <p className="mt-0.5 text-2xs text-faint">{hint}</p>
       {rules.length === 0 ? (
-        <p className="mt-2 rounded-md border border-dashed border-ink-800 p-2.5 text-[11px] text-ink-600">
+        <p className="mt-2 rounded-md border border-dashed border-line p-2.5 text-xs text-faint">
           {emptyText ?? "None."}
         </p>
       ) : (
         <ul className="mt-2 space-y-1">
           {rules.map((rule, index) => (
-            <li
-              key={`${rule.name}-${index}`}
-              className="rounded-md border border-ink-800 bg-ink-950/40 px-3 py-2"
-            >
+            <li key={`${rule.name}-${index}`} className="rounded-md border border-line bg-sunken px-3 py-2">
               <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-[11px] text-ink-200">{rule.name}</span>
-                <span
-                  className={`text-[10px] ${
-                    rule.action === "allow" || rule.action === "allowed"
-                      ? "text-success"
-                      : rule.action === "deny" || rule.action === "denied"
-                        ? "text-danger"
-                        : "text-warning"
-                  }`}
-                >
-                  {rule.action}
-                </span>
+                <span className="font-mono text-xs text-secondary">{rule.name}</span>
+                <Badge tone={actionTone(rule.action)}>{rule.action}</Badge>
               </div>
               {rule.reason ? (
-                <p className="mt-1 text-[11px] leading-4 text-ink-500">{rule.reason}</p>
+                <p className="mt-1 text-xs leading-4 text-faint">{rule.reason}</p>
               ) : null}
               {rule.tools.length > 0 || rule.operations.length > 0 ? (
-                <p className="mt-1 font-mono text-[10px] text-ink-600">
+                <p className="mt-1 font-mono text-2xs text-faint">
                   {[...rule.tools, ...rule.operations].join(", ")}
                 </p>
               ) : null}
@@ -440,6 +523,14 @@ function RuleList({
       )}
     </div>
   );
+}
+
+/** Maps a policy action onto a tone so allow/ask/deny read consistently. */
+function actionTone(action: string): Tone {
+  const value = action.toLowerCase();
+  if (value.startsWith("allow")) return "success";
+  if (value.startsWith("deny")) return "error";
+  return "warning";
 }
 
 function ProjectScreen() {
@@ -470,16 +561,16 @@ function ProjectScreen() {
 
 function ChipRow({ label, items, empty }: { label: string; items: string[]; empty: string }) {
   return (
-    <div className="rounded-md border border-ink-800 bg-ink-950/40 px-3 py-2">
-      <span className="text-[11px] text-ink-500">{label}</span>
+    <div className="rounded-md border border-line bg-sunken px-3 py-2">
+      <span className="text-xs text-faint">{label}</span>
       {items.length === 0 ? (
-        <p className="mt-1 text-[11px] text-ink-600">{empty}</p>
+        <p className="mt-1 text-xs text-faint">{empty}</p>
       ) : (
         <div className="mt-1.5 flex flex-wrap gap-1">
           {items.map((item) => (
             <span
               key={item}
-              className="max-w-full truncate rounded bg-ink-850 px-1.5 py-0.5 font-mono text-[10px] text-ink-300"
+              className="max-w-full truncate rounded-sm bg-elevated px-1.5 py-0.5 font-mono text-2xs text-secondary"
               title={item}
             >
               {item}
@@ -499,23 +590,20 @@ function VerificationScreen() {
       description="Commands the runtime runs to verify agent changes."
     >
       {settings.verification.commands.length === 0 ? (
-        <p className="rounded-md border border-dashed border-ink-800 p-3 text-[11px] leading-4 text-ink-600">
+        <p className="rounded-md border border-dashed border-line p-3 text-xs leading-4 text-faint">
           No verification commands were detected for this project.
         </p>
       ) : (
         <ul className="space-y-1">
           {settings.verification.commands.map((command) => (
-            <li
-              key={command.category}
-              className="rounded-md border border-ink-800 bg-ink-950/40 px-3 py-2"
-            >
+            <li key={command.category} className="rounded-md border border-line bg-sunken px-3 py-2">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-medium text-ink-300">{command.category}</span>
-                <span className="text-[10px] text-ink-600">
+                <span className="text-xs font-medium text-secondary">{command.category}</span>
+                <span className="text-2xs text-faint">
                   {command.is_override ? "project override" : "detected"}
                 </span>
               </div>
-              <p className="mt-1 break-words font-mono text-[11px] text-ink-200">
+              <p className="mt-1 break-words font-mono text-xs text-secondary">
                 {formatCommand(command)}
               </p>
             </li>

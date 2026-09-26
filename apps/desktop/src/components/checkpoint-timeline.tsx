@@ -1,11 +1,7 @@
-import {
-  CheckCircle2,
-  History,
-  LoaderCircle,
-  RotateCcw,
-} from "lucide-react";
+import { CheckCircle2, History, LoaderCircle, RotateCcw } from "lucide-react";
 import { formatTimestamp, type CheckpointEntry } from "../lib/changes";
 import type { RestoreReport } from "../lib/rpc";
+import { Badge, Button, EmptyState, Tooltip } from "./ui";
 
 interface CheckpointTimelineProps {
   checkpoints: CheckpointEntry[];
@@ -32,38 +28,33 @@ export function CheckpointTimeline({
   return (
     <div>
       <div className="mb-2 flex items-center justify-between">
-        <p className="mono-label flex items-center gap-1.5">
-          <History size={11} /> Checkpoints
+        <p className="label-mono flex items-center gap-1.5">
+          <History className="size-icon-sm" /> Checkpoints
         </p>
-        <span className="text-[10px] text-ink-600">{checkpoints.length}</span>
+        <span className="text-2xs text-faint">{checkpoints.length}</span>
       </div>
       {checkpoints.length === 0 ? (
-        <p className="rounded-md border border-dashed border-ink-800 p-3 text-xs leading-5 text-ink-600">
-          Checkpoints are recorded automatically when a run starts. Run a task to create one.
-        </p>
+        <EmptyState>Checkpoints are recorded automatically when a run starts. Run a task to create one.</EmptyState>
       ) : (
         <ol className="space-y-2">
           {checkpoints.map((checkpoint) => {
             const restoring = restoringId === checkpoint.id;
             const restorable = checkpoint.affectedFiles.length > 0;
             return (
-              <li key={checkpoint.id} className="rounded-lg border border-ink-800 bg-ink-900/70 p-2.5">
+              <li key={checkpoint.id} className="rounded-lg border border-line bg-elevated p-2.5">
                 <div className="flex items-start justify-between gap-2">
-                  <code
-                    className="min-w-0 flex-1 truncate font-mono text-[10px] text-ink-300"
-                    title={checkpoint.id}
-                  >
+                  <code className="min-w-0 flex-1 truncate font-mono text-2xs text-secondary" title={checkpoint.id}>
                     {checkpoint.id}
                   </code>
                   {checkpoint.isRestored ? (
-                    <span className="flex shrink-0 items-center gap-1 text-[9px] text-success">
-                      <CheckCircle2 size={10} /> restored
-                    </span>
+                    <Badge tone="success">
+                      <CheckCircle2 className="size-icon-xs" /> restored
+                    </Badge>
                   ) : null}
                 </div>
-                <p className="mt-1 text-[10px] text-ink-600">{formatTimestamp(checkpoint.createdAt)}</p>
+                <p className="mt-1 text-2xs text-faint">{formatTimestamp(checkpoint.createdAt)}</p>
                 <p
-                  className="mt-1 line-clamp-2 text-[11px] leading-4 text-ink-400"
+                  className="mt-1 line-clamp-2 text-xs leading-4 text-muted"
                   title={checkpoint.trigger || "Run started"}
                 >
                   {checkpoint.trigger || "Run started"}
@@ -73,47 +64,57 @@ export function CheckpointTimeline({
                     {checkpoint.affectedFiles.slice(0, 4).map((file) => (
                       <span
                         key={file}
-                        className="max-w-full truncate rounded bg-ink-850 px-1.5 py-0.5 font-mono text-[9px] text-ink-500"
+                        className="max-w-full truncate rounded-sm bg-active px-1.5 py-0.5 font-mono text-2xs text-muted"
                         title={file}
                       >
                         {file}
                       </span>
                     ))}
                     {checkpoint.affectedFiles.length > 4 ? (
-                      <span className="text-[9px] text-ink-600">+{checkpoint.affectedFiles.length - 4}</span>
+                      <span className="text-2xs text-faint">
+                        +{checkpoint.affectedFiles.length - 4}
+                      </span>
                     ) : null}
                   </div>
                 ) : null}
-                <button
-                  className="quiet-button mt-2 w-full justify-center py-1.5 text-[10px]"
-                  disabled={disabled || restoring || !restorable}
-                  title={
+                <Tooltip
+                  label={
                     restorable
                       ? "Ask the runtime to revert this checkpoint's recorded changes"
                       : "This checkpoint recorded no file changes"
                   }
-                  onClick={() => onRestore(checkpoint.id)}
                 >
-                  {restoring ? (
-                    <LoaderCircle size={12} className="animate-spin" />
-                  ) : (
-                    <RotateCcw size={12} />
-                  )}
-                  {restoring ? "Restoring…" : "Restore"}
-                </button>
+                  <span className="mt-2 block">
+                    <Button
+                      size="sm"
+                      block
+                      disabled={disabled || restoring || !restorable}
+                      onClick={() => onRestore(checkpoint.id)}
+                      icon={
+                        restoring ? (
+                          <LoaderCircle className="size-icon-sm animate-spin" />
+                        ) : (
+                          <RotateCcw className="size-icon-sm" />
+                        )
+                      }
+                    >
+                      {restoring ? "Restoring…" : "Restore"}
+                    </Button>
+                  </span>
+                </Tooltip>
               </li>
             );
           })}
         </ol>
       )}
       {lastRestore ? (
-        <div className="mt-2 flex items-start gap-1.5 rounded-md border border-ink-800 bg-ink-900/60 p-2 text-[10px] leading-4 text-ink-400">
-          <CheckCircle2 size={12} className="mt-0.5 shrink-0 text-success" />
+        <p className="mt-2 flex items-start gap-1.5 rounded-md border border-line bg-elevated p-2 text-2xs leading-4 text-muted">
+          <CheckCircle2 className="mt-0.5 size-icon-sm shrink-0 text-success" />
           <span>
             Restored {lastRestore.restored_files.length} file
             {lastRestore.restored_files.length === 1 ? "" : "s"} through the runtime.
           </span>
-        </div>
+        </p>
       ) : null}
     </div>
   );
