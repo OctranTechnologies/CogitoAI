@@ -182,6 +182,92 @@ fn rejects_binary_and_large_files() {
 }
 
 #[test]
+fn records_tool_arguments_as_the_model_wrote_them() {
+    // The event log is persisted and read back by every client, so a string
+    // argument must be stored as the string itself. Serialising the JSON value
+    // would store its encoding instead, and readers would show literal quotes.
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    fs::write(workspace.join("file.txt"), "content").unwrap();
+    let registry = ToolRegistry::with_workspace_tools();
+    let bus = EventBus::new();
+    let requested = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&requested);
+    let _subscription = bus.subscribe(Arc::new(move |event: &harness_session::HarnessEvent| {
+        if let harness_session::EventPayload::ToolRequested { tool, arguments } = &event.payload {
+            if tool == "read_file" {
+                *captured.lock().unwrap() = Some(arguments.clone());
+            }
+        }
+    }));
+    let session_id = SessionId::new("session-arguments").unwrap();
+    let context = ToolContext {
+        policy: &AllowAllPolicy,
+        working_directory: workspace,
+        event_bus: Some(&bus),
+        session_id: Some(&session_id),
+        correlation_id: None,
+    };
+
+    registry
+        .execute(
+            &context,
+            request("read_file", json!({ "path": "file.txt" })),
+        )
+        .unwrap();
+
+    let arguments = requested
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a tool.requested event should have been emitted");
+    assert_eq!(arguments.get("path").map(String::as_str), Some("file.txt"));
+}
+
+#[test]
+fn records_non_string_tool_arguments_as_json() {
+    // Numbers, booleans, and objects have no plain-string form, so they keep
+    // their JSON representation rather than being flattened.
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    fs::write(workspace.join("file.txt"), "content").unwrap();
+    let registry = ToolRegistry::with_workspace_tools();
+    let bus = EventBus::new();
+    let requested = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&requested);
+    let _subscription = bus.subscribe(Arc::new(move |event: &harness_session::HarnessEvent| {
+        if let harness_session::EventPayload::ToolRequested { tool, arguments } = &event.payload {
+            if tool == "read_file" {
+                *captured.lock().unwrap() = Some(arguments.clone());
+            }
+        }
+    }));
+    let session_id = SessionId::new("session-arguments-non-string").unwrap();
+    let context = ToolContext {
+        policy: &AllowAllPolicy,
+        working_directory: workspace,
+        event_bus: Some(&bus),
+        session_id: Some(&session_id),
+        correlation_id: None,
+    };
+
+    registry
+        .execute(
+            &context,
+            request(
+                "read_file",
+                json!({ "path": "file.txt", "line": 12, "whole": true }),
+            ),
+        )
+        .unwrap();
+
+    let arguments = requested.lock().unwrap().clone().unwrap();
+    assert_eq!(arguments.get("line").map(String::as_str), Some("12"));
+    assert_eq!(arguments.get("whole").map(String::as_str), Some("true"));
+    assert_eq!(arguments.get("path").map(String::as_str), Some("file.txt"));
+}
+
+#[test]
 fn emits_tool_lifecycle_events_through_the_common_registry() {
     let temporary = tempdir().unwrap();
     let workspace = temporary.path();

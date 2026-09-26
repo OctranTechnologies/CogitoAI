@@ -283,7 +283,17 @@ fn event_arguments(arguments: &serde_json::Value) -> BTreeMap<String, String> {
         .map(|arguments| {
             arguments
                 .iter()
-                .map(|(name, value)| (name.clone(), concise_event_value(&value.to_string())))
+                // A string argument is recorded as the string the model asked
+                // for. Serialising the `Value` would store its JSON encoding
+                // instead, which puts literal quotes in the event log and in
+                // every surface that reads it back.
+                .map(|(name, value)| {
+                    let rendered = match value {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    (name.clone(), concise_event_value(&rendered))
+                })
                 .collect()
         })
         .unwrap_or_default()
