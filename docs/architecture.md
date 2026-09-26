@@ -1,5 +1,9 @@
 # CogitoAI architecture
 
+For the crate map and step-by-step extension guides, see
+[development.md](development.md). For what the project is and how to run it, see
+the [README](../README.md).
+
 ## Dependency direction
 
 The workspace separates contracts, capabilities, and composition. Dependencies
@@ -7,59 +11,80 @@ point toward the capability being used, never from a capability back to a UI or
 provider implementation.
 
 ```text
-                         +----------------+
-                         | harness-core   |
-                         | contracts, IDs |
-                         +--------+-------+
-                                  ^
-             +--------------------+--------------------+
-             |                    |                    |
-     +-------+------+     +-------+------+     +-------+------+
-     | harness-     |     | harness-     |     | harness-      |
-     | models       |     | tools        |     | policy        |
-     +--------------+     +-------+------+     +---------------+
-             ^                    ^                    ^
-             |                    |                    |
-             +--------------------+--------------------+
-                                  |
-                         +--------+---------+
-                         | harness-rpc     |
-                         | composition root |
-                         +-----------------+
-                                  ^
-               +------------------+------------------+
-               |                  |                  |
-       +-------+------+   +-------+------+   +-------+------+
-       | harness-     |   | harness-     |   | harness-      |
-       | session      |   | git          |   | verification  |
-       +--------------+   +--------------+   +---------------+
-                                  ^
-                           +------+------+
-                           | harness-cli  |
-                           | client shell |
-                           +-------------+
+                          +----------------+
+                          | harness-core   |
+                          | contracts, IDs |
+                          +--------+-------+
+                                   ^
+        +-------------+-------------+-------------+-------------+
+        |             |             |             |             |
+   +----+-----+  +-----+-----+  +----+-----+  +--+-------+  +--+------+
+   | harness- |  | harness- |  | harness- |  | harness- |  | harness- |
+   | models   |  | policy   |  | session  |  | git      |  | pty     |
+   +----+-----+  +-----+-----+  +----+-----+  +--+-------+  +--+------+
+        ^             ^             ^             ^             |
+        |             |             |             |             |
+        +-------------+------+------+-------------+             |
+                            |      |                            |
+                   +--------+--+ +-+--------------+             |
+                   | harness-  | | harness-      |             |
+                   | tools     | | verification  |             |
+                   +--------+--+ +-+--------------+             |
+                            |      |                            |
+                            |  +---+--------------+             |
+                            |  | harness-context  |             |
+                            |  +------------------+             |
+                            |         ^                          |
+                            |         |                          |
+                            +---------+--------------------------+
+                                      |
+                             +--------+---------+
+                             | harness-agent    |
+                             | the agent loop   |
+                             +-----------------+
+                                      ^
+                    +-----------------+------------------+
+                    |                                    |
+            +-------+--------+                  +--------+--------+
+            | harness-rpc    |                  | harness-cli      |
+            | runtime + RPC  |                  | CLI client       |
+            +-------+--------+                  +-----------------+
+                    ^
+                    |
+          +---------+---------+
+          | cogitoai-desktop  |
+          | Tauri shell       |
+          +-------------------+
 ```
 
-The actual manifest graph is intentionally narrower than the conceptual
-picture: `harness-core` has no capability dependencies, and `harness-rpc` is
-the composition root for capability crates. `harness-cli` is a presentation
-client and composes the same runtime services for its single-process commands;
-`harness-rpc` also owns the versioned loopback JSON-lines transport used by
-desktop and integration clients.
+The manifest graph is slightly wider than this conceptual picture, and
+`harness-context` and `harness-verification` both reach down to `harness-tools` and
+`harness-git` for the types they assemble. The direction is what matters: nothing
+below the line depends on anything above it.
+
+`harness-rpc` is the composition root for capability crates and owns the versioned
+loopback JSON-lines transport. `harness-cli` is a presentation client that composes
+the same runtime services in-process for its single-process commands. The Tauri
+shell links only `harness-rpc`, so it cannot reach a tool, provider, or policy
+implementation except through the runtime boundary.
 
 ## Crate responsibilities
 
 | Crate | Owns | Must not own |
 | --- | --- | --- |
-| `harness-core` | Provider-neutral orchestration traits, shared errors, IDs, configuration, logging setup | Provider APIs, filesystem or shell execution |
+| `harness-core` | Provider-neutral orchestration traits, shared errors, IDs, configuration, logging setup, workspace discovery | Provider APIs, filesystem or shell execution |
 | `harness-models` | Model-provider adapters and provider capabilities | Agent lifecycle, tool execution policy |
-| `harness-tools` | Tool contracts, tool requests/results, registry | Authorization decisions, provider logic |
+| `harness-tools` | Tool contracts, tool requests/results, registry, workspace tools, process execution | Authorization decisions, provider logic |
 | `harness-policy` | Permissions, decisions, and policy enforcement | Tool implementations, UI concerns |
-| `harness-session` | Sessions, events, and persistence interfaces | Git operations, provider adapters |
-| `harness-git` | Git/checkpoint contracts | General session state |
+| `harness-session` | Sessions, events, and persistence | Git operations, provider adapters |
+| `harness-git` | Git/checkpoint contracts and shadow checkpoint storage | General session state |
+| `harness-context` | Context assembly from workspace, instructions, and Git state | Agent lifecycle, provider adapters |
 | `harness-verification` | Test, lint, and typecheck verification contracts | Agent orchestration |
+| `harness-pty` | Human terminal sessions over a native pseudo-terminal | Any `Tool` implementation, so the agent cannot reach it |
+| `harness-agent` | The agent loop, approvals, checkpoint recording, verification feedback | Transport, UI concerns |
 | `harness-rpc` | Runtime composition and the client-facing runtime boundary | UI code or direct UI access to privileged implementations |
 | `harness-cli` | Command-line parsing and client presentation | Direct filesystem, shell, Git, or provider implementations |
+
 
 ## Runtime boundary
 
@@ -128,8 +153,18 @@ cargo tree --workspace --edges normal
 The expected internal graph is:
 
 - `harness-core`: no workspace dependencies.
-- `harness-models`, `harness-policy`, `harness-session`, `harness-git`, and
-  `harness-verification`: depend only on `harness-core`.
-- `harness-tools`: depends on `harness-core` and `harness-policy`.
-- `harness-rpc`: composes the capability crates.
-- `harness-cli`: depends on `harness-core` and external CLI libraries.
+- `harness-models`, `harness-policy`, `harness-session`, and `harness-pty`: depend
+  only on `harness-core`.
+- `harness-git`: depends on `harness-core` and `harness-session`.
+- `harness-tools`: depends on `harness-core`, `harness-policy`, and
+  `harness-session`.
+- `harness-verification`: depends on `harness-core`, `harness-session`, and
+  `harness-tools`.
+- `harness-context`: depends on `harness-core`, `harness-git`, `harness-session`,
+  and `harness-tools`.
+- `harness-agent`: composes the capability crates and owns the loop.
+- `harness-rpc`: composes the capability crates and owns the transport.
+- `harness-cli`: depends on `harness-agent` and the capability crates.
+- `cogitoai-desktop`: depends on `harness-rpc` only, which is what keeps the
+  shell from reaching a privileged implementation directly.
+

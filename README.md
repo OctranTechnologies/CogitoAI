@@ -1,129 +1,365 @@
 # CogitoAI
 
-CogitoAI is a model-agnostic coding-agent harness. It ships a Rust workspace of
-runtime crates, a command-line client, a versioned RPC runtime, and a Tauri
-desktop client over that runtime.
+CogitoAI is a model-agnostic coding-agent harness. It gives an agent a controlled
+set of tools over a local workspace, records everything the agent does as an
+append-only event log, and lets you inspect, verify, and undo the result. When the
+workspace is a Git repository, recovery is precise and Git-aware.
 
-The runtime owns everything that has consequences: the agent loop, the tool
-registry, policy decisions, approvals, verification, Git checkpoints, terminals,
-and durable sessions. The CLI and the desktop shell are presentation clients.
+It ships as two clients over one runtime: a terminal CLI and a Tauri desktop
+application.
 
-## Repository layout
+## Project overview
 
-- `crates/`: Rust backend and client crates.
-- `apps/desktop/`: Tauri 2 + React + TypeScript desktop shell over `harness-rpc`.
-- `docs/`: architecture and development documentation.
-- `examples/`: small, future-facing usage examples.
+### What the harness does
 
-## Rust workspace
+You give it a task in a repository. It assembles context from the project, asks a
+model what to do, executes the model's tool calls under a policy engine, records
+every step as a durable event, runs the project's own verification commands, and
+reports what changed. You approve anything the policy says requires approval, and
+you can put the repository back the way it was.
 
-Requirements: Rust 1.78 or newer.
+### Architectural philosophy
+
+**Model agnostic.** The agent loop never learns which vendor it is talking to.
+`harness-models` defines messages, tool calls, streaming deltas, usage, and
+capabilities; a provider is anything that implements `ModelProvider`. Swapping
+models changes a configuration value, not the architecture. A deterministic mock
+provider is a first-class provider, not a test stub bolted on afterwards, which is
+what makes the whole system testable without a network.
+
+**Local first.** The runtime runs in-process on your machine and the RPC transport
+binds to loopback. There is no cloud service, no account, and no telemetry.
+Credentials are read from the environment of the process you started and are never
+sent to a client, written to a config file, or logged. Your code does not leave the
+machine.
+
+**Deterministic execution control.** The model's freedom ends at the tool
+boundary. A model may only ask for an action; the runtime decides whether that
+action happens. Every call is matched against the policy engine, which resolves to
+allow, ask, or deny from the mode, the configured rules, and the path or command
+involved. Reads and searches are bounded, writes are checkpointed, commands have a
+timeout and an output cap, and a cancelled or failed run still closes its session
+cleanly. The same task produces the same event stream whether a person or a script
+is watching.
+
+**CLI and desktop over one runtime.** Both clients drive the same agent core, the
+same policy engine, and the same session store. The CLI composes them in-process;
+the desktop reaches them across a versioned JSONL RPC protocol. Neither client
+contains agent logic, so a capability added to the runtime is available to both,
+and the desktop cannot obtain a privileged capability the CLI could not, because
+`harness-rpc` is the only thing the shell links.
+
+**Event-sourced sessions.** A session is a JSONL file with one schema-versioned
+event per line. Nothing is mutated in place: tool calls, approvals, verification
+results, checkpoints, and compaction are all appended. Reconstructing a session
+means replaying its log, so history stays auditable and a crash can lose at most
+the final partially written record, which is then reported as a warning rather
+than silently dropped.
+
+**Git-aware recovery.** Checkpoints are captured against the repository's own
+state, so undo is precise. A restore touches only the files the checkpoint
+recorded, refuses to proceed when a file changed after the checkpoint was taken,
+and leaves unrelated work, untracked files, and the index alone. The agent works
+with your dirty working tree rather than requiring a clean one.
+
+## Architecture
 
 ```text
-cargo build --workspace
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+        CLI (harness-cli) ──────────────┐
+                                       ├── agent core (harness-agent)
+        Desktop (Tauri/React) ── RPC ──┘        │
+        (harness-rpc, versioned JSONL           │
+         over loopback TCP)                     ▼
+                              ┌──────────────────────────────┐
+                              │ tools · policy · models ·    │
+                              │ session · git · context ·    │
+                              │ pty · verification · core    │
+                              └──────────────────────────────┘
+
+   The CLI composes these crates in-process; the desktop reaches them only
+   through the RPC runtime. Neither client contains agent logic.
 ```
+
+Both clients are untrusted with respect to privileged operations. A client may
+request; the runtime decides. Every privileged call is evaluated by the same
+`harness-policy` engine against the open workspace before it happens, and the
+desktop can reach nothing without going through `harness-rpc`, which links no tool,
+provider, or policy implementation of its own.
+
+
+See [`docs/architecture.md`](docs/architecture.md) for crate responsibilities and
+dependency direction, and [`docs/development.md`](docs/development.md) for a crate
+map and step-by-step guides to adding a provider, tool, policy rule, or client
+surface.
+
+## Prerequisites
+
+| Requirement | Version | Notes |
+| --- | --- | --- |
+| Rust | 1.78 or newer (`rust-version` in the workspace manifest) | Verified on 1.95.0 |
+| Node.js | 20 or newer | Verified on 24.20.0; only the desktop app needs it |
+| pnpm | 10 or newer | Verified on 10.33.4; the committed `pnpm-lock.yaml` pins resolutions |
+| Git | 2.x recommended | Required for checkpoints and diffs; the agent still runs without it |
+| Platform C++ toolchain | see below | Required by Tauri only |
+
+Tauri 2 platform prerequisites, needed only for the desktop application:
+
+- **Windows:** Microsoft WebView2 Runtime, plus Visual Studio Build Tools with the
+  desktop C++ workload. The interactive terminal additionally needs Windows 10
+  version 1809 (build 17763) or newer for ConPTY.
+- **macOS:** Xcode command-line tools.
+- **Linux:** the WebKitGTK development packages required by Tauri 2. A headless
+  container without `/dev/ptmx` cannot open an interactive terminal.
+
+## Installation
+
+From a clean clone:
+
+```bash
+git clone https://github.com/OctranTechnologies/CogitoAI.git
+cd CogitoAI
+cargo build --workspace
+```
+
+That is enough for the CLI. The desktop application additionally needs the
+frontend dependencies:
+
+```bash
+cd apps/desktop
+pnpm install
+cd ../..
+```
+
+pnpm 10 blocks dependency lifecycle scripts by default and prints an
+"Ignored build scripts" warning for `esbuild`. That warning is expected here and
+does not need `pnpm approve-builds`; the build works because those packages ship
+prebuilt binaries.
+
+## Model configuration
+
+The harness runs without any credentials. The default provider is a deterministic
+mock that executes a fixed, scripted workflow through the real agent loop, policy
+engine, checkpoint store, and verification commands, so you can exercise the whole
+system offline.
+
+To use a real provider, set the API key in the environment of the process you
+start. Never put a key in a file, and never commit one.
+
+```bash
+# PowerShell
+$env:OPENAI_API_KEY = "<your-key>"
+$env:COGITO_MODEL_PROVIDER = "openai"
+$env:COGITO_MODEL = "gpt-4o-mini"
+```
+
+```bash
+# bash
+export OPENAI_API_KEY="<your-key>"
+export COGITO_MODEL_PROVIDER="openai"
+export COGITO_MODEL="gpt-4o-mini"
+```
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `COGITO_MODEL_PROVIDER` | `mock` or `openai` | `mock` |
+| `COGITO_MODEL` | Model name passed to the provider | provider default |
+| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | `OPENAI_API_KEY` |
+| `COGITO_MODEL_BASE_URL` | Provider base URL, for OpenAI-compatible endpoints | provider default |
+| `COGITO_MOCK_REPAIR` | Mock-only test hook; see [Testing the repair loop](#testing-the-repair-loop) | unset |
+| `RUST_LOG` | Runtime log level for the RPC runtime | `info` |
+
+The key is read from the environment only. It is never returned by the settings
+API, never placed in an RPC frame, and never logged; clients are told only whether
+a credential is present and which variable holds it. The harness stores no key on
+disk and implements no home-grown encryption.
+
+## Current v0 capabilities
+
+Everything in this list is implemented and covered by tests.
+
+**Agent and tools**
+
+- Single-agent loop with tool calling, streaming deltas, and usage accounting.
+- Seven tools: `read_file`, `write_file`, `apply_patch`, `list_directory`, `glob`,
+  `grep`, and `shell`.
+- Path containment: every tool resolves paths against the workspace root, so `..`
+  segments, absolute paths, and symlinks cannot escape it.
+- Bounded reads and command execution, with per-command timeouts.
+
+**Policy and approvals**
+
+- Four execution modes: `read-only`, `safe`, `normal`, `auto`.
+- Per-request decisions of allow, ask, or deny, from the mode, configured rules,
+  and the path or command involved.
+- Explicit deny of credential-bearing paths (`.env`, `.ssh/`, private keys, and
+  certificate files) in every mode, including `auto`.
+- Interactive approvals over the CLI and the desktop, with cancellation that
+  always takes effect and unanswered prompts that time out.
+
+**Verification and recovery**
+
+- Verification plans derived from detected manifests, with formatter, lint,
+  typecheck, build, targeted test, general test, and Git-diff steps.
+- Failed verification is fed back into the model, so the agent can correct its own
+  work and re-verify.
+- Git-aware checkpoints and precise, conflict-refusing undo.
+- Compaction of long sessions with the full history preserved.
+
+**Clients**
+
+- CLI with JSONL event output, session inspection, resume, status, diff, and undo.
+- Tauri desktop with conversation, tool activity, verification results, approvals,
+  cancellation, Monaco source and diff views, checkpoint timeline, an interactive
+  terminal, and five settings screens.
+- Versioned RPC runtime with a loopback JSONL protocol.
+
+### Design system
+
+The desktop uses a token-driven dark theme built for density. Colours live only
+in `src/styles.css` as CSS custom properties, and Tailwind maps semantic names onto
+them, so a component writes `bg-panel` or `text-muted` and never a literal value.
+A light theme is declared but not selectable in v0, which keeps every component
+legible under either palette.
+
+`src/components/ui/` holds the primitives: `Button`, `IconButton`, `Tooltip`,
+`Badge`, `Separator`, `StatusIndicator`, `Panel`, `ScrollArea`, `Popover`,
+`Dropdown`, `ContextMenu`, `Modal`, and `CommandMenu`. Monaco and xterm are
+configured from JavaScript and so read the same custom properties at runtime
+through `src/lib/tokens.ts` rather than keeping a second copy of the palette.
 
 ## Running the CLI
 
-Build the binary and run commands from a clean checkout with `cargo run`:
+Inspect a workspace without running any project code:
 
-```text
-cargo build --workspace
+```bash
 cargo run -p harness-cli -- .
-cargo run -p harness-cli -- run "Inspect the project and report the next step"
-cargo run -p harness-cli -- sessions
-cargo run -p harness-cli -- status
-cargo run -p harness-cli -- diff
-cargo run -p harness-cli -- config
 ```
 
-`harness .` inspects the current workspace without running project code. Use a
-positional path or the global `--workspace` option for another repository:
+Run the deterministic mock workflow, which needs no credentials:
 
-```text
-cargo run -p harness-cli -- --workspace /path/to/project .
-cargo run -p harness-cli -- --workspace /path/to/project run "Fix the failing test" /path/to/project
-```
-
-Use `--json` for machine-readable output. Agent runs emit one JSON event per
-line, including assistant deltas, tool lifecycle events, approvals,
-verification results, and terminal session events. `--yes` auto-approves
-policy prompts for non-interactive or CI workflows.
-
-```text
-cargo run -p harness-cli -- --json sessions
-cargo run -p harness-cli -- --json run "Summarize this repository"
-cargo run -p harness-cli -- --json status
-```
-
-Agent runs are interruptible with `Ctrl+C`; the cancellation token is shared
-with filesystem shell execution and verification commands. A canceled or
-failed run is persisted as a session and can be resumed.
-
-The deterministic mock provider is the default and needs no credentials. It
-runs a real, complete workflow through the same agent loop, policy engine,
-checkpoint store, and verification commands as a live model: read a file, make a
-deliberately broken edit, let verification fail, correct the edit, and let
-verification pass. The script targets `mock-output.txt` by default.
-
-To point the mock at a specific repair cycle (a test hook, ignored by every real
-provider), set `COGITO_MOCK_REPAIR` to JSON with `path`, `broken`, and `fixed`
-contents:
-
-```text
+```bash
 cargo run -p harness-cli -- --yes run "Create a mock output"
-
-$env:COGITO_MOCK_REPAIR = '{"path":"src/lib.rs","broken":"pub fn value() -> u32 { oops","fixed":"pub fn value() -> u32 { 2 }"}'
-cargo run -p harness-cli -- --json run "make the test pass"
 ```
 
-The second form writes the broken content, reports the real verification
-failure, applies the fix, and reports the passing run. It is how the test suite
-exercises the corrective loop without a model or a network.
+Use a real provider:
 
-To use OpenAI or another compatible endpoint:
-
-```text
-$env:OPENAI_API_KEY="<your-key>"
-$env:COGITO_MODEL_PROVIDER="openai"
-$env:COGITO_MODEL="gpt-4o-mini"
+```bash
 cargo run -p harness-cli -- --model-provider openai --model gpt-4o-mini run "Inspect and improve the project"
+```
+
+Point at another repository, with machine-readable output:
+
+```bash
+cargo run -p harness-cli -- --workspace /path/to/project --json run "Fix the failing test" /path/to/project
 ```
 
 Session and recovery commands:
 
-```text
+```bash
 cargo run -p harness-cli -- sessions
 cargo run -p harness-cli -- session inspect <session-id>
 cargo run -p harness-cli -- resume <session-id> "Continue the remaining work"
-cargo run -p harness-cli -- status --session <session-id>
+cargo run -p harness-cli -- status
 cargo run -p harness-cli -- diff
 cargo run -p harness-cli -- undo
 ```
 
-`undo` restores the latest harness checkpoint, or a checkpoint selected by ID,
-and refuses to overwrite unrelated user changes. Agent mutations are recorded
-in checkpoint snapshots when the workspace is a Git repository.
+`inspect` reports the repository root, Git state, detected languages, manifests,
+package manager, monorepo indicators, instruction files, and likely verification
+commands:
 
-
-
-```text
-cargo run -p harness-cli -- inspect
+```bash
 cargo run -p harness-cli -- inspect --json
-cargo run -p harness-cli -- inspect --path /path/to/project --json
 ```
 
-`inspect` reports the repository root, Git availability/branch/working-tree
-state, detected languages, package manager, manifests, monorepo indicators,
-instruction files, and likely test/build/format/lint/typecheck commands. The
-JSON form is the serializable `harness_core::WorkspaceDescription` consumed by
-future CLI and desktop clients.
+Global options: `--workspace` (default `.`), `--session-root` (default
+`.cogito/sessions`), `--model-provider`, `--model`, `--json`, `--yes`,
+`--log-level`, `--compaction-threshold`. Agent runs are interruptible with
+`Ctrl+C`; the cancellation token is shared with tool execution and verification
+commands.
 
-Project-local configuration is optional. When present, `.agent/config.toml`
-overrides inferred package-manager and command settings:
+`--yes` auto-approves policy prompts. Use it only in a disposable workspace or in
+CI.
+
+## Running the desktop application
+
+The desktop is a client: it does not start or own the runtime, so run the
+development runtime first. In one terminal, from the repository root:
+
+```bash
+cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+```
+
+The first argument is the workspace to open and the second is the listen address;
+both have defaults, so `cargo run -p harness-rpc --bin cogito-rpc-dev` alone is
+equivalent to the line above. Sessions and checkpoints for that workspace are
+written under its `.cogito/` directory. In a second terminal:
+
+```bash
+cd apps/desktop
+pnpm install
+pnpm tauri dev
+```
+
+`pnpm tauri dev` starts the Vite dev server itself and compiles the Rust shell. In
+the app, enter the runtime address and a repository path, then select Connect.
+
+To build the desktop binary without bundling installers:
+
+```bash
+cd apps/desktop
+pnpm tauri build --debug
+```
+
+Installer bundling is disabled in `tauri.conf.json` (`bundle.active` is `false`),
+so this produces an executable at `<repo-root>/target/debug/cogitoai-desktop`
+rather than a packaged installer. The interactive terminal requires a real terminal
+emulator to answer the console host's cursor-position query, which xterm.js does;
+the CLI's non-interactive shell tool does not.
+
+See [`apps/desktop/README.md`](apps/desktop/README.md) for the desktop-specific
+behaviour, including the human-versus-agent terminal boundary.
+
+## Running tests
+
+Rust, from the repository root:
+
+```bash
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Frontend, from `apps/desktop`:
+
+```bash
+cd apps/desktop
+pnpm typecheck
+pnpm lint
+pnpm test
+pnpm build
+pnpm check:classes
+```
+
+`pnpm verify` runs all five in order. `check:classes` asserts that every static
+class name used in a component resolves to a rule in the generated CSS, because a
+Tailwind class that does not resolve leaves an element silently unstyled rather
+than failing the build.
+
+The frontend suite covers the runtime-facing logic (store, events, settings,
+terminal, RPC parsing), the design tokens, the UI primitives, and a render smoke
+test of the whole shell. The Rust suite includes end-to-end tests that drive the
+real components rather than mocks of them: the full agent lifecycle against a
+real Git repository, a security audit of the workspace and permission boundaries,
+the CLI binary against a real Cargo project where a broken edit genuinely fails
+`cargo test`, and the RPC runtime over a real socket.
+
+## Configuration
+
+Project-local configuration is optional. All files live under `.agent/` in the
+repository root.
+
+`.agent/config.toml` sets the package manager and verification commands:
 
 ```toml
 package_manager = "pnpm"
@@ -131,7 +367,15 @@ package_manager = "pnpm"
 [commands]
 test = ["pnpm", "test"]
 build = ["pnpm", "run", "build"]
+format = ["pnpm", "run", "format"]
+lint = ["pnpm", "run", "lint"]
+typecheck = ["pnpm", "run", "typecheck"]
+```
 
+The same file may carry a `[policy]` section, which the CLI loads into its policy
+engine:
+
+```toml
 [policy]
 mode = "normal"
 
@@ -144,505 +388,181 @@ paths = [".env*", ".ssh/**", "**/*.key"]
 name = "ask-generated-files"
 action = "ask"
 paths = ["generated/**"]
+
+[[policy.rules]]
+name = "allow-read-only-tools"
+action = "allow"
+tools = ["read_file", "grep", "glob", "list_directory"]
+operations = ["read", "search"]
 ```
 
-The policy engine reads the `[policy]` section through
-`PolicyEngine::from_file`; explicit `deny` rules always win, followed by
-priority-ordered rules and then mode defaults. The modes are `read-only`,
-`safe`, `normal`, and `auto`; `read-only` allows reads/searches only, `safe`
-asks for mutations and commands, `normal` allows project edits and known safe
-commands, and `auto` allows configured categories while preserving explicit
-denies.
-
-Supported project instruction files are loaded in this deterministic
-precedence order: `AGENTS.md`, `CLAUDE.md`, `README.md`, `CONTRIBUTING.md`, and
-`.agent/instructions.md`. Malformed `.agent/config.toml` files return a typed
-configuration error rather than being ignored.
-
-Discovery reads filesystem metadata and read-only Git metadata only. It never
-runs project scripts, package-manager commands, or other project code.
-
-The CLI is a thin presentation layer over the harness session, agent, policy,
-tool, verification, and Git capabilities. The desktop application is a second
-client over the same runtime; see [Desktop application](#desktop-application).
-
-## Model providers
-
-The model boundary is provider-neutral. `harness-models` defines messages,
-content blocks, tool definitions/calls, streaming deltas, usage, finish
-reasons, capabilities, and provider errors without exposing provider request
-types. The deterministic mock provider is the default; the OpenAI adapter is a
-real implementation using `ureq` and an environment-provided API key.
-
-Inspect the selected model and capabilities:
-
-```text
-cargo run -p harness-cli -- model-info
-cargo run -p harness-cli -- --model-provider mock --model test-model model-info
-```
-
-Ask the mock provider, optionally streaming:
-
-```text
-cargo run -p harness-cli -- ask "hello"
-cargo run -p harness-cli -- ask --stream "hello"
-```
-
-For OpenAI, set credentials without placing them in project files:
-
-```text
-$env:OPENAI_API_KEY="<your-key>"
-$env:COGITO_MODEL_PROVIDER="openai"
-$env:COGITO_MODEL="gpt-4o-mini"
-cargo run -p harness-cli -- ask "Summarize this project"
-```
-
-On POSIX shells, use `export OPENAI_API_KEY=...` and equivalent
-`COGITO_MODEL_*` variables. The supported environment settings are
-`COGITO_MODEL_PROVIDER`, `COGITO_MODEL`, `COGITO_MODEL_API_KEY_ENV`, and
-`COGITO_MODEL_BASE_URL`; CLI `--model-provider` and `--model` flags override
-environment selection. `COGITO_MODEL_BASE_URL` can target an OpenAI-compatible
-endpoint. API keys are read only at runtime, are not serialized by the model
-configuration or event types, and are never written to session JSONL.
-
-## Filesystem tools
-
-`harness-tools` exposes a common JSON-schema-based `Tool` contract and the
-initial safe tools: `read_file`, `write_file`, `apply_patch`, `list_directory`,
-`glob`, and `grep`. Invoke them through `ToolRegistry`; the registry checks
-policy and emits `tool.requested`, `tool.approved`/`tool.denied`,
-`tool.started`, `tool.output`, and `tool.completed`/`tool.failed` events.
-
-All paths are relative to the supplied workspace and are canonicalized before
-use. Absolute paths, traversal, and symlink escapes are rejected. Text files
-are limited to 256 KiB, directory/search results are bounded and concise, and
-`apply_patch` requires exactly one matching `old_text` context before writing.
-Binary files are rejected rather than returned as model input.
-
-## Shell execution
-
-The `shell` tool runs explicitly approved commands through a replaceable
-`ProcessRunner`; the current implementation uses the platform shell. The
-command is selected through the `shell` argument (`auto`, `bash`, `sh`, or
-`cmd`), with `working_directory` constrained to the workspace. `timeout_ms`
-defaults to 30 seconds and is capped at 10 minutes. Captured stdout/stderr are
-bounded to 1 MiB by default/request limits, streamed to the caller, and
-reported with exit status.
-
-`ShellTool` exposes a `CancellationToken`; cancellation and timeout paths
-terminate the child and best-effort process tree, then join output readers.
-There is no auto-approval: the registry requires
-`Permission::ExecuteCommand` policy approval for every shell invocation.
-Commands still run with the host account’s OS permissions, so workspace path
-validation is not a sandbox; Docker, SSH, and remote sandbox runners can be
-added behind `ProcessRunner` without changing the agent loop. Windows uses
-`cmd /C` by default and Unix uses `sh -lc`; process-tree cleanup depends on
-available OS process controls.
-
-## Context assembly
-
-`harness-context` assembles provider-neutral context from system instructions,
-workspace metadata, precedence-ordered project instructions, Git state, the
-current request, recent conversation, explicitly selected files, and explicitly
-provided tool results. It never scans or loads an entire repository and does
-not perform semantic/vector search.
-
-`ContextBudget` limits individual files, tool-result contributions, retained
-shell output, and the approximate working token budget. `ContextAssembly`
-returns the rendered prompt plus every item with its source, inclusion reason,
-estimated tokens, original size, inclusion status, and applied limits, making
-context decisions inspectable by CLI/RPC/desktop clients.
-
-When the agent's working context reaches its compaction threshold, it derives
-or generates a compact continuation state with task, current approach,
-discoveries, important files, modified files, decisions, failed attempts, test
-status, and remaining work. The state is emitted as `context.compacted`, placed
-back into the working context, and never replaces the JSONL event history. The
-compaction strategy is replaceable through `CompactionStrategy`, so a future
-low-cost model or assistant can produce richer summaries. The default trigger is
-24,000 estimated tokens; use the CLI's `--compaction-threshold <tokens>` option
-to tune it for a workspace.
-
-## Verification
-
-`harness-verification` turns discovered project commands into structured
-verification steps for formatter/check, lint, typecheck, build, targeted tests,
-general tests, and final Git diff. A targeted plan is selected after source
-changes when a test command is known; broad tests are not run automatically in
-that path. Results include command, category, duration, exit code, bounded
-output, and relevant diagnostics, and verification failures are added to the
-next agent context.
-
-Project-local `[commands]` overrides in `.agent/config.toml` are used before
-inferred defaults:
-
-```toml
-[commands]
-format = ["cargo", "fmt", "--all", "--", "--check"]
-lint = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
-typecheck = ["cargo", "check", "--workspace"]
-build = ["cargo", "build", "--workspace"]
-test = ["cargo", "test", "--workspace"]
-```
-
-## Desktop application
-
-The initial cross-platform desktop shell lives in `apps/desktop`. It uses
-Tauri 2, React, TypeScript, Vite, Tailwind, and Zustand. It is deliberately a
-thin client: React owns UI/session state, Tauri commands only bridge the
-versioned `harness-rpc` TCP protocol, and the Rust runtime remains the sole
-owner of agent execution, tools, policy, approvals, verification, checkpoints,
-and durable sessions.
-
-Prerequisites:
-
-- Rust 1.78 or newer and the Rust target required by Tauri for your platform.
-- Node.js 20 or newer and pnpm 10 or newer.
-- Windows: Microsoft WebView2 Runtime and Visual Studio Build Tools with the
-  desktop C++ workload. macOS: Xcode command-line tools. Linux: the WebKitGTK
-  development packages required by Tauri 2.
-- A running CogitoAI RPC runtime. The desktop does not start or own the runtime
-  process.
-
-Install and run the frontend/Tauri shell:
-
-```text
-cd apps/desktop
-pnpm install
-pnpm tauri dev
-```
-
-For a local mock runtime, use the development binary from another terminal at
-the workspace root:
-
-```text
-cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
-```
-
-In the desktop shell, enter the runtime address and a repository path, then
-select Connect. The shell can create/resume sessions, send messages, stream
-assistant output, show tool activity and verification results, approve or deny
-tools once, cancel runs, and inspect the chronological runtime timeline.
-Closing and reopening the window does not delete or corrupt an active session:
-reconnecting reloads the session list and the runtime remains the source of
-truth. Use Resume on a selected session to rehydrate its persisted conversation
-and event timeline before continuing.
-
-### Code changes and checkpoints
-
-The Changes view adds code-change observability on top of the runtime. It
-lists added, modified, and deleted files with per-file line counts, and opens
-any file in Monaco Editor. Diffs render side-by-side (with an inline toggle)
-and source files render read-only with syntax highlighting; the shell cannot
-edit your files. Monaco is bundled locally, so viewing works with no network
-access.
-
-The checkpoint timeline shows each runtime checkpoint with its ID, timestamp,
-the task that triggered it, and the files it recorded. Restoring a checkpoint
-calls `checkpoint.undo` on the runtime, which applies the existing restore
-safety logic: it reverts only the files that checkpoint recorded, refuses to
-proceed when a file changed since the checkpoint was taken, and leaves every
-other change in the working tree untouched. The desktop never writes to the
-filesystem to undo work. The changes view refreshes from runtime events, so it
-updates after a run finishes and after a restore.
-
-The runtime keeps its own sessions and checkpoints under `.cogito/` inside the
-workspace. Those files are runtime state, not user code, so they are excluded
-from reported code changes.
-
-### Terminal
-
-The desktop can open an interactive shell rendered with xterm.js, backed by a
-real pseudo-terminal in the runtime. Output streams both ways, resizing is
-forwarded to the PTY, and Ctrl+C is delivered as a real interrupt.
-
-Terminals are **human-controlled sessions** and are deliberately separate from
-**agent-controlled command execution**:
-
-- Agent commands run through the runtime's tool registry, which evaluates every
-  call against the policy engine (deny / ask / allow) and executes it captured
-  and non-interactively.
-- A terminal is interactive and is intentionally **not** policy-governed, because
-  a person is typing into it directly and is responsible for every command.
-  Prompting someone to approve their own keystrokes would be noise, not safety.
-
-The boundary is enforced rather than merely documented:
-
-- `harness-pty` exposes no tool implementation and is never registered in a
-  `ToolRegistry`, so no model-driven tool call can open or write to a terminal.
-- `terminal.open` requires `origin: "human"`; any other origin is refused. The
-  origin enum has no agent variant to construct.
-- A terminal's working directory must resolve inside the open workspace.
-
-A terminal is bound to its workspace and is closed when the workspace changes or
-the connection drops. The runtime also terminates a client's terminals when that
-client disconnects, so closing the window never leaves an orphaned shell.
-
-### Settings
-
-The desktop exposes five configuration screens, all served by typed runtime
-APIs (`settings.inspect`, `settings.update_model`, `settings.update_permissions`,
-`settings.test_model`):
-
-- **Models** — provider, selected model, model capabilities, base URL, and a
-  connectivity check. Changing the model or permission mode rebuilds the agent
-  runner in place, so a change takes effect on the next run without a restart.
-- **Permissions** — the active execution mode, what each operation does when no
-  rule matches, the built-in rules, and any rules loaded from
-  `.agent/policy.toml`.
-- **Project** — workspace path, detected languages and manifests, package
-  manager, instruction files, and monorepo status.
-- **Verification** — the commands the runtime will run and whether they come
-  from project configuration or detection.
-- **Runtime** — runtime version, session and checkpoint storage paths, log level
-  and destination, and available providers.
-
-### Credentials
-
-API keys are read from the process environment and are **never** returned to the
-desktop.
-
-- The runtime reports only whether a credential is available and which
-  environment variable holds it (`OPENAI_API_KEY` by default, configurable with
-  `COGITO_MODEL_API_KEY_ENV`). There is no field anywhere in the settings
-  payload that can carry the key itself.
-- Credentials are not stored in runtime configuration, not written to
-  configuration files, and not logged. Free-form error text is redacted before it
-  is returned to a client.
-- No home-grown encryption is used. An unverified cipher is worse than an honest
-  environment variable, because it looks like protection without providing it.
-- An operating-system keychain backend is not implemented. If one is added it
-  will slot in behind the same `SecretStore` trait, and no frontend code changes,
-  because clients only ever receive credential *presence*.
-
-Relevant environment variables:
-
-| Variable | Purpose |
-| --- | --- |
-| `COGITO_MODEL_PROVIDER` | `mock` or `openai` |
-| `COGITO_MODEL` | Model name |
-| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the API key |
-| `COGITO_MODEL_BASE_URL` | Provider base URL |
-| `OPENAI_API_KEY` | Default API key variable |
-| `RUST_LOG` | Runtime log level |
-
-Frontend and Tauri checks:
-
-```text
-cd apps/desktop
-pnpm typecheck
-pnpm lint
-pnpm test
-pnpm build
-pnpm tauri build --debug
-```
-
-The production host is expected to embed `RpcServer` or start
-`cogito-rpc-dev` for local development. The v0 transport is loopback-only and
-has no authentication or encryption; do not bind it to a public interface.
-
-
-`harness-rpc` provides a versioned, newline-delimited JSON protocol over a
-loopback TCP socket. `RpcServer` binds to `127.0.0.1`; `RpcClient` can connect
-from the CLI, a desktop host, or an integration test. Requests contain an
-explicit protocol `version`, `id`, `method`, and JSON `params`. Responses use
-stable `ok`, `result`, and `error.code` fields, while agent progress arrives as
-`agent.event` notifications followed by `agent.completed` or `agent.failed`.
-
-The v1 method surface is:
-
-```text
-rpc.initialize
-workspace.open / workspace.inspect
-config.inspect / config.update
-session.create / session.list / session.inspect / session.state / session.resume
-agent.send / agent.run / agent.approve / agent.deny / agent.cancel
-git.status / git.diff
-checkpoint.list / checkpoint.inspect / checkpoint.undo
-```
-
-`agent.send` and `agent.run` are asynchronous: the server returns a `run_id`
-immediately and continues the existing `AgentRunner` on a worker thread. Event
-notifications contain the durable `HarnessEvent`; the session JSONL file
-remains the source of truth. Approvals are explicit `approval.request`
-notifications, and `agent.approve`/`agent.deny` release the waiting agent.
-Dropping a client denies pending approvals and cancels the active run so a
-worker cannot remain blocked. v0 allows one active agent run per server because
-the current event model has no independent run correlation for concurrent
-mutations.
-
-There is no standalone daemon binary in v0. Desktop applications and other
-frontends embed `RpcServer::bind` (or
-`RpcServer::bind_with_approvals` when they need the RPC approval handler) and
-own the process lifecycle. The server should be launched by the host with a
-fixed loopback address, for example `127.0.0.1:0` to let the OS choose a port,
-and the host should report that port to its client. The socket has no
-authentication or encryption because it is loopback-only; treat any local
-process able to connect as a client of the configured workspace. Do not bind
-the v0 server to a public interface, and do not expose provider keys, full
-checkpoint contents, or unrestricted tool execution through the protocol.
-
-
-
-`harness-git` exposes read-only repository status/diff inspection and
-`ShadowCheckpointStore` for recoverable checkpoints. Checkpoints are external
-JSON snapshots; the harness never commits, stages, resets, or cleans the user’s
-repository automatically.
-
-Create a checkpoint before a mutation, then record each harness-owned path
-after the mutation:
-
-```rust
-let checkpoint = store.create(&session_id, workspace)?;
-fs::write(workspace.join("src/main.rs"), updated_contents)?;
-store.record_harness_change(&checkpoint.id, &workspace.join("src/main.rs"))?;
-let report = store.undo(&checkpoint.id)?;
-```
-
-Undo restores only recorded paths to their checkpoint baseline. It preflights
-recorded paths and aborts without changing anything when current contents no
-longer match the recorded harness result. Unrelated user edits, untracked
-files, staged index state, and unrelated history remain untouched. Files over
-10 MiB, symlinks, and unsupported Git states are not snapshotted. Changes made
-by the harness but not recorded with `record_harness_change` cannot be safely
-attributed or undone; callers must record them immediately after each
-mutation. A conflict is reported rather than resolved automatically.
+A rule accepts `name`, `action` (`allow`, `ask`, or `deny`), `priority`, and the
+optional matchers `tools`, `operations`, `modes`, `paths`, and
+`command_patterns`. Paths are globs relative to the repository root.
+
+`.agent/policy.toml` uses the same schema and is what the desktop Permissions
+screen reads to list your configured rules. See
+[Policy rule enforcement](#policy-rule-enforcement) for how the two clients differ.
+
+`.agent/instructions.md` adds project instructions to the assembled context.
+`AGENTS.md`, `CLAUDE.md`, `README.md`, and `CONTRIBUTING.md` are also read, in that
+precedence order, earliest first. Discovery reads filesystem metadata and
+read-only Git metadata only; it never runs project scripts.
+
+A malformed configuration file produces a typed configuration error rather than
+being silently ignored.
+
+### Policy rule enforcement
+
+This differs between the two clients in v0, and it is worth being explicit:
+
+- The **CLI** loads both the mode and the rules from `.agent/config.toml` and
+  enforces them. If that file is absent it runs in `normal` mode with no rules.
+- The **desktop** enforces the execution mode, which is runtime state you can
+  change in the Permissions screen without editing a file. The development
+  runtime constructs its policy engine from the mode alone, so the rules in
+  `.agent/policy.toml` are listed in the Permissions screen but are not loaded
+  into the engine that authorises tool calls.
+
+The two built-in protections described under [Permissions](#permissions) — the
+workspace boundary and credential-path denial — are enforced by the engine
+itself and therefore apply in both clients regardless of configuration.
 
 ## Session storage
 
-`harness-session` persists execution history as portable JSONL. The host chooses
-the session root when constructing `JsonlSessionStore`; each session is stored
-as `<session-root>/<session-id>.jsonl`, with one schema-versioned event per
-line. `load` reconstructs the complete event history, while `resume` appends
-an explicit `session.resumed` event and reactivates the same session, including
-sessions that previously completed or failed. `recent` lists session metadata
-and compaction counts from the same directory. A truncated final record is
-reported as a load warning while all earlier events remain intact; complete
-malformed records fail validation and are never rewritten.
+Sessions are stored as JSONL under `.cogito/sessions/` in the workspace, one file
+per session named `<session-id>.jsonl`, with one schema-versioned event per line.
+Checkpoints are stored separately under `.cogito/checkpoints/` at the repository
+root.
 
-`context.compacted` events contain both a human-readable summary and the
-structured continuation state. Compaction changes only the working context;
-the complete event/session history remains permanently available for
-inspection. A repeated compaction creates another event and replaces the latest
-working continuation state, so older summaries remain auditable.
+The CLI's session root is configurable with `--session-root`. The RPC runtime
+defaults to `<workspace>/.cogito/sessions`.
 
-Session commands are model-free until a continuation is requested:
+`.cogito/` is runtime state, not user code, and is excluded from reported code
+changes. It is already listed in `.gitignore`.
 
-```text
-cargo run -p harness-cli -- --session-root .cogito/sessions session list
-cargo run -p harness-cli -- --session-root .cogito/sessions session inspect <session-id>
-cargo run -p harness-cli -- --session-root .cogito/sessions session resume <session-id> "Continue the remaining work"
+A truncated final record, which is what a crash mid-append leaves behind, is
+reported as a load warning while all earlier events remain intact. A malformed
+record anywhere earlier fails validation rather than being skipped, because
+silently dropping it would rewrite history. `resume` appends an explicit
+`session.resumed` event and reactivates the same session, including one that
+previously completed or failed.
+
+## Permissions
+
+Every privileged operation resolves to one of three decisions:
+
+- **allow** — run it without asking.
+- **ask** — stream an approval request and wait for an explicit allow-once or
+  deny-once answer.
+- **deny** — refuse it and tell the model why.
+
+The execution mode sets the default, and configured rules override it. An explicit
+`deny` rule always wins; otherwise the highest-priority matching rule wins, and
+mode defaults apply when no rule matches.
+
+| Mode | Reads and searches | Writes and patches | Commands |
+| --- | --- | --- | --- |
+| `read-only` | allow | deny | deny |
+| `safe` | allow | ask | ask |
+| `normal` | allow | allow | allow for known-safe commands, otherwise ask |
+| `auto` | allow | allow | allow for known-safe commands, otherwise ask, with explicit denies preserved |
+
+Two built-in protections apply in every mode, including `auto`, and are not
+overridable by a rule that merely asks:
+
+- The workspace is a hard boundary. Paths resolving outside it are denied.
+- Credential-bearing paths are denied outright rather than gated on approval, so
+  a mistaken "allow" cannot expose them. The protected set is `.env`, `.env.*`,
+  anything under `.ssh/`, `id_rsa`, `id_ed25519`, `id_ecdsa`, and files ending in
+  `.pem`, `.key`, `.p12`, or `.pfx`.
+
+The shell tool cannot be path-checked the way file tools are, because a command is
+an arbitrary string. `cat .env` is therefore evaluated as a command and prompts,
+rather than being denied by path. Approval is the mitigation.
+
+The engine's configured mode is authoritative. A request cannot widen the
+permission level you selected.
+
+## Checkpoints and undo
+
+A checkpoint records the files the agent is about to change, together with their
+contents at that moment. `undo` restores the most recent checkpoint, or one chosen
+by ID.
+
+Undo restores only recorded paths to their recorded baseline. It preflights those
+paths and aborts without changing anything when their current contents no longer
+match what the harness left behind, so a formatter or a person who edited the file
+afterwards is never silently overwritten. The conflict is reported rather than
+resolved. Unrelated user edits, untracked files, staged index state, and
+unrelated history are left untouched, and no commit is created or rewritten.
+
+Deliberate limitations:
+
+- Checkpoints are shadow snapshots, not commits. A harness change that was not
+  recorded with `record_harness_change` cannot be safely attributed or undone, so
+  callers must record each mutation immediately.
+- Files over 10 MiB, symlinks, and unsupported Git states are not snapshotted.
+- A dirty working tree is supported. A checkpoint captures the dirty state, so
+  undo returns the tree to what it was before the run rather than to `HEAD`.
+- Verification steps that reformat files, such as `cargo fmt`, can change a file
+  after its checkpoint was taken, which makes a later undo of that file report a
+  conflict instead of proceeding.
+
+## Testing the repair loop
+
+The mock provider can be pointed at a specific break-and-fix cycle, which is how
+the corrective path is tested without a model or a network. `COGITO_MOCK_REPAIR`
+takes JSON with a `path`, the `broken` content to write first, and the `fixed`
+content to write after verification fails:
+
+```bash
+# PowerShell
+$env:COGITO_MOCK_REPAIR = '{"path":"src/lib.rs","broken":"pub fn value() -> u32 { oops","fixed":"pub fn value() -> u32 { 2 }"}'
+cargo run -p harness-cli -- --json run "make the test pass"
 ```
 
-`session list` shows IDs, status, event counts, and compaction counts.
-`session inspect` shows session metadata, counts, warnings, and the latest
-continuation state. `session resume` reopens the stored workspace and session
-and continues from the persisted compacted state; use `session inspect --json`
-for the complete machine-readable report.
+```bash
+# bash
+export COGITO_MOCK_REPAIR='{"path":"src/lib.rs","broken":"pub fn value() -> u32 { oops","fixed":"pub fn value() -> u32 { 2 }"}'
+cargo run -p harness-cli -- --json run "make the test pass"
+```
 
-The event model is provider- and UI-independent. `harness-session::EventBus`
-provides in-process live subscriptions for CLI, RPC, and future desktop
-clients; durable JSONL remains the portable source of truth.
+This hook affects the mock provider only and is ignored by every real provider. It
+writes real files, so point it at a scratch repository.
 
-## Security boundaries and known limitations
+## Project status
 
-These are the guarantees the code actually enforces, and the places where it
-deliberately does not try to.
+This is v0. The following are **not** implemented, and no part of this repository
+should be read as promising them:
 
-**Enforced, and covered by tests:**
+- **No Jev decision layer.** There is no separate decision, planning, or
+  adjudication stage. A single agent loop runs from task to completion; the
+  verification-correction loop is the only structured retry.
+- **No subagents.** There is no multi-agent orchestration, delegation, or
+  parallelism. `harness-agent` runs exactly one agent per task.
+- **No MCP.** There is no Model Context Protocol client or server, and no external
+  tool server integration. Tools are compiled-in Rust implementations.
+- **No plugin system.** There is no runtime tool or provider discovery, and no
+  third-party extension loading. Providers and tools are registered in Rust at
+  build time. The `@tauri-apps/plugin-dialog` dependency is Tauri's own native
+  file dialog, not a CogitoAI extension point.
+- **No remote execution.** The runtime runs in-process on the local machine. There
+  is no container sandbox, no SSH or remote host execution, and no distributed
+  scheduling.
+- **No authentication.** The RPC protocol is unauthenticated and grants full
+  control of the opened workspace. It binds to loopback and must not be exposed to
+  a network.
+- **No installer bundles.** Tauri bundling is disabled; only the executable is
+  produced.
+- **Configured policy rules are CLI-only in v0.** The CLI loads mode and rules
+  from `.agent/config.toml` and enforces both. The desktop enforces the execution
+  mode but lists rules without loading them into the engine that authorises tool
+  calls. See [Policy rule enforcement](#policy-rule-enforcement).
+- **Verification is command-based.** Verification runs the project commands that
+  were discovered or configured. There is no semantic analysis, test selection, or
+  understanding of which failure matters.
 
-- *The workspace is a hard boundary.* Every path a tool touches is resolved
-  against the workspace root, including `..` segments, absolute paths, and
-  symlinks. `read_file`, `write_file`, `apply_patch`, `grep`, and `glob` all
-  refuse to leave it, and `file.read` and `git.file_diff` in the runtime apply
-  the same rule.
-- *The selected permission mode is authoritative.* `PolicyEngine` ignores the
-  mode a request claims and applies the mode it was configured with, so a
-  caller cannot widen a read-only workspace to auto by constructing a different
-  request.
-- *Credential files are denied, not merely gated.* `.env`, `.env.*`, anything
-  under `.ssh/`, `id_rsa`/`id_ed25519`/`id_ecdsa`, and `*.pem`/`*.key`/`*.p12`/
-  `*.pfx` are refused outright in every mode, including `auto`, so a mistaken
-  approval cannot expose them. They are also not writable.
-- *Credentials stay in the environment.* No RPC frame, settings payload, event,
-  verification result, or log carries an API key. Clients see only presence,
-  source, and the environment-variable name.
-- *Sessions are addressed, not path-constructed.* A session ID containing
-  separators or `..` is rejected rather than resolved.
-- *Nothing runs unbounded.* Command execution has a timeout and an output cap,
-  oversized reads are truncated or refused, and a provider failure, a
-  cancellation, or an exhausted tool loop always closes the session as either
-  completed or failed.
-- *Cancelling always works.* A pending approval polls the run's cancellation
-  token and is abandoned on cancel, so a run cannot be pinned by a permission
-  prompt nobody is answering. An unanswered prompt is also declined after five
-  minutes rather than waiting for the life of the process.
+## License
 
-**Deliberate limits:**
-
-- *The RPC protocol is unauthenticated and intended for loopback only.* It binds
-  to `127.0.0.1` and grants full control of the workspace to anything that can
-  reach the port. Do not expose it to a network.
-- *Credential protection is name-based.* A secret stored under an ordinary name
-  (`secrets.txt`, a committed fixture) is a normal workspace file and is
-  readable. The engine cannot detect secrets by content, and refusing files by
-  guesswork would break legitimate work.
-- *The shell cannot be path-checked the way file tools are.* A command such as
-  `cat .env` is gated as a command, so it prompts rather than being denied
-  outright. Approval is the mitigation.
-- *Checkpoints are shadow-based, not commits.* A harness change that is not
-  recorded with `record_harness_change` cannot be safely attributed or undone,
-  and a file that changed after a checkpoint was taken makes restore refuse
-  rather than clobber.
-- *Undo is refused on conflict by design.* If a formatter or a person changed a
-  recorded file after the checkpoint, `undo` reports the conflict and changes
-  nothing. It will not guess which version is correct.
-
-## What is verified
-
-The suite exercises the real components rather than mocks of them:
-
-- `crates/harness-agent/tests/lifecycle.rs` drives the full v0 lifecycle against
-  a real Git repository: discover, start a session, read, search, edit through
-  policy, checkpoint, run verification, observe a real failure, correct the edit,
-  pass verification, produce a diff, complete, reload from disk after a
-  simulated restart, resume, and undo without touching unrelated user work. It
-  also covers cancellation, an exhausted loop, and torn session records.
-- `crates/harness-agent/tests/security_audit.rs` covers the boundaries listed
-  above, including traversal through every file tool, protected credential files
-  in all four modes, environment-credential leakage, oversized and binary files,
-  bounded command output, dirty-repository safety, and provider failure.
-- `crates/harness-cli/tests/cli_commands.rs` runs the real binary against a real
-  Cargo project, where a genuinely invalid edit fails `cargo test` and the agent
-  corrects it. This is the end-to-end proof of the corrective loop.
-- `crates/harness-rpc/tests/rpc_loopback.rs` covers sessions, approvals,
-  cancellation while an approval is unanswered, terminal cleanup on disconnect,
-  settings, and credential redaction over the real socket protocol.
-- `crates/harness-pty/tests/pty_sessions.rs` drives a real PTY, including
-  interactive startup, resize, Unicode, Ctrl+C, and process cleanup on close.
-
-Verified on Windows: `cargo fmt --all -- --check`, `cargo clippy --workspace
---all-targets -- -D warnings`, and `cargo test --workspace` (143 tests) all pass,
-with the workspace suite confirmed green on two consecutive runs and the PTY
-suite on four. The desktop typecheck, lint, tests (55), and build pass, the
-Tauri binary builds, and the desktop application launches and stays running.
-Three live end-to-end scripts drive the real RPC runtime over a socket: code
-changes and checkpoint restore, human terminal behaviour, and settings with a
-credential planted in the environment that is then proven absent from every RPC
-frame and log.
-
-## Architecture
-
-See [`docs/architecture.md`](docs/architecture.md) for crate responsibilities,
-dependency direction, runtime composition, and the privileged-operation
-boundary enforced for UI clients.
-
-## Conventions
-
-- Rust code uses the workspace edition, version, lint configuration, and
-  shared error/ID types.
-- Provider integrations belong in `harness-models`, not in `harness-core`.
-- Privileged operations are mediated by `harness-policy` and must be invoked
-  through the runtime boundary in `harness-rpc`.
-- Session state and events are owned by `harness-session`; Git checkpoints and
-  verification are separate capabilities rather than UI responsibilities.
+MIT. See [`LICENSE`](LICENSE).

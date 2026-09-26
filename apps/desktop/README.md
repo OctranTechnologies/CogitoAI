@@ -1,9 +1,11 @@
 # CogitoAI desktop shell
 
-This directory contains the initial Tauri 2 + React + TypeScript desktop
-client. It is a presentation layer over the versioned `harness-rpc` loopback
-protocol. Tauri commands only manage the RPC transport; agent logic remains in
-the Rust runtime.
+This directory contains the Tauri 2 + React + TypeScript desktop client. It is a
+presentation layer over the versioned `harness-rpc` loopback protocol. Tauri
+commands only manage the RPC transport; agent logic remains in the Rust runtime.
+
+For the project as a whole, see the [root README](../../README.md). For crate
+boundaries, see [`docs/architecture.md`](../../docs/architecture.md).
 
 ## Prerequisites
 
@@ -12,6 +14,10 @@ the Rust runtime.
 - pnpm 10+
 - Tauri 2 platform prerequisites: WebView2 on Windows, Xcode command-line
   tools on macOS, or WebKitGTK development packages on Linux.
+
+The terminal panel has the extra requirements listed under
+[Platform prerequisites](#platform-prerequisites) below.
+
 
 ## Development
 
@@ -115,6 +121,16 @@ applied through the runtime; the desktop never edits configuration itself.
 Model and permission changes are validated by the runtime before anything is
 applied, so an invalid value is rejected and the previous setting stays in force.
 
+### Policy rules
+
+The Permissions screen lists the rules it finds in `.agent/policy.toml` at the
+repository root, using the same schema as the CLI's `.agent/config.toml`. In v0
+the development runtime builds its policy engine from the execution mode alone, so
+those listed rules are shown for reference but are not loaded into the engine that
+authorises tool calls. The two built-in protections, the workspace boundary and
+credential-path denial, are enforced by the engine itself and always apply. The
+CLI does load and enforce configured rules.
+
 ### API keys
 
 API keys are read from the runtime process environment and are never sent to the
@@ -131,6 +147,46 @@ home-grown encryption.
 | `COGITO_MODEL_BASE_URL` | Provider base URL |
 | `RUST_LOG` | Runtime log level |
 
+## Design system
+
+The interface is styled from a single token layer. `src/styles.css` declares
+every colour as a CSS custom property in the `:root` block, and
+`tailwind.config.js` maps semantic names onto those variables:
+
+| Group | Tokens |
+| --- | --- |
+| Surfaces | `app`, `panel`, `elevated`, `overlay`, `sunken`, `hover`, `active`, `scrim` |
+| Borders | `line`, `line-strong`, `line-stronger` |
+| Text | `primary`, `secondary`, `muted`, `faint`, `inverse` |
+| Status | `accent`, `success`, `warning`, `error`, `info` |
+
+Colours are stored as bare RGB channels rather than hex so Tailwind's
+`/opacity` modifier keeps working (`bg-panel/80`). A `[data-theme="light"]` block
+declares the same tokens for a light palette; it is not selectable in v0, but
+because nothing is hardcoded, enabling it later is a data-attribute change rather
+than a redesign.
+
+Radius, motion, shadow, and focus-ring values are tokens in the same file, and the
+icon sizes are spacing keys so the `size-*` utility resolves them.
+
+**Use the tokens.** A component writes `bg-panel` and `text-muted`, never a hex
+value or a hand-tuned grey. `pnpm check:classes` fails the build step if a class
+used in a component does not resolve to a rule in the generated CSS, which
+catches the case where a token refactor silently unstyles an element.
+
+**Use the primitives.** `src/components/ui/` exports `Button`, `IconButton`,
+`Tooltip`, `Badge`, `Separator`, `StatusIndicator`, `Panel`, `ScrollArea`,
+`Popover`, `Dropdown`, `ContextMenu`, `Modal`, and `CommandMenu`, plus `toneText`
+and friends for mapping a status onto a colour. They own the shared behaviour:
+Escape and outside-click dismissal, focus restoration, the focus trap in
+`Modal`, and the keyboard contract for menus. Re-implementing that in a component
+is how the interface ends up inconsistent.
+
+**Monaco and xterm** cannot use Tailwind classes, so they read the same custom
+properties at runtime through `src/lib/tokens.ts` (`color`, `alpha`, `hex`).
+That keeps one palette rather than three. If you add a token and need it in the
+editor or the terminal, add it to the `FALLBACK` map there too.
+
 ## Checks
 
 ```text
@@ -139,8 +195,18 @@ pnpm typecheck
 pnpm lint
 pnpm test
 pnpm build
+pnpm check:classes
+```
+
+`pnpm verify` runs all five. To compile the native shell as well:
+
+```text
 pnpm tauri build --debug
 ```
 
+`bundle.active` is `false` in `tauri.conf.json`, so this produces an executable
+under `target/debug/` rather than a packaged installer.
+
 The v0 transport is loopback-only and unauthenticated. Do not bind it to a
 public interface.
+
