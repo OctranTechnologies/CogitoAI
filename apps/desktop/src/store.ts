@@ -47,10 +47,17 @@ import {
   type PtyInfo,
   type TerminalExit,
 } from "./lib/terminal";
+import {
+  isSettingsSnapshot,
+  type ConnectionTestResult,
+  type SettingsSnapshot,
+  type UpdateModelRequest,
+} from "./lib/settings";
 
 export type { ChatMessage, RunPhase, TimelineEntry, ToolActivity, VerificationActivity } from "./lib/events";
 export type { ChangeSummary, CheckpointEntry, FileChange, FileView } from "./lib/changes";
 export type { PtyInfo, TerminalExit } from "./lib/terminal";
+export type { SettingsSnapshot, UpdateModelRequest } from "./lib/settings";
 
 /**
  * Terminal sessions are human-controlled, not agent-controlled.
@@ -111,6 +118,10 @@ export interface DesktopStore {
   terminal: PtyInfo | null;
   isStartingTerminal: boolean;
   terminalExit: TerminalExit | null;
+  settings: SettingsSnapshot | null;
+  isLoadingSettings: boolean;
+  settingsError: string | null;
+  modelTest: ConnectionTestResult | null;
   connect: (address: string, workspacePath: string) => Promise<void>;
   disconnect: () => Promise<void>;
   setWorkspacePath: (path: string) => void;
@@ -134,6 +145,11 @@ export interface DesktopStore {
   writeTerminal: (data: string) => Promise<void>;
   resizeTerminal: (cols: number, rows: number) => Promise<void>;
   closeTerminal: () => Promise<void>;
+  refreshSettings: () => Promise<void>;
+  updateModel: (request: UpdateModelRequest) => Promise<boolean>;
+  updatePermissionMode: (mode: string) => Promise<boolean>;
+  testModelConnection: () => Promise<void>;
+  clearSettingsError: () => void;
 }
 
 const systemInstructions =
@@ -275,6 +291,10 @@ export const useDesktopStore = create<DesktopStore>()(
       terminal: null,
       isStartingTerminal: false,
       terminalExit: null,
+      settings: null,
+      isLoadingSettings: false,
+      settingsError: null,
+      modelTest: null,
 
       connect: async (address, workspacePath) => {
         if (get().clientId) await get().disconnect();
@@ -295,6 +315,8 @@ export const useDesktopStore = create<DesktopStore>()(
           // Load existing workspace changes and checkpoints on connect so the
           // changes panel is populated before any run happens.
           await get().refreshChanges();
+          // Settings are workspace-derived, so they load alongside the rest.
+          await get().refreshSettings();
         } catch (error) {
           const clientId = get().clientId;
           if (clientId) await disconnectRuntime(clientId).catch(() => undefined);
@@ -568,6 +590,77 @@ export const useDesktopStore = create<DesktopStore>()(
           set({ lastError: errorMessage(error) });
         }
       },
+
+      refreshSettings: async () => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        set({ isLoadingSettings: true });
+        try {
+          const payload = expectResult(await requestRuntime(clientId, "settings.inspect", {}));
+          if (!isSettingsSnapshot(payload)) {
+            throw new RpcTransportError("runtime returned malformed settings", "malformed_event");
+          }
+          set({ settings: payload, isLoadingSettings: false, settingsError: null });
+        } catch (error) {
+          set({ isLoadingSettings: false, settingsError: errorMessage(error) });
+        }
+      },
+
+      updateModel: async (request) => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return false;
+        set({ settingsError: null });
+        try {
+          // The runtime validates before applying, so an invalid value is
+          // rejected without ever changing the active model.
+          const payload = expectResult(
+            await requestRuntime(clientId, "settings.update_model", { ...request }),
+          );
+          if (!isSettingsSnapshot(payload)) {
+            throw new RpcTransportError("runtime returned malformed settings", "malformed_event");
+          }
+          set({ settings: payload, modelTest: null });
+          return true;
+        } catch (error) {
+          set({ settingsError: errorMessage(error) });
+          return false;
+        }
+      },
+
+      updatePermissionMode: async (mode) => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return false;
+        set({ settingsError: null });
+        try {
+          const payload = expectResult(
+            await requestRuntime(clientId, "settings.update_permissions", { mode }),
+          );
+          if (!isSettingsSnapshot(payload)) {
+            throw new RpcTransportError("runtime returned malformed settings", "malformed_event");
+          }
+          set({ settings: payload });
+          return true;
+        } catch (error) {
+          set({ settingsError: errorMessage(error) });
+          return false;
+        }
+      },
+
+      testModelConnection: async () => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        set({ settingsError: null });
+        try {
+          const result = expectResult(
+            await requestRuntime<ConnectionTestResult>(clientId, "settings.test_model", {}),
+          );
+          set({ modelTest: result });
+        } catch (error) {
+          set({ settingsError: errorMessage(error) });
+        }
+      },
+
+      clearSettingsError: () => set({ settingsError: null }),
 
       handleServerMessage: (message) => {
         if (message.kind === "response") {

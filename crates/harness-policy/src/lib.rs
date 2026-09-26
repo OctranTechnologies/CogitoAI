@@ -202,6 +202,14 @@ impl PolicyEngine {
         }
     }
 
+    /// The rules loaded from configuration, in file order.
+    ///
+    /// Exposed so a client can show which rules are actually in force instead of
+    /// asking the user to trust a mode name.
+    pub fn configured_rules(&self) -> &[PolicyRule] {
+        &self.rules
+    }
+
     pub fn from_toml(
         contents: &str,
         workspace_root: impl Into<PathBuf>,

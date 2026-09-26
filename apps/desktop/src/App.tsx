@@ -22,6 +22,7 @@ import {
   RotateCcw,
   Send,
   Server,
+  Settings2,
   ShieldCheck,
   Square,
   Terminal,
@@ -39,6 +40,7 @@ import {
   type VerificationActivity,
 } from "./store";
 import { CheckpointTimeline } from "./components/checkpoint-timeline";
+import { SettingsDialog } from "./components/settings-dialog";
 import { TerminalPanel } from "./components/terminal-panel";
 import type { CheckpointEntry } from "./lib/changes";
 import type { GitStatusSummary, SessionSummary } from "./lib/rpc";
@@ -56,6 +58,7 @@ function App() {
   const [address, setAddress] = useState("127.0.0.1:4545");
   const [showContext, setShowContext] = useState(true);
   const [centerView, setCenterView] = useState<CenterView>("conversation");
+  const [showSettings, setShowSettings] = useState(false);
   const {
     status,
     clientId,
@@ -167,6 +170,7 @@ function App() {
         onChooseWorkspace={chooseWorkspace}
         onConnect={connectRuntime}
         onToggleContext={() => setShowContext((value) => !value)}
+        onOpenSettings={() => setShowSettings(true)}
         showContext={showContext}
       />
       <div className="flex min-h-0 flex-1">
@@ -251,6 +255,7 @@ function App() {
         </main>
       </div>
       <StatusBar status={status} runPhase={runPhase} workspacePath={workspacePath} lastError={lastError} onClearError={clearError} />
+      <SettingsDialog open={showSettings} onClose={() => setShowSettings(false)} />
       {lastError ? <ErrorToast message={lastError} onClose={clearError} /> : null}
     </div>
   );
@@ -322,6 +327,7 @@ function TopBar({
   onChooseWorkspace,
   onConnect,
   onToggleContext,
+  onOpenSettings,
   showContext,
 }: {
   status: string;
@@ -333,6 +339,7 @@ function TopBar({
   onChooseWorkspace: () => void;
   onConnect: () => void;
   onToggleContext: () => void;
+  onOpenSettings: () => void;
   showContext: boolean;
 }) {
   return (
@@ -374,6 +381,14 @@ function TopBar({
           {connected ? "Connected" : "Connect"}
         </button>
       </div>
+      <button
+        className="icon-button"
+        onClick={onOpenSettings}
+        aria-label="Open settings"
+        title="Settings"
+      >
+        <Settings2 size={16} />
+      </button>
       <button
         className={`icon-button ${showContext ? "bg-ink-800 text-ink-100" : ""}`}
         onClick={onToggleContext}

@@ -12,6 +12,7 @@ use harness_models::{
     ProviderError, ScriptedMockProvider, StreamDelta, StreamDeltaKind, ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
+use harness_rpc::AgentRunnerFactory as _;
 use harness_rpc::{
     ApprovalBroker, RpcApprovalHandler, RpcClient, RpcServer, Runtime, ServerMessage,
 };
@@ -103,6 +104,91 @@ fn setup(
         .with_workspace_root(root.to_path_buf()),
     );
     (runtime, sessions)
+}
+
+/// A factory that rebuilds the runner for whatever model and execution mode is
+/// requested, so settings changes are observable end to end.
+struct TestRunnerFactory {
+    root: std::path::PathBuf,
+    sessions: Arc<dyn SessionStore>,
+    approvals: Arc<ApprovalBroker>,
+    checkpoints: Arc<dyn CheckpointStore>,
+}
+
+impl harness_rpc::AgentRunnerFactory for TestRunnerFactory {
+    fn build(
+        &self,
+        model: &harness_models::ModelConfig,
+        mode: harness_policy::ExecutionMode,
+    ) -> Result<Arc<harness_agent::AgentRunner>, harness_core::Error> {
+        Ok(Arc::new(
+            harness_agent::AgentRunner::new(
+                Arc::new(harness_models::ScriptedMockProvider::new(
+                    model.model.clone(),
+                    Vec::new(),
+                )),
+                model.model.clone(),
+                harness_tools::ToolRegistry::with_workspace_tools(),
+                Arc::new(PolicyEngine::new(mode, &self.root)),
+                Arc::clone(&self.sessions),
+                harness_context::ContextBuilder::default(),
+                harness_agent::AgentLimits::default(),
+                Arc::new(RpcApprovalHandler::new(Arc::clone(&self.approvals))),
+            )
+            .with_checkpoints(Arc::clone(&self.checkpoints)),
+        ))
+    }
+}
+
+/// Builds a runtime that can apply model and permission changes at runtime.
+fn setup_settings(
+    root: &Path,
+    provider: Arc<dyn ModelProvider>,
+    approvals: Arc<ApprovalBroker>,
+) -> (Arc<Runtime>, Arc<JsonlSessionStore>) {
+    std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(root)
+        .status()
+        .unwrap();
+    let event_bus = EventBus::new();
+    let sessions =
+        Arc::new(JsonlSessionStore::with_event_bus(root.join("sessions"), event_bus).unwrap());
+    let checkpoints: Arc<dyn CheckpointStore> =
+        Arc::new(ShadowCheckpointStore::new(root.join(".cogito/checkpoints")).unwrap());
+    let factory = Arc::new(TestRunnerFactory {
+        root: root.to_path_buf(),
+        sessions: Arc::clone(&sessions) as Arc<dyn SessionStore>,
+        approvals: Arc::clone(&approvals),
+        checkpoints: Arc::clone(&checkpoints),
+    });
+    let initial = factory
+        .build(
+            &harness_models::ModelConfig::default(),
+            ExecutionMode::Normal,
+        )
+        .unwrap();
+    let runtime = Arc::new(
+        Runtime::new(
+            Arc::new(DummyAgent),
+            Vec::new(),
+            harness_tools::ToolRegistry::with_workspace_tools(),
+            Arc::new(PolicyEngine::new(ExecutionMode::Normal, root)),
+            Arc::clone(&sessions) as Arc<dyn SessionStore>,
+            Arc::clone(&checkpoints),
+            Vec::new(),
+        )
+        .with_agent_runner(initial)
+        .with_runner_factory(factory)
+        .with_workspace_root(root.to_path_buf()),
+    );
+    let _ = provider;
+    (runtime, sessions)
+}
+
+/// Renders a value as JSON so a test can scan the whole payload for a secret.
+fn rendered(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 fn start_server(
@@ -489,6 +575,138 @@ fn exposes_checkpoints_file_views_and_diffs_and_restores_through_the_runtime() {
     drop(client);
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     server.join().unwrap();
+}
+
+/// The secret the runtime holds in its environment for this test.
+const TEST_SECRET_VAR: &str = "COGITO_E2E_SECRET";
+const TEST_SECRET: &str = "sk-do-not-leak-1234567890";
+
+#[test]
+fn exposes_typed_settings_and_never_returns_a_credential() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    std::env::set_var(TEST_SECRET_VAR, TEST_SECRET);
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
+    let (runtime, _sessions) = setup_settings(root, provider, Arc::clone(&approvals));
+    let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
+
+    assert_ok(&client.request("rpc.initialize", json!({})).unwrap());
+    let initialized = client.request("rpc.initialize", json!({})).unwrap();
+    let advertised = initialized.result.unwrap();
+    let methods: Vec<String> = advertised["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    for method in [
+        "settings.inspect",
+        "settings.update_model",
+        "settings.update_permissions",
+        "settings.test_model",
+    ] {
+        assert!(
+            methods.iter().any(|name| name == method),
+            "runtime does not advertise {method}"
+        );
+    }
+
+    assert_ok(&client.request("workspace.open", json!({})).unwrap());
+
+    let inspected = client.request("settings.inspect", json!({})).unwrap();
+    assert_ok(&inspected);
+    let snapshot = inspected.result.unwrap();
+    for screen in [
+        "models",
+        "permissions",
+        "project",
+        "verification",
+        "runtime",
+    ] {
+        assert!(
+            snapshot.get(screen).is_some(),
+            "settings snapshot missing {screen}"
+        );
+    }
+    assert!(snapshot["project"]["workspace_path"].is_string());
+    assert!(snapshot["project"]["is_git_repository"].is_boolean());
+    assert!(snapshot["runtime"]["version"].is_string());
+    assert!(snapshot["runtime"]["session_storage_path"].is_string());
+    assert!(snapshot["permissions"]["mode"].is_string());
+    assert!(snapshot["models"]["capabilities"].is_object());
+    assert!(snapshot["models"]["credential"].is_object());
+
+    // No credential value may appear anywhere in the payload.
+    assert!(
+        !rendered(&snapshot).contains(TEST_SECRET),
+        "credential leaked through settings.inspect"
+    );
+
+    // A model change is applied and reflected back.
+    let switched = client
+        .request(
+            "settings.update_model",
+            json!({"provider": "mock", "model": "mock-alt"}),
+        )
+        .unwrap();
+    assert_ok(&switched);
+    assert_eq!(switched.result.unwrap()["models"]["model"], "mock-alt");
+
+    // Invalid settings are rejected and leave the model untouched.
+    for (payload, label) in [
+        (json!({"model": "   "}), "blank model"),
+        (json!({"provider": "nope"}), "unknown provider"),
+        (json!({"base_url": "not-a-url"}), "invalid base_url"),
+        (json!({"api_key_env": "BAD NAME"}), "invalid api_key_env"),
+    ] {
+        let rejected = client.request("settings.update_model", payload).unwrap();
+        assert!(!rejected.ok, "{label} must be rejected");
+    }
+    let after = client.request("settings.inspect", json!({})).unwrap();
+    assert_eq!(after.result.clone().unwrap()["models"]["model"], "mock-alt");
+
+    // Permission mode changes take effect, and invalid ones do not.
+    let permissions = client
+        .request("settings.update_permissions", json!({"mode": "read_only"}))
+        .unwrap();
+    assert_ok(&permissions);
+    let permissions = permissions.result.unwrap();
+    assert_eq!(permissions["permissions"]["mode"], "read_only");
+    assert!(permissions["permissions"]["mode_description"].is_string());
+    assert!(!permissions["permissions"]["default_behavior"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let bad_mode = client
+        .request("settings.update_permissions", json!({"mode": "yolo"}))
+        .unwrap();
+    assert!(!bad_mode.ok, "unknown mode must be rejected");
+    let still = client.request("settings.inspect", json!({})).unwrap();
+    assert_eq!(
+        still.result.clone().unwrap()["permissions"]["mode"],
+        "read_only"
+    );
+
+    // The connection test never reveals a credential.
+    let tested = client.request("settings.test_model", json!({})).unwrap();
+    assert_ok(&tested);
+    let tested = tested.result.unwrap();
+    assert!(tested["ok"].is_boolean());
+    assert!(tested["message"].is_string());
+    assert!(!rendered(&tested).contains(TEST_SECRET));
+
+    // Every response exchanged above must be free of the secret.
+    assert!(!rendered(&snapshot).contains(TEST_SECRET));
+    assert!(!rendered(&after.result.unwrap()).contains(TEST_SECRET));
+    assert!(!rendered(&still.result.unwrap()).contains(TEST_SECRET));
+
+    drop(client);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.join().unwrap();
+    std::env::remove_var(TEST_SECRET_VAR);
 }
 
 #[test]

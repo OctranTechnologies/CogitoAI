@@ -244,6 +244,43 @@ impl Default for ModelConfig {
 }
 
 impl ModelConfig {
+    /// Rejects settings that would leave the runtime unable to reach a model.
+    ///
+    /// Validation happens before anything is applied so an invalid value from a
+    /// client can never leave the runtime half-configured.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("model must not be empty".to_owned());
+        }
+        if self.model.len() > 200 {
+            return Err("model name is too long".to_owned());
+        }
+        if !self.base_url.trim().is_empty() {
+            if !self.base_url.starts_with("https://") && !self.base_url.starts_with("http://") {
+                return Err("base_url must start with http:// or https://".to_owned());
+            }
+            if self.base_url.len() > 2048 {
+                return Err("base_url is too long".to_owned());
+            }
+        }
+        // The API key environment variable is named, never the key itself, so
+        // this must be a valid variable name.
+        if self.api_key_env.trim().is_empty() {
+            return Err("api_key_env must not be empty".to_owned());
+        }
+        if !self
+            .api_key_env
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(format!(
+                "api_key_env {:?} is not a valid environment variable name",
+                self.api_key_env
+            ));
+        }
+        Ok(())
+    }
+
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {

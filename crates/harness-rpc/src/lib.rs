@@ -1,6 +1,7 @@
 pub mod client;
 pub mod protocol;
 pub mod server;
+pub mod settings;
 
 pub use client::{RpcClient, RpcClientError, RpcClientReader, RpcClientWriter};
 pub use harness_pty::{
@@ -11,15 +12,21 @@ pub use protocol::{
     RpcError, RpcNotification, RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION,
 };
 pub use server::{ApprovalBroker, RpcApprovalHandler, RpcServer, RpcServerError};
+pub use settings::{
+    ConnectionTestResult, CredentialSource, CredentialStatus, EnvironmentSecretStore,
+    ModelSettingsView, PermissionSettingsView, ProjectSettingsView, RuntimeSettingsView,
+    SecretStore, SettingsError, SettingsSnapshot, UpdateModelRequest, UpdatePermissionsRequest,
+    VerificationSettingsView,
+};
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use harness_agent::{AgentOutcome, AgentRunner, AgentTask};
 use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
 use harness_git::{Checkpoint, CheckpointInfo, CheckpointStore, GitError, RestoreReport};
-use harness_models::ModelProvider;
-use harness_policy::Policy;
+use harness_models::{ModelConfig, ModelProvider};
+use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{
     HarnessEvent, Session, SessionLoadReport, SessionState, SessionStore, SessionSummary,
 };
@@ -30,11 +37,17 @@ pub struct Runtime {
     agent: Arc<dyn AgentRuntime>,
     providers: Vec<Box<dyn ModelProvider>>,
     tools: ToolRegistry,
-    policy: Arc<dyn Policy>,
+    /// Execution policy, replaceable at runtime when the user changes the
+    /// permission mode.
+    policy: Arc<RwLock<Arc<dyn Policy>>>,
     sessions: Arc<dyn SessionStore>,
     checkpoints: Arc<dyn CheckpointStore>,
     verifiers: Vec<Arc<dyn Verifier>>,
-    agent_runner: Option<Arc<AgentRunner>>,
+    /// The active runner, rebuilt when model or permission settings change.
+    agent_runner: RwLock<Option<Arc<AgentRunner>>>,
+    /// Builds a runner for a given model and execution mode, so settings changes
+    /// take effect without restarting the process.
+    runner_factory: RwLock<Option<Arc<dyn AgentRunnerFactory>>>,
     workspace_root: Option<PathBuf>,
     /// Human-operated terminals.
     ///
@@ -44,6 +57,18 @@ pub struct Runtime {
     /// only from an RPC client acting for a person. See the `harness-pty` module
     /// documentation for the full boundary.
     ptys: Arc<Mutex<PtyManager>>,
+    /// Model selection, owned by the runtime so the desktop can read and change
+    /// it without reaching into provider internals.
+    model: RwLock<ModelConfig>,
+}
+
+/// Builds an [`AgentRunner`] for a selected model and execution mode.
+///
+/// The runtime stores this so that changing a setting in the desktop can
+/// rebuild the runner in place; without it, model or permission changes would
+/// require restarting the process.
+pub trait AgentRunnerFactory: Send + Sync {
+    fn build(&self, model: &ModelConfig, mode: ExecutionMode) -> Result<Arc<AgentRunner>, Error>;
 }
 
 impl Runtime {
@@ -60,21 +85,84 @@ impl Runtime {
             agent,
             providers,
             tools,
-            policy,
+            policy: Arc::new(RwLock::new(policy)),
             sessions,
             checkpoints,
             verifiers,
-            agent_runner: None,
+            agent_runner: RwLock::new(None),
+            runner_factory: RwLock::new(None),
             workspace_root: None,
             // Retargeted by `with_workspace_root`; the placeholder root is
             // replaced before any terminal can be opened.
             ptys: Arc::new(Mutex::new(PtyManager::new("."))),
+            model: RwLock::new(ModelConfig::from_env()),
         }
     }
 
-    pub fn with_agent_runner(mut self, agent_runner: Arc<AgentRunner>) -> Self {
-        self.agent_runner = Some(agent_runner);
+    pub fn with_agent_runner(self, agent_runner: Arc<AgentRunner>) -> Self {
+        *self
+            .agent_runner
+            .write()
+            .expect("agent runner lock poisoned") = Some(agent_runner);
         self
+    }
+
+    /// Registers the factory used to rebuild the runner when settings change.
+    pub fn with_runner_factory(self, factory: Arc<dyn AgentRunnerFactory>) -> Self {
+        *self
+            .runner_factory
+            .write()
+            .expect("runner factory lock poisoned") = Some(factory);
+        self
+    }
+
+    /// The policy currently in force.
+    pub fn policy(&self) -> Arc<dyn Policy> {
+        Arc::clone(&self.policy.read().expect("policy lock poisoned"))
+    }
+
+    /// The execution mode currently in force.
+    pub fn execution_mode(&self) -> ExecutionMode {
+        self.policy().mode()
+    }
+
+    /// The model currently selected.
+    pub fn model(&self) -> ModelConfig {
+        self.model.read().expect("model lock poisoned").clone()
+    }
+
+    /// Applies a new model selection and execution mode.
+    ///
+    /// The runner and policy are rebuilt together so both the model and the
+    /// permission mode take effect on the next run. Returns an error when no
+    /// factory is registered, because silently ignoring the change would leave
+    /// the desktop showing settings that are not actually in force.
+    pub fn apply_settings(&self, model: ModelConfig, mode: ExecutionMode) -> Result<(), Error> {
+        model
+            .validate()
+            .map_err(|reason| Error::InvalidConfig { reason })?;
+        let factory = self
+            .runner_factory
+            .read()
+            .expect("runner factory lock poisoned")
+            .clone();
+        let Some(factory) = factory else {
+            return Err(Error::InvalidConfig {
+                reason: "this runtime cannot change model or permission settings at runtime"
+                    .to_owned(),
+            });
+        };
+        let runner = factory.build(&model, mode)?;
+        *self.model.write().expect("model lock poisoned") = model;
+        *self.policy.write().expect("policy lock poisoned") = Arc::new(PolicyEngine::new(
+            mode,
+            self.workspace_root.clone().unwrap_or_default(),
+        ));
+        *self
+            .agent_runner
+            .write()
+            .expect("agent runner lock poisoned") = Some(runner);
+        Ok(())
     }
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
@@ -95,16 +183,22 @@ impl Runtime {
         task: &AgentTask,
         cancellation: &harness_tools::CancellationToken,
     ) -> Result<AgentOutcome, harness_agent::AgentError> {
-        self.agent_runner
-            .as_ref()
+        self.current_runner()
             .ok_or_else(|| {
                 harness_agent::AgentError::Core("agent runtime is not configured".to_owned())
             })?
             .run(task, cancellation)
     }
 
+    fn current_runner(&self) -> Option<Arc<AgentRunner>> {
+        self.agent_runner
+            .read()
+            .expect("agent runner lock poisoned")
+            .clone()
+    }
+
     pub fn agent_event_bus(&self) -> Option<harness_session::EventBus> {
-        self.agent_runner.as_ref().map(|runner| runner.event_bus())
+        self.current_runner().map(|runner| runner.event_bus())
     }
 
     pub fn workspace_root(&self) -> Option<&std::path::Path> {
@@ -120,8 +214,9 @@ impl Runtime {
         working_directory: &std::path::Path,
         request: ToolRequest,
     ) -> Result<ToolResult, Error> {
+        let policy = self.policy.read().expect("policy lock poisoned").clone();
         let context = ToolContext {
-            policy: self.policy.as_ref(),
+            policy: policy.as_ref(),
             working_directory,
             event_bus: None,
             session_id: None,

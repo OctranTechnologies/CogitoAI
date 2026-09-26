@@ -361,6 +361,54 @@ A terminal is bound to its workspace and is closed when the workspace changes or
 the connection drops. The runtime also terminates a client's terminals when that
 client disconnects, so closing the window never leaves an orphaned shell.
 
+### Settings
+
+The desktop exposes five configuration screens, all served by typed runtime
+APIs (`settings.inspect`, `settings.update_model`, `settings.update_permissions`,
+`settings.test_model`):
+
+- **Models** — provider, selected model, model capabilities, base URL, and a
+  connectivity check. Changing the model or permission mode rebuilds the agent
+  runner in place, so a change takes effect on the next run without a restart.
+- **Permissions** — the active execution mode, what each operation does when no
+  rule matches, the built-in rules, and any rules loaded from
+  `.agent/policy.toml`.
+- **Project** — workspace path, detected languages and manifests, package
+  manager, instruction files, and monorepo status.
+- **Verification** — the commands the runtime will run and whether they come
+  from project configuration or detection.
+- **Runtime** — runtime version, session and checkpoint storage paths, log level
+  and destination, and available providers.
+
+### Credentials
+
+API keys are read from the process environment and are **never** returned to the
+desktop.
+
+- The runtime reports only whether a credential is available and which
+  environment variable holds it (`OPENAI_API_KEY` by default, configurable with
+  `COGITO_MODEL_API_KEY_ENV`). There is no field anywhere in the settings
+  payload that can carry the key itself.
+- Credentials are not stored in runtime configuration, not written to
+  configuration files, and not logged. Free-form error text is redacted before it
+  is returned to a client.
+- No home-grown encryption is used. An unverified cipher is worse than an honest
+  environment variable, because it looks like protection without providing it.
+- An operating-system keychain backend is not implemented. If one is added it
+  will slot in behind the same `SecretStore` trait, and no frontend code changes,
+  because clients only ever receive credential *presence*.
+
+Relevant environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `COGITO_MODEL_PROVIDER` | `mock` or `openai` |
+| `COGITO_MODEL` | Model name |
+| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the API key |
+| `COGITO_MODEL_BASE_URL` | Provider base URL |
+| `OPENAI_API_KEY` | Default API key variable |
+| `RUST_LOG` | Runtime log level |
+
 Frontend and Tauri checks:
 
 ```text

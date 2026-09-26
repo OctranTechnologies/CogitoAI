@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::settings::SecretStore;
 use harness_agent::{AgentError, AgentTask, ApprovalHandler};
 use harness_core::{discover_workspace, CheckpointId, RunId, SessionId};
 use harness_git::{is_runtime_state_path, GitClient, GitError};
@@ -41,6 +42,8 @@ pub enum RpcServerError {
     Git(#[from] GitError),
     #[error("runtime error: {0}")]
     Runtime(String),
+    #[error(transparent)]
+    Settings(#[from] crate::settings::SettingsError),
     #[error("agent runtime is not configured")]
     AgentUnavailable,
 }
@@ -65,7 +68,8 @@ impl RpcServer {
     ) -> Result<Self, RpcServerError> {
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
-        let state = Arc::new(ServerState::new(approvals));
+        let state =
+            Arc::new(ServerState::new(approvals).with_session_root(session_root(runtime.as_ref())));
         let event_subscription = runtime.agent_event_bus().map(|bus| {
             let state = Arc::clone(&state);
             bus.subscribe(Arc::new(EventForwarder { state }))
@@ -136,6 +140,11 @@ struct ServerState {
     /// Terminals opened by each client, so a disconnect can reap its processes
     /// instead of leaking a shell with no consumer.
     client_terminals: Mutex<HashMap<u64, Vec<String>>>,
+    /// Credential source for the settings surfaces. Holds no secret values: the
+    /// store is asked only whether a credential exists.
+    secret_store: Arc<dyn SecretStore>,
+    /// Where sessions are written, reported by the Runtime settings screen.
+    session_root: PathBuf,
 }
 
 struct ActiveRun {
@@ -153,7 +162,25 @@ impl ServerState {
             seen_events: Mutex::new(Vec::new()),
             approvals,
             client_terminals: Mutex::new(HashMap::new()),
+            secret_store: crate::settings::default_secret_store(),
+            session_root: PathBuf::from("."),
         }
+    }
+
+    /// Credential source used by the settings surfaces.
+    fn secret_store(&self) -> Arc<dyn SecretStore> {
+        Arc::clone(&self.secret_store)
+    }
+
+    /// Overrides the session storage root reported to clients.
+    fn with_session_root(mut self, session_root: PathBuf) -> Self {
+        self.session_root = session_root;
+        self
+    }
+
+    /// Where the runtime persists sessions, reported by the Runtime screen.
+    fn session_root(&self) -> PathBuf {
+        self.session_root.clone()
     }
 
     fn register(&self, sender: Sender<ServerMessage>) -> u64 {
@@ -577,6 +604,12 @@ fn dispatch(
         "workspace.open" | "workspace.inspect" => workspace(runtime, &request.params),
         "config.inspect" => config_inspect(runtime, &request.params),
         "config.update" => config_update(runtime, &request.params),
+        "settings.inspect" => settings_inspect(state, runtime),
+        "settings.update_model" => settings_update_model(state, runtime, &request.params),
+        "settings.update_permissions" => {
+            settings_update_permissions(state, runtime, &request.params)
+        }
+        "settings.test_model" => settings_test_model(state, runtime),
         "session.create" => session_create(runtime, &request.params),
         "session.list" => session_list(runtime, &request.params),
         "session.inspect" => session_inspect(runtime, &request.params),
@@ -1002,6 +1035,59 @@ fn workspace_path(runtime: &Runtime, params: &Value) -> Result<PathBuf, RpcServe
         return Ok(requested);
     }
     Ok(root.to_path_buf())
+}
+
+/// Reports where the runtime keeps its durable state, for the Runtime screen.
+fn session_root(runtime: &Runtime) -> PathBuf {
+    runtime
+        .workspace_root()
+        .map(|root| root.join(".cogito/sessions"))
+        .unwrap_or_else(|| PathBuf::from(".cogito/sessions"))
+}
+
+/// Assembles the full settings snapshot for the desktop settings surfaces.
+///
+/// The snapshot never contains a credential value, only whether one is
+/// available and which environment variable holds it.
+fn settings_snapshot(state: &ServerState, runtime: &Runtime) -> Result<Value, RpcServerError> {
+    let store = state.secret_store();
+    let session_root = state.session_root();
+    Ok(serde_json::to_value(crate::settings::snapshot(
+        runtime,
+        store.as_ref(),
+        &session_root,
+    )?)?)
+}
+
+fn settings_inspect(state: &ServerState, runtime: &Runtime) -> Result<Value, RpcServerError> {
+    settings_snapshot(state, runtime)
+}
+
+fn settings_update_model(
+    state: &ServerState,
+    runtime: &Runtime,
+    params: &Value,
+) -> Result<Value, RpcServerError> {
+    let request: crate::settings::UpdateModelRequest = serde_json::from_value(params.clone())?;
+    crate::settings::apply_model(runtime, &request)?;
+    settings_snapshot(state, runtime)
+}
+
+fn settings_update_permissions(
+    state: &ServerState,
+    runtime: &Runtime,
+    params: &Value,
+) -> Result<Value, RpcServerError> {
+    let request: crate::settings::UpdatePermissionsRequest =
+        serde_json::from_value(params.clone())?;
+    crate::settings::apply_permissions(runtime, &request)?;
+    settings_snapshot(state, runtime)
+}
+
+fn settings_test_model(state: &ServerState, runtime: &Runtime) -> Result<Value, RpcServerError> {
+    let model = runtime.model();
+    let result = crate::settings::test_model_connection(&model, state.secret_store().as_ref());
+    Ok(serde_json::to_value(result)?)
 }
 
 fn session_id(params: &Value) -> Result<SessionId, RpcServerError> {

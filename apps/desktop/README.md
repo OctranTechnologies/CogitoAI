@@ -106,6 +106,31 @@ position and blocks until something answers. xterm.js answers this
 automatically, which is why the terminal must be rendered with a real terminal
 emulator rather than printed to a log view.
 
+## Settings
+
+Open settings from the gear button in the top bar. Five screens are available:
+Models, Runtime, Permissions, Project, and Verification. Values are read from and
+applied through the runtime; the desktop never edits configuration itself.
+
+Model and permission changes are validated by the runtime before anything is
+applied, so an invalid value is rejected and the previous setting stays in force.
+
+### API keys
+
+API keys are read from the runtime process environment and are never sent to the
+desktop. The Models screen shows only whether a credential is configured and
+which environment variable holds it; the value is never displayed, editable, or
+logged. The runtime keeps no key in its configuration and does not implement any
+home-grown encryption.
+
+| Variable | Purpose |
+| --- | --- |
+| `COGITO_MODEL_PROVIDER` | `mock` or `openai` |
+| `COGITO_MODEL` | Model name |
+| `COGITO_MODEL_API_KEY_ENV` | Variable holding the API key (default `OPENAI_API_KEY`) |
+| `COGITO_MODEL_BASE_URL` | Provider base URL |
+| `RUST_LOG` | Runtime log level |
+
 ## Checks
 
 ```text
