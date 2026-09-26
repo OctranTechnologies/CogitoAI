@@ -1,0 +1,493 @@
+[
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457016885986500-1",
+    "event_type": "session.started",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "workspace_root": "\\\\?\\C:\\Users\\KIIT\\AppData\\Local\\Temp\\cogito-live-JfFX20"
+      },
+      "type": "session.started"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457016885
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457016894610200-2",
+    "event_type": "session.resumed",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "reason": "session resume requested"
+      },
+      "type": "session.resumed"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457016894
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017020491400-3",
+    "event_type": "checkpoint.created",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "checkpoint_id": "checkpoint-6348-1790457016979826600",
+        "reference": "71ce433706ebbb3a498b4d4964b44063a71887a0"
+      },
+      "type": "checkpoint.created"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017020
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017020638700-4",
+    "event_type": "user.message",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "text": "List the workspace and write a short note."
+      },
+      "type": "user.message"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017020
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017021644800-5",
+    "event_type": "model.requested",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "model": "dev-mock",
+        "prompt_tokens": null,
+        "provider": "scripted-mock"
+      },
+      "type": "model.requested"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017021
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017028988500-6",
+    "event_type": "model.response",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "input_tokens": 1,
+        "model": "dev-mock",
+        "output_tokens": 1,
+        "provider": "scripted-mock",
+        "text": ""
+      },
+      "type": "model.response"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017028
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017034969300-7",
+    "event_type": "tool.requested",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "arguments": {
+          "path": "."
+        },
+        "tool": "list_directory"
+      },
+      "type": "tool.requested"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017034
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017035243100-8",
+    "event_type": "policy.decision",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "action": "allow",
+        "mode": "normal",
+        "operation": "read",
+        "reason": "Normal mode allows this operation",
+        "rule": "mode-default",
+        "tool": "list_directory"
+      },
+      "type": "policy.decision"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017035
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017035269300-9",
+    "event_type": "tool.approved",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "reason": "mode-default",
+        "tool": "list_directory"
+      },
+      "type": "tool.approved"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017035
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017035283500-10",
+    "event_type": "tool.started",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "tool": "list_directory"
+      },
+      "type": "tool.started"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017035
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017035659000-11",
+    "event_type": "tool.output",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "output": "dir\t.cogito\ndir\t.git\ndir\tsrc\nfile\tREADME.md",
+        "tool": "list_directory"
+      },
+      "type": "tool.output"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017035
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017035698500-12",
+    "event_type": "tool.completed",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "tool": "list_directory"
+      },
+      "type": "tool.completed"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017035
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017080360100-13",
+    "event_type": "model.requested",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "model": "dev-mock",
+        "prompt_tokens": null,
+        "provider": "scripted-mock"
+      },
+      "type": "model.requested"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017080
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017090279300-14",
+    "event_type": "model.response",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "input_tokens": 1,
+        "model": "dev-mock",
+        "output_tokens": 1,
+        "provider": "scripted-mock",
+        "text": ""
+      },
+      "type": "model.response"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017090
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017097082000-15",
+    "event_type": "tool.requested",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "arguments": {
+          "content": "Generated by the development RPC runtime.",
+          "path": "cogito-rpc-dev-output.txt"
+        },
+        "tool": "write_file"
+      },
+      "type": "tool.requested"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017097
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017097400800-16",
+    "event_type": "policy.decision",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "action": "allow",
+        "mode": "normal",
+        "operation": "write",
+        "reason": "Normal mode allows this operation",
+        "rule": "mode-default",
+        "tool": "write_file"
+      },
+      "type": "policy.decision"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017097
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017097453100-17",
+    "event_type": "tool.approved",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "reason": "mode-default",
+        "tool": "write_file"
+      },
+      "type": "tool.approved"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017097
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017097471200-18",
+    "event_type": "tool.started",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "tool": "write_file"
+      },
+      "type": "tool.started"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017097
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017098311100-19",
+    "event_type": "file.changed",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "change": "Added",
+        "path": "\\\\?\\C:\\Users\\KIIT\\AppData\\Local\\Temp\\cogito-live-JfFX20\\cogito-rpc-dev-output.txt"
+      },
+      "type": "file.changed"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017098
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017098403600-20",
+    "event_type": "tool.output",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "output": "wrote cogito-rpc-dev-output.txt",
+        "tool": "write_file"
+      },
+      "type": "tool.output"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017098
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017098423700-21",
+    "event_type": "tool.completed",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "tool": "write_file"
+      },
+      "type": "tool.completed"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017098
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017153557100-22",
+    "event_type": "model.requested",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "model": "dev-mock",
+        "prompt_tokens": null,
+        "provider": "scripted-mock"
+      },
+      "type": "model.requested"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017153
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017159813200-23",
+    "event_type": "assistant.delta",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "text": "Developm"
+      },
+      "type": "assistant.delta"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017159
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017159880100-24",
+    "event_type": "assistant.delta",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "text": "ent runt"
+      },
+      "type": "assistant.delta"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017159
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017159895500-25",
+    "event_type": "assistant.delta",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "text": "ime task"
+      },
+      "type": "assistant.delta"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017159
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017159910000-26",
+    "event_type": "assistant.delta",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "text": " complet"
+      },
+      "type": "assistant.delta"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017159
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017159923800-27",
+    "event_type": "assistant.delta",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "text": "e."
+      },
+      "type": "assistant.delta"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017159
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017199553300-28",
+    "event_type": "model.response",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "input_tokens": 1,
+        "model": "dev-mock",
+        "output_tokens": 1,
+        "provider": "scripted-mock",
+        "text": "Development runtime task complete."
+      },
+      "type": "model.response"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017199
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017207845200-29",
+    "event_type": "assistant.message",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "text": "Development runtime task complete."
+      },
+      "type": "assistant.message"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017207
+  },
+  {
+    "correlation_id": null,
+    "event_id": "6348-1790457017216064300-30",
+    "event_type": "session.completed",
+    "parent_id": null,
+    "payload": {
+      "data": {
+        "reason": null
+      },
+      "type": "session.completed"
+    },
+    "schema_version": 1,
+    "session_id": "6348-1790457016885926300-0",
+    "timestamp": 1790457017216
+  }
+]
