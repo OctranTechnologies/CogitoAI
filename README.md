@@ -1,8 +1,12 @@
 # CogitoAI
 
-CogitoAI is a model-agnostic coding-agent harness. The repository currently
-contains the Rust workspace, runtime contracts, dependency boundaries, and
-side-effect-free project discovery and configuration loading.
+CogitoAI is a model-agnostic coding-agent harness. It ships a Rust workspace of
+runtime crates, a command-line client, a versioned RPC runtime, and a Tauri
+desktop client over that runtime.
+
+The runtime owns everything that has consequences: the agent loop, the tool
+registry, policy decisions, approvals, verification, Git checkpoints, terminals,
+and durable sessions. The CLI and the desktop shell are presentation clients.
 
 ## Repository layout
 
@@ -59,12 +63,26 @@ Agent runs are interruptible with `Ctrl+C`; the cancellation token is shared
 with filesystem shell execution and verification commands. A canceled or
 failed run is persisted as a session and can be resumed.
 
-The deterministic mock provider is the default and runs a complete scripted
-workflow (list directory, write a file, and finish) without credentials:
+The deterministic mock provider is the default and needs no credentials. It
+runs a real, complete workflow through the same agent loop, policy engine,
+checkpoint store, and verification commands as a live model: read a file, make a
+deliberately broken edit, let verification fail, correct the edit, and let
+verification pass. The script targets `mock-output.txt` by default.
+
+To point the mock at a specific repair cycle (a test hook, ignored by every real
+provider), set `COGITO_MOCK_REPAIR` to JSON with `path`, `broken`, and `fixed`
+contents:
 
 ```text
 cargo run -p harness-cli -- --yes run "Create a mock output"
+
+$env:COGITO_MOCK_REPAIR = '{"path":"src/lib.rs","broken":"pub fn value() -> u32 { oops","fixed":"pub fn value() -> u32 { 2 }"}'
+cargo run -p harness-cli -- --json run "make the test pass"
 ```
+
+The second form writes the broken content, reports the real verification
+failure, applies the fix, and reports the passing run. It is how the test suite
+exercises the corrective loop without a model or a network.
 
 To use OpenAI or another compatible endpoint:
 
@@ -145,9 +163,8 @@ Discovery reads filesystem metadata and read-only Git metadata only. It never
 runs project scripts, package-manager commands, or other project code.
 
 The CLI is a thin presentation layer over the harness session, agent, policy,
-tool, verification, and Git capabilities. The desktop application is not
-scaffolded or runnable yet. Its future setup and run commands will be added
-here when the Tauri application exists.
+tool, verification, and Git capabilities. The desktop application is a second
+client over the same runtime; see [Desktop application](#desktop-application).
 
 ## Model providers
 
@@ -526,6 +543,93 @@ for the complete machine-readable report.
 The event model is provider- and UI-independent. `harness-session::EventBus`
 provides in-process live subscriptions for CLI, RPC, and future desktop
 clients; durable JSONL remains the portable source of truth.
+
+## Security boundaries and known limitations
+
+These are the guarantees the code actually enforces, and the places where it
+deliberately does not try to.
+
+**Enforced, and covered by tests:**
+
+- *The workspace is a hard boundary.* Every path a tool touches is resolved
+  against the workspace root, including `..` segments, absolute paths, and
+  symlinks. `read_file`, `write_file`, `apply_patch`, `grep`, and `glob` all
+  refuse to leave it, and `file.read` and `git.file_diff` in the runtime apply
+  the same rule.
+- *The selected permission mode is authoritative.* `PolicyEngine` ignores the
+  mode a request claims and applies the mode it was configured with, so a
+  caller cannot widen a read-only workspace to auto by constructing a different
+  request.
+- *Credential files are denied, not merely gated.* `.env`, `.env.*`, anything
+  under `.ssh/`, `id_rsa`/`id_ed25519`/`id_ecdsa`, and `*.pem`/`*.key`/`*.p12`/
+  `*.pfx` are refused outright in every mode, including `auto`, so a mistaken
+  approval cannot expose them. They are also not writable.
+- *Credentials stay in the environment.* No RPC frame, settings payload, event,
+  verification result, or log carries an API key. Clients see only presence,
+  source, and the environment-variable name.
+- *Sessions are addressed, not path-constructed.* A session ID containing
+  separators or `..` is rejected rather than resolved.
+- *Nothing runs unbounded.* Command execution has a timeout and an output cap,
+  oversized reads are truncated or refused, and a provider failure, a
+  cancellation, or an exhausted tool loop always closes the session as either
+  completed or failed.
+- *Cancelling always works.* A pending approval polls the run's cancellation
+  token and is abandoned on cancel, so a run cannot be pinned by a permission
+  prompt nobody is answering. An unanswered prompt is also declined after five
+  minutes rather than waiting for the life of the process.
+
+**Deliberate limits:**
+
+- *The RPC protocol is unauthenticated and intended for loopback only.* It binds
+  to `127.0.0.1` and grants full control of the workspace to anything that can
+  reach the port. Do not expose it to a network.
+- *Credential protection is name-based.* A secret stored under an ordinary name
+  (`secrets.txt`, a committed fixture) is a normal workspace file and is
+  readable. The engine cannot detect secrets by content, and refusing files by
+  guesswork would break legitimate work.
+- *The shell cannot be path-checked the way file tools are.* A command such as
+  `cat .env` is gated as a command, so it prompts rather than being denied
+  outright. Approval is the mitigation.
+- *Checkpoints are shadow-based, not commits.* A harness change that is not
+  recorded with `record_harness_change` cannot be safely attributed or undone,
+  and a file that changed after a checkpoint was taken makes restore refuse
+  rather than clobber.
+- *Undo is refused on conflict by design.* If a formatter or a person changed a
+  recorded file after the checkpoint, `undo` reports the conflict and changes
+  nothing. It will not guess which version is correct.
+
+## What is verified
+
+The suite exercises the real components rather than mocks of them:
+
+- `crates/harness-agent/tests/lifecycle.rs` drives the full v0 lifecycle against
+  a real Git repository: discover, start a session, read, search, edit through
+  policy, checkpoint, run verification, observe a real failure, correct the edit,
+  pass verification, produce a diff, complete, reload from disk after a
+  simulated restart, resume, and undo without touching unrelated user work. It
+  also covers cancellation, an exhausted loop, and torn session records.
+- `crates/harness-agent/tests/security_audit.rs` covers the boundaries listed
+  above, including traversal through every file tool, protected credential files
+  in all four modes, environment-credential leakage, oversized and binary files,
+  bounded command output, dirty-repository safety, and provider failure.
+- `crates/harness-cli/tests/cli_commands.rs` runs the real binary against a real
+  Cargo project, where a genuinely invalid edit fails `cargo test` and the agent
+  corrects it. This is the end-to-end proof of the corrective loop.
+- `crates/harness-rpc/tests/rpc_loopback.rs` covers sessions, approvals,
+  cancellation while an approval is unanswered, terminal cleanup on disconnect,
+  settings, and credential redaction over the real socket protocol.
+- `crates/harness-pty/tests/pty_sessions.rs` drives a real PTY, including
+  interactive startup, resize, Unicode, Ctrl+C, and process cleanup on close.
+
+Verified on Windows: `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, and `cargo test --workspace` (143 tests) all pass,
+with the workspace suite confirmed green on two consecutive runs and the PTY
+suite on four. The desktop typecheck, lint, tests (55), and build pass, the
+Tauri binary builds, and the desktop application launches and stays running.
+Three live end-to-end scripts drive the real RPC runtime over a socket: code
+changes and checkpoint restore, human terminal behaviour, and settings with a
+credential planted in the environment that is then proven absent from every RPC
+frame and log.
 
 ## Architecture
 

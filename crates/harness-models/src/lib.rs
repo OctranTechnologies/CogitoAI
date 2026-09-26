@@ -202,6 +202,8 @@ pub enum ProviderError {
     Transport { provider: &'static str },
     #[error("provider stream consumer failed")]
     StreamConsumer,
+    #[error("provider configuration is invalid: {reason}")]
+    Configuration { reason: String },
 }
 
 pub trait ModelProvider: Send + Sync {

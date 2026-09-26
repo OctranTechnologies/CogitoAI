@@ -194,6 +194,14 @@ struct TerminalClient {
     id: String,
     output: String,
     answered: usize,
+    /// How much of the event stream has already been folded into `output`.
+    ///
+    /// The recorder keeps every chunk, so re-reading it in full would duplicate
+    /// earlier output on every poll. That both corrupts what the assertions see
+    /// and inflates the cursor-query count, which makes the harness answer
+    /// queries the shell never asked and leaves a real shell stuck on a reply
+    /// that was never expected.
+    consumed: usize,
 }
 
 impl TerminalClient {
@@ -208,12 +216,17 @@ impl TerminalClient {
             id,
             output: String::new(),
             answered: 0,
+            consumed: 0,
         }
     }
 
     /// Streams new output and answers any outstanding cursor-position query.
     fn pump(&mut self, events: &Arc<Mutex<Vec<TerminalEvent>>>) {
-        self.output.push_str(&output_so_far(events, &self.id));
+        let stream = output_so_far(events, &self.id);
+        if stream.len() > self.consumed {
+            self.output.push_str(&stream[self.consumed..]);
+            self.consumed = stream.len();
+        }
         let requested = self.output.matches(DSR_REQUEST).count();
         while self.answered < requested {
             self.answered += 1;
@@ -312,6 +325,7 @@ fn opens_a_human_shell_and_streams_interactive_output() {
         id: info.id.clone(),
         output: String::new(),
         answered: 0,
+        consumed: 0,
     };
     // Wait for the banner so the shell has reached a prompt.
     client.wait_for(&events, |text| !text.is_empty());
@@ -346,6 +360,7 @@ fn streams_unicode_output_without_corrupting_multibyte_characters() {
         id: info.id.clone(),
         output: String::new(),
         answered: 0,
+        consumed: 0,
     };
     client.wait_for_exit(&events);
 
@@ -422,6 +437,11 @@ fn ctrl_c_interrupts_a_running_command_instead_of_terminating_the_shell() {
     client.wait_for(&events, |text| {
         text.contains("ping") || text.contains("sleep")
     });
+
+    // The echo only proves the shell accepted the line, not that the child is
+    // already attached to the console. An interrupt delivered in that window is
+    // dropped, so let the command actually start first.
+    std::thread::sleep(Duration::from_millis(1500));
 
     // ETX (0x03) is what a real keyboard Ctrl+C produces.
     client.write_raw("\u{3}");
@@ -584,6 +604,7 @@ fn runs_an_explicit_program_when_one_is_requested() {
         id: info.id.clone(),
         output: String::new(),
         answered: 0,
+        consumed: 0,
     };
     client.wait_for_exit(&events);
     assert!(
@@ -685,6 +706,7 @@ fn the_default_shell_queries_the_terminal_for_its_cursor() {
         id: info.id.clone(),
         output: String::new(),
         answered: 0,
+        consumed: 0,
     };
 
     client.wait_for(&events, |text| text.contains(DSR_REQUEST));

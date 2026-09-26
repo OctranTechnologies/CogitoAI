@@ -515,11 +515,11 @@ fn run_agent(
             .collect(),
         details: Default::default(),
     };
-    let verification_plan = if model_config.provider == ProviderKind::Mock {
-        None
-    } else {
-        Some(VerificationPlan::all(&description))
-    };
+    // The mock provider is a stand-in for a real model, so it runs the same
+    // verification and checkpoint machinery a real run does. Only a workspace
+    // with a detectable toolchain produces commands, so a plain directory still
+    // verifies nothing.
+    let verification_plan = Some(VerificationPlan::all(&description));
     let agent_task = AgentTask {
         workspace_root: path,
         user_task: task,
@@ -571,6 +571,23 @@ fn run_agent(
 
 fn provider_for_agent(config: &ModelConfig) -> Result<Arc<dyn ModelProvider>, ProviderError> {
     if config.provider == ProviderKind::Mock {
+        if let Some(repair) = mock_repair_script()? {
+            return Ok(Arc::new(ScriptedMockProvider::new(
+                config.model.clone(),
+                vec![
+                    tool_response("read_file", json!({ "path": repair.path })),
+                    tool_response(
+                        "write_file",
+                        json!({ "path": repair.path, "content": repair.broken }),
+                    ),
+                    tool_response(
+                        "write_file",
+                        json!({ "path": repair.path, "content": repair.fixed }),
+                    ),
+                    text_response("Mock repair workflow completed."),
+                ],
+            )));
+        }
         return Ok(Arc::new(ScriptedMockProvider::new(
             config.model.clone(),
             vec![
@@ -587,6 +604,50 @@ fn provider_for_agent(config: &ModelConfig) -> Result<Arc<dyn ModelProvider>, Pr
         )));
     }
     Ok(Arc::from(provider_from_config(config)?))
+}
+
+/// A deliberately broken edit followed by a corrective one, so the mock can
+/// exercise the real verify-fail-then-correct loop.
+///
+/// Supplied through `COGITO_MOCK_REPAIR` as JSON because file contents contain
+/// newlines that a plain environment variable cannot carry portably. This is a
+/// test hook for the mock provider only; it never affects a real provider.
+struct MockRepair {
+    path: String,
+    broken: String,
+    fixed: String,
+}
+
+fn mock_repair_script() -> Result<Option<MockRepair>, ProviderError> {
+    let Some(raw) = std::env::var_os("COGITO_MOCK_REPAIR") else {
+        return Ok(None);
+    };
+    let invalid = |reason: String| ProviderError::Configuration {
+        reason: format!("COGITO_MOCK_REPAIR: {reason}"),
+    };
+    let value: Value = serde_json::from_str(&raw.to_string_lossy())
+        .map_err(|error| invalid(format!("expected JSON ({error})")))?;
+    let field = |name: &str| -> Result<String, ProviderError> {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(format!("missing string field `{name}`")))
+    };
+    let repair = MockRepair {
+        path: field("path")?,
+        broken: field("broken")?,
+        fixed: field("fixed")?,
+    };
+    if repair.path.trim().is_empty() {
+        return Err(invalid("path must not be empty".to_owned()));
+    }
+    if repair.broken == repair.fixed {
+        return Err(invalid(
+            "`broken` and `fixed` must differ for the repair to be meaningful".to_owned(),
+        ));
+    }
+    Ok(Some(repair))
 }
 
 fn tool_response(name: &str, arguments: Value) -> ModelResponse {

@@ -1095,6 +1095,105 @@ fn dropped_client_cancels_active_run_and_allows_reconnect() {
     let _ = server.join();
 }
 
+#[test]
+fn cancelling_a_run_works_while_an_approval_is_left_unanswered() {
+    // A person who walks away from a permission prompt must not pin the run
+    // forever, and cancelling has to take effect even though the agent is
+    // blocked waiting for an answer that will never come.
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "rpc-mock",
+        vec![
+            response(
+                Some((
+                    "write_file",
+                    json!({"path": "never-written.txt", "content": "should not happen"}),
+                )),
+                "",
+            ),
+            response(None, "unreachable"),
+        ],
+    ));
+    // Safe mode means the write must prompt.
+    let (runtime, sessions) = setup(root, ExecutionMode::Safe, provider, Arc::clone(&approvals));
+    let (mut client, _address, shutdown, server) = start_server(runtime, Arc::clone(&approvals));
+
+    let created = client.request("session.create", json!({})).unwrap();
+    assert_ok(&created);
+    let session_id = SessionId::new(
+        created.result.unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    )
+    .unwrap();
+    let accepted = client
+        .request(
+            "agent.send",
+            json!({"task": task(root, Some(session_id.clone()))}),
+        )
+        .unwrap();
+    assert_ok(&accepted);
+    let run_id = accepted.result.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Wait for the prompt, then deliberately never answer it.
+    let mut prompted = false;
+    for _ in 0..200 {
+        if let ServerMessage::Notification(notification) = client.receive().unwrap() {
+            if notification.method == "approval.request" {
+                prompted = true;
+                break;
+            }
+        }
+    }
+    assert!(prompted, "expected an approval prompt");
+    thread::sleep(Duration::from_millis(200));
+
+    let cancelled = client
+        .request("agent.cancel", json!({"run_id": run_id}))
+        .unwrap();
+    assert_ok(&cancelled);
+
+    // The run must wind down on its own, without anyone answering.
+    let mut finished = false;
+    for _ in 0..300 {
+        match client.receive() {
+            Ok(ServerMessage::Notification(notification)) => {
+                if notification.method == "agent.failed" || notification.method == "agent.completed"
+                {
+                    finished = true;
+                    break;
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        finished,
+        "cancelling must release a run blocked on an unanswered approval"
+    );
+    assert!(
+        !root.join("never-written.txt").exists(),
+        "a declined tool call must not have run"
+    );
+    assert!(wait_for(|| {
+        sessions
+            .load(&session_id)
+            .map(|session| session.state().is_ok())
+            .unwrap_or(false)
+    }));
+
+    drop(client);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = server.join();
+}
+
 struct SlowProvider;
 
 impl ModelProvider for SlowProvider {

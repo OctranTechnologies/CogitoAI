@@ -238,6 +238,10 @@ impl PolicyEngine {
         request: &PolicyRequest,
     ) -> Result<PolicyEvaluation, PolicyError> {
         let mut normalized_request = request.clone();
+        // The engine's configured mode is authoritative. The request also carries
+        // a mode, but a caller-supplied value must never be able to widen the
+        // permission the user actually selected.
+        normalized_request.mode = self.mode;
         normalized_request.workspace_root = normalize_path(&request.workspace_root);
         if let Some(path) = &request.path {
             normalized_request.path = Some(normalize_path(path));

@@ -3,10 +3,10 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::settings::SecretStore;
 use harness_agent::{AgentError, AgentTask, ApprovalHandler};
@@ -346,7 +346,14 @@ pub struct ApprovalBroker {
     pending: Mutex<HashMap<String, SyncSender<bool>>>,
     next_id: AtomicU64,
     sender: Mutex<Option<(u64, Sender<ServerMessage>)>>,
+    cancellation: Mutex<Option<CancellationToken>>,
 }
+
+/// How long a pending approval waits before it is treated as declined.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often a waiting approval checks for cancellation.
+const APPROVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 impl Default for ApprovalBroker {
     fn default() -> Self {
@@ -360,7 +367,18 @@ impl ApprovalBroker {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             sender: Mutex::new(None),
+            cancellation: Mutex::new(None),
         }
+    }
+
+    /// Lets a pending approval be abandoned when the run it belongs to is
+    /// cancelled, so cancelling actually takes effect while the agent is
+    /// blocked waiting for a person who may have walked away.
+    pub fn with_cancellation(&self, token: CancellationToken) {
+        *self
+            .cancellation
+            .lock()
+            .expect("approval cancellation lock poisoned") = Some(token);
     }
 
     fn set_sender(&self, client: u64, sender: Sender<ServerMessage>) {
@@ -411,9 +429,38 @@ impl ApprovalBroker {
             self.remove(&approval_id);
             return Ok(false);
         }
-        let result = receiver.recv().unwrap_or(false);
-        self.remove(&approval_id);
-        Ok(result)
+        // Wait for the person, but never indefinitely: a cancellation must be
+        // able to abandon the request, and an unanswered prompt must not pin a
+        // worker for the lifetime of the process.
+        let deadline = Instant::now() + APPROVAL_TIMEOUT;
+        loop {
+            if self
+                .cancellation
+                .lock()
+                .expect("approval cancellation lock poisoned")
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                self.remove(&approval_id);
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.remove(&approval_id);
+                return Ok(false);
+            }
+            match receiver.recv_timeout(remaining.min(APPROVAL_POLL_INTERVAL)) {
+                Ok(approved) => {
+                    self.remove(&approval_id);
+                    return Ok(approved);
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.remove(&approval_id);
+                    return Ok(false);
+                }
+            }
+        }
     }
 
     fn resolve(&self, approval_id: &str, approved: bool) -> bool {
@@ -764,6 +811,9 @@ fn start_run(request: RpcRequest, state: &Arc<ServerState>, runtime: &Arc<Runtim
         );
     }
     let cancellation = CancellationToken::new();
+    // A pending approval must be abandonable, otherwise cancelling a run whose
+    // prompt nobody is answering would have no effect at all.
+    state.approvals.with_cancellation(cancellation.clone());
     let run_id = match state.begin_run(cancellation.clone()) {
         Ok(run_id) => run_id,
         Err(error) => return error_response(request.id, "run_in_progress", error.to_string()),
