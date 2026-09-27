@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Search } from "lucide-react";
 import { cx } from "./cx";
 import { useDismissable } from "./dismiss";
@@ -9,6 +9,7 @@ export interface CommandItem {
   group?: string;
   detail?: string;
   keywords?: string;
+  shortcut?: string;
   icon?: ReactNode;
   disabled?: boolean;
   onSelect: () => void;
@@ -40,12 +41,15 @@ export function CommandMenu({
 }: CommandMenuProps) {
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const activeOptionRef = useRef<HTMLButtonElement>(null);
   const { surfaceRef } = useDismissable<HTMLDivElement>(open, onClose);
 
   useEffect(() => {
     if (open) {
       setQuery("");
       setActive(0);
+      inputRef.current?.focus();
     }
   }, [open]);
 
@@ -61,6 +65,10 @@ export function CommandMenu({
   useEffect(() => {
     if (active >= matches.length) setActive(0);
   }, [matches.length, active]);
+
+  useEffect(() => {
+    activeOptionRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [active]);
 
   if (!open) return null;
 
@@ -95,7 +103,9 @@ export function CommandMenu({
         <div className="flex items-center gap-2 border-b border-line px-3">
           <Search className="size-icon-sm shrink-0 text-faint" />
           <input
+            ref={inputRef}
             data-autofocus
+            aria-activedescendant={matches[active] ? `command-option-${matches[active].id}` : undefined}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder={placeholder}
@@ -110,6 +120,8 @@ export function CommandMenu({
             matches.map((item, index) => (
               <button
                 key={item.id}
+                ref={index === active ? activeOptionRef : undefined}
+                id={`command-option-${item.id}`}
                 type="button"
                 role="option"
                 aria-selected={index === active}
@@ -135,6 +147,11 @@ export function CommandMenu({
                 ) : null}
                 {item.group ? (
                   <span className="label-mono shrink-0 normal-case">{item.group}</span>
+                ) : null}
+                {item.shortcut ? (
+                  <kbd className="shrink-0 rounded border border-line bg-panel px-1.5 py-0.5 font-mono text-2xs text-faint">
+                    {item.shortcut}
+                  </kbd>
                 ) : null}
               </button>
             ))

@@ -37,6 +37,10 @@ export interface SessionWorkspaceProps {
     onSelectModel: (model: string) => void;
     onSelectMode: (mode: string) => void;
   };
+  terminal?: {
+    visible: boolean;
+    onVisibilityChange: (visible: boolean) => void;
+  };
 
   onApprove: (approvalId: string) => void;
   onDeny: (approvalId: string) => void;
@@ -146,7 +150,10 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
           {/* The composer is pinned to the bottom so the task is always in the
               same place no matter how much activity has scrolled past. The human
               terminal sits directly above it and renders nothing when closed. */}
-          <TerminalPanel />
+          <TerminalPanel
+            visible={props.terminal?.visible}
+            onVisibilityChange={props.terminal?.onVisibilityChange}
+          />
           <div className="shrink-0 border-t border-line bg-app px-4 py-3">
             <div className="mx-auto max-w-3xl">
               <PromptComposer

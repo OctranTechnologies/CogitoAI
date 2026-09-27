@@ -9,6 +9,7 @@ import {
 } from "../store";
 import { describeExit } from "../lib/terminal";
 import { alpha, color } from "../lib/tokens";
+import { desktopShortcutLabel } from "../lib/keyboard";
 import { Badge, Button, IconButton, Tooltip } from "./ui";
 
 /**
@@ -59,7 +60,13 @@ const OPTIONS = {
  * policy engine is intentionally not involved. Agent command execution uses a
  * completely separate, policy-governed path and cannot reach this terminal.
  */
-export function TerminalPanel() {
+export function TerminalPanel({
+  visible,
+  onVisibilityChange,
+}: {
+  visible?: boolean;
+  onVisibilityChange?: (visible: boolean) => void;
+}) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -71,7 +78,12 @@ export function TerminalPanel() {
   const isStartingTerminal = useDesktopStore((state) => state.isStartingTerminal);
   const connected = useDesktopStore((state) => state.status === "connected");
   const workspacePath = useDesktopStore((state) => state.workspacePath);
-  const [isVisible, setIsVisible] = useState(false);
+  const [localVisibility, setLocalVisibility] = useState(false);
+  const isVisible = visible ?? localVisibility;
+  const setVisible = (next: boolean) => {
+    onVisibilityChange?.(next);
+    if (visible === undefined) setLocalVisibility(next);
+  };
 
   // Create/dispose the xterm instance alongside the runtime session so the
   // buffer, cursor, and scrollback all reset together.
@@ -143,10 +155,10 @@ export function TerminalPanel() {
         </div>
         <div className="flex shrink-0 items-center gap-1">
           <IconButton
-            label={isVisible ? "Hide terminal" : "Show terminal"}
+            label={`${isVisible ? "Hide" : "Show"} terminal (${desktopShortcutLabel("toggleTerminal")})`}
             size="sm"
             aria-expanded={isVisible}
-            onClick={() => setIsVisible((value) => !value)}
+            onClick={() => setVisible(!isVisible)}
           >
             {isVisible ? <X className="size-icon-sm" /> : <TerminalSquare className="size-icon-sm" />}
           </IconButton>
@@ -165,10 +177,10 @@ export function TerminalPanel() {
               variant="secondary"
               disabled={!connected || !workspacePath || isStartingTerminal}
               onClick={() => {
-                setIsVisible(true);
+                setVisible(true);
                 void startTerminal();
               }}
-              title="Open an interactive shell in the selected workspace"
+              title={`Open an interactive shell in the selected workspace (${desktopShortcutLabel("toggleTerminal")})`}
             >
               {isStartingTerminal ? (
                 <LoaderCircle className="size-icon-xs animate-spin" />

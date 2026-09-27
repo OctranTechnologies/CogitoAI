@@ -3,6 +3,7 @@ use std::io::{self, Stdout};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
+use super::INTERACTIVE_COMMANDS;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -20,22 +21,6 @@ use ratatui::{Frame, Terminal};
 
 const ACTIVITY_LIMIT: usize = 200;
 const HISTORY_LIMIT: usize = 100;
-const SLASH_COMMANDS: &[&str] = &[
-    "/cancel",
-    "/clear",
-    "/config",
-    "/diff",
-    "/exit",
-    "/help",
-    "/inspect",
-    "/model",
-    "/resume",
-    "/run",
-    "/sessions",
-    "/status",
-    "/undo",
-];
-
 type BackendTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 #[derive(Clone, Debug)]
@@ -560,9 +545,9 @@ impl AppState {
             return;
         }
         let prefix = self.input.as_str();
-        let matches = SLASH_COMMANDS
+        let matches = INTERACTIVE_COMMANDS
             .iter()
-            .copied()
+            .map(|definition| definition.name)
             .filter(|command| command.starts_with(prefix))
             .collect::<Vec<_>>();
         if matches.len() == 1 {

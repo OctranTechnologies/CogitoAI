@@ -407,7 +407,7 @@ describe("settings helpers", () => {
     expect(summary).toContain("streaming");
     expect(summary).toContain("tool calling");
     expect(summary).toContain("vision");
-    expect(summary).toContain("128,000 token context");
+    expect(summary).toContain(`${(128_000).toLocaleString()} token context`);
   });
 
   it("formats a verification command", () => {

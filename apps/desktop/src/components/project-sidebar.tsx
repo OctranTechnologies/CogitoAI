@@ -15,6 +15,7 @@ import {
 import type { SessionSummary } from "../lib/rpc";
 import { filterSessions, type SidebarProject } from "../lib/sidebar-model";
 import { Button, ContextMenu, Dropdown, ScrollArea, Separator, StatusIndicator, Tooltip, cx } from "./ui";
+import { desktopShortcutLabel } from "../lib/keyboard";
 
 const RECENT_PREVIEW = 8;
 const PROJECT_PREVIEW = 3;
@@ -26,6 +27,7 @@ export interface ProjectSidebarProps {
   workspacePath: string;
   status: string;
   projects: SidebarProject[];
+  searchRequest?: number;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
   disabled: boolean;
@@ -39,6 +41,7 @@ export function ProjectSidebar({
   workspacePath,
   status,
   projects,
+  searchRequest = 0,
   onSelectSession,
   onNewSession,
   disabled,
@@ -62,7 +65,11 @@ export function ProjectSidebar({
 
   useEffect(() => {
     if (searchOpen) searchRef.current?.focus();
-  }, [searchOpen]);
+  }, [searchOpen, searchRequest]);
+
+  useEffect(() => {
+    if (searchRequest > 0) setSearchOpen(true);
+  }, [searchRequest]);
 
   function isExpanded(project: SidebarProject): boolean {
     return expanded[project.path] ?? project.active;
@@ -101,7 +108,7 @@ export function ProjectSidebar({
           </span>
         </Tooltip>
         <div className="ml-auto flex items-center gap-0.5">
-          <Tooltip label={searchOpen ? "Close session search" : "Search sessions"}>
+          <Tooltip label={searchOpen ? "Close session search" : `Search sessions (${desktopShortcutLabel("searchSessions")})`}>
             <button
               type="button"
               aria-label={searchOpen ? "Close session search" : "Search sessions"}
@@ -122,9 +129,13 @@ export function ProjectSidebar({
       </header>
 
       <div className="px-3 pb-2">
-        <Button variant="primary" block onClick={onNewSession} disabled={disabled} icon={<Play className="size-icon-sm" />}>
-          New task
-        </Button>
+        <Tooltip label={`New task (${desktopShortcutLabel("newTask")})`}>
+          <span className="block">
+            <Button variant="primary" block onClick={onNewSession} disabled={disabled} icon={<Play className="size-icon-sm" />}>
+              New task
+            </Button>
+          </span>
+        </Tooltip>
       </div>
 
       {searchOpen ? (

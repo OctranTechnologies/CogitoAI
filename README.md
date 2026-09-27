@@ -302,6 +302,13 @@ and elapsed time for the current run. Its second line shows an approval, current
 action, or shortcuts. Context percentage, price, and reasoning effort are omitted
 when the runtime cannot determine them.
 
+The interactive slash commands are `/help`, `/run`, `/resume`, `/inspect`,
+`/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/mode`, `/clear`,
+`/cancel`, and `/exit`. `/mode` reports the execution mode loaded from the
+workspace policy; change that setting in `.agent/config.toml` and restart the CLI.
+Tab completes commands. The `TERM=dumb` line-oriented fallback lists only the
+commands it supports while preserving ordinary terminal output.
+
 `Alt+Enter` (or `Ctrl+J`) inserts a line break; Enter submits. Up/Down navigate
 command history for single-line input, and Tab completes slash commands. PageUp and
 PageDown scroll the activity feed. While work is running, `Ctrl+C` cancels it. At
@@ -336,6 +343,13 @@ pnpm tauri dev
 
 `pnpm tauri dev` starts the Vite dev server itself and compiles the Rust shell. In
 the app, enter the runtime address and a repository path, then select Connect.
+
+The desktop command palette opens with `Ctrl+K` or `Ctrl+Shift+P` (use `Cmd` on
+macOS). It can create a task, open a project, resume a session, switch model or
+execution mode, show diffs or checkpoints, open the terminal, undo the latest
+checkpointed harness change, and open settings. `Ctrl/Cmd+N` starts a task,
+`Ctrl/Cmd+P` focuses project and session search, `Ctrl/Cmd+Enter` submits the
+composer, and `Ctrl/Cmd+\`` toggles the terminal. `Escape` closes open overlays.
 
 To build the desktop binary without bundling installers:
 

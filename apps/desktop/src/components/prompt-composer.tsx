@@ -5,6 +5,7 @@ import { Button, IconButton, Tooltip, cx } from "./ui";
 import { ComposerShell } from "./composer-parts";
 import { useAutoGrow } from "../lib/composer";
 import { AttachButton, ModelSelector, ModeSelector } from "./composer-selectors";
+import { desktopShortcutLabel, matchesDesktopShortcut } from "../lib/keyboard";
 
 export interface PromptComposerProps {
   value: string;
@@ -66,11 +67,13 @@ export function PromptComposer({
   }
 
   function onKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    const modifiedSubmit = matchesDesktopShortcut(event, "submitPrompt");
     if (event.key !== "Enter") return;
     // Never submit while an IME is composing: Enter is committing a candidate.
     if (event.nativeEvent.isComposing) return;
     if (event.shiftKey) return; // Shift+Enter is an explicit newline.
     event.preventDefault();
+    if (modifiedSubmit) event.stopPropagation();
     submit();
   }
 
@@ -140,7 +143,7 @@ export function PromptComposer({
             <Tooltip
               label={
                 canSubmit
-                  ? "Enter to send · Shift+Enter for a new line"
+                  ? `Enter to send · Shift+Enter for a new line · ${desktopShortcutLabel("submitPrompt")} submits from anywhere`
                   : "Type a task to send it"
               }
             >

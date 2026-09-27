@@ -332,7 +332,30 @@ export const useDesktopStore = create<DesktopStore>()(
         set({ status: "disconnected", clientId: null, activeRunId: null, runPhase: "idle" });
       },
 
-      setWorkspacePath: (workspacePath) => set({ workspacePath }),
+      setWorkspacePath: (workspacePath) => {
+        if (workspacePath === get().workspacePath) return;
+        set({
+          workspacePath,
+          workspace: null,
+          sessions: [],
+          activeSessionId: null,
+          ...emptyRunState(),
+          gitStatus: null,
+          changes: emptyChanges(),
+          selectedPath: null,
+          fileChange: null,
+          fileView: null,
+          aggregateDiff: null,
+          isLoadingChanges: false,
+          isChangesTruncated: false,
+          isLoadingFile: false,
+          checkpoints: [],
+          restoringCheckpointId: null,
+          lastRestore: null,
+          settings: null,
+          settingsError: null,
+        });
+      },
       setComposer: (composer) => set({ composer }),
       selectSession: async (sessionId) => {
         if (get().activeSessionId === sessionId && get().events.length > 0) return;

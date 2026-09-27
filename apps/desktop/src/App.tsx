@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
@@ -14,8 +14,9 @@ import {
   RotateCcw,
   Server,
   Settings2,
-  Square,
   Terminal,
+  ShieldCheck,
+  History,
   X,
 } from "lucide-react";
 import {
@@ -36,6 +37,13 @@ import type { SettingsScreen } from "./lib/settings";
 import { readStoredRailTarget, storeRailTarget } from "./lib/shell-prefs";
 import { groupSessionsByWorkspace, sortSessionsByRecent, type SidebarProject } from "./lib/sidebar-model";
 import {
+  DESKTOP_COMMANDS,
+  desktopShortcutLabel,
+  matchesDesktopShortcut,
+  paletteShortcutLabel,
+  type DesktopCommandId,
+} from "./lib/keyboard";
+import {
   Button,
   CommandMenu,
   IconButton,
@@ -53,6 +61,8 @@ function App() {
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("changes");
   const [showSettings, setShowSettings] = useState(false);
   const [showCommands, setShowCommands] = useState(false);
+  const [searchRequest, setSearchRequest] = useState(0);
+  const [terminalVisible, setTerminalVisible] = useState(false);
   const [railTarget, setRailTarget] = useState<RailTarget>(readStoredRailTarget);
   const [settingsScreen, setSettingsScreen] = useState<SettingsScreen>("models");
   const [pendingMode, setPendingMode] = useState<string | null>(null);
@@ -85,10 +95,12 @@ function App() {
     restoringCheckpointId,
     lastRestore,
     terminal,
+    isStartingTerminal,
     settings,
     updateModel,
     updatePermissionMode,
     closeTerminal,
+    startTerminal,
     connect,
     setWorkspacePath,
     setComposer,
@@ -98,7 +110,6 @@ function App() {
     approve,
     deny,
     cancel,
-    refreshChanges,
     selectFile,
     clearSelectedFile,
     restoreCheckpoint,
@@ -146,22 +157,12 @@ function App() {
     return () => window.removeEventListener("beforeunload", onUnload);
   }, [terminal, closeTerminal]);
 
-  // The command palette only offers actions that already exist elsewhere in the
-  // shell. It is a faster route to them, not a new capability.
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        setShowCommands((value) => !value);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
-
   async function chooseWorkspace() {
+    if (running) return;
     const selected = await open({ directory: true, multiple: false, title: "Select workspace" });
-    if (typeof selected === "string") setWorkspacePath(selected);
+    if (typeof selected !== "string" || selected === workspacePath) return;
+    setWorkspacePath(selected);
+    if (connected) await connect(address, selected);
   }
 
   async function connectRuntime() {
@@ -195,9 +196,9 @@ function App() {
    * button all funnel through the same path; the form event is only used to stop
    * the browser navigating on a native submit.
    */
-  async function submitPrompt(text: string) {
+  const submitPrompt = useCallback(async (text: string) => {
     await sendMessage(text);
-  }
+  }, [sendMessage]);
 
   async function selectModel(model: string) {
     await updateModel({ model });
@@ -213,83 +214,152 @@ function App() {
     }
   }
 
-  // The palette only offers actions that already exist elsewhere in the shell.
-  // It is a faster route to them, not a new capability, and it is built inline
-  // because the handlers it closes over are recreated on every render.
+  function openSettings(screen: SettingsScreen = "models") {
+    setSettingsScreen(screen);
+    setShowSettings(true);
+  }
+
+  function showInspector(tab: InspectorTab) {
+    setRailTarget("home");
+    storeRailTarget("home");
+    setInspectorTab(tab);
+    setInspectorOpen(true);
+  }
+
+  const openTerminal = useCallback(() => {
+    setRailTarget("home");
+    storeRailTarget("home");
+    setTerminalVisible(true);
+    if (!terminal && !isStartingTerminal) void startTerminal();
+  }, [isStartingTerminal, startTerminal, terminal]);
+
+  const toggleTerminal = useCallback(() => {
+    if (terminalVisible) {
+      setTerminalVisible(false);
+      return;
+    }
+    openTerminal();
+  }, [openTerminal, terminalVisible]);
+
+  // Every shortcut is defined in lib/keyboard.ts. Input-specific shortcuts are
+  // handled by their owner; global actions remain available from the rest of
+  // the shell without stealing keys from an open modal or palette.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (matchesDesktopShortcut(event, "palette") || matchesDesktopShortcut(event, "paletteAlternate")) {
+        event.preventDefault();
+        setShowSettings(false);
+        setShowCommands((value) => !value);
+        return;
+      }
+      if (showCommands || showSettings) return;
+
+      if (matchesDesktopShortcut(event, "newTask")) {
+        if (connected && !running && !isLoadingSession) {
+          event.preventDefault();
+          void createSession();
+        }
+      } else if (matchesDesktopShortcut(event, "searchSessions")) {
+        event.preventDefault();
+        setSearchRequest((value) => value + 1);
+      } else if (matchesDesktopShortcut(event, "toggleTerminal")) {
+        event.preventDefault();
+        if (connected && workspacePath && !isStartingTerminal) toggleTerminal();
+      } else if (matchesDesktopShortcut(event, "submitPrompt")) {
+        const target = event.target;
+        if (target instanceof HTMLElement && target.closest('[aria-label="Message the agent"]')) return;
+        if (composer.trim() && connected && !running && workspacePath) {
+          event.preventDefault();
+          void submitPrompt(composer);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    composer,
+    connected,
+    createSession,
+    isLoadingSession,
+    isStartingTerminal,
+    running,
+    showCommands,
+    showSettings,
+    startTerminal,
+    submitPrompt,
+    terminal,
+    terminalVisible,
+    toggleTerminal,
+    workspacePath,
+  ]);
+
+  const latestUndoableCheckpoint = [...checkpoints]
+    .filter((checkpoint) => !checkpoint.isRestored && checkpoint.affectedFiles.length > 0)
+    .sort((left, right) => right.createdAt - left.createdAt)[0];
+  const commandIcons: Record<DesktopCommandId, ReactNode> = {
+    "session.new": <Play className="size-icon-sm" />,
+    "workspace.open": <FolderOpen className="size-icon-sm" />,
+    "sessions.search": <MessageSquare className="size-icon-sm" />,
+    "session.resume": <RotateCcw className="size-icon-sm" />,
+    "model.switch": <Settings2 className="size-icon-sm" />,
+    "mode.switch": <ShieldCheck className="size-icon-sm" />,
+    "view.diff": <FileDiff className="size-icon-sm" />,
+    "terminal.open": <Terminal className="size-icon-sm" />,
+    "view.checkpoints": <History className="size-icon-sm" />,
+    "change.undo": <RotateCcw className="size-icon-sm" />,
+    "settings.open": <Settings2 className="size-icon-sm" />,
+  };
+  const commandHandlers: Record<DesktopCommandId, () => void> = {
+    "session.new": () => void createSession(),
+    "workspace.open": () => void chooseWorkspace(),
+    "sessions.search": () => setSearchRequest((value) => value + 1),
+    "session.resume": () => {
+      if (activeSessionId) void resumeSession();
+      else setSearchRequest((value) => value + 1);
+    },
+    "model.switch": () => openSettings("models"),
+    "mode.switch": () => openSettings("permissions"),
+    "view.diff": () => showInspector("changes"),
+    "terminal.open": openTerminal,
+    "view.checkpoints": () => showInspector("checkpoints"),
+    "change.undo": () => {
+      if (latestUndoableCheckpoint) void restoreCheckpoint(latestUndoableCheckpoint.id);
+    },
+    "settings.open": () => openSettings(),
+  };
   const commandItems = [
-    {
-      id: "connect",
-      label: connected ? "Runtime connected" : "Connect to runtime",
-      detail: address,
-      icon: <PlugZap className="size-icon-sm" />,
-      disabled: connected || !workspacePath,
-      onSelect: () => void connectRuntime(),
-    },
-    {
-      id: "workspace",
-      label: "Choose workspace folder",
-      icon: <FolderOpen className="size-icon-sm" />,
-      onSelect: () => void chooseWorkspace(),
-    },
-    {
-      id: "session.new",
-      label: "New session",
-      icon: <Play className="size-icon-sm" />,
-      disabled: !connected || running || isLoadingSession,
-      onSelect: () => void createSession(),
-    },
-    {
-      id: "session.resume",
-      label: "Resume selected session",
-      icon: <RotateCcw className="size-icon-sm" />,
-      disabled: !connected || !activeSessionId || running,
-      onSelect: () => void resumeSession(),
-    },
-    {
-      id: "view.changes",
-      label: "Show code changes",
-      icon: <FileDiff className="size-icon-sm" />,
-      onSelect: () => {
-        setInspectorTab("changes");
-        setInspectorOpen(true);
-      },
-    },
-    {
-      id: "view.events",
-      label: "Show event details",
-      icon: <MessageSquare className="size-icon-sm" />,
-      onSelect: () => {
-        setInspectorTab("events");
-        setInspectorOpen(true);
-      },
-    },
-    {
-      id: "changes.refresh",
-      label: "Refresh code changes",
-      icon: <RotateCcw className="size-icon-sm" />,
-      disabled: !connected,
-      onSelect: () => void refreshChanges(),
-    },
-    {
-      id: "context.toggle",
-      label: inspectorOpen ? "Hide inspector" : "Show inspector",
-      icon: <PanelRight className="size-icon-sm" />,
-      onSelect: () => setInspectorOpen((value) => !value),
-    },
-    {
-      id: "run.cancel",
-      label: "Stop the running task",
-      icon: <Square className="size-icon-sm" />,
-      disabled: !running,
-      onSelect: () => cancel(),
-    },
-    {
-      id: "settings",
-      label: "Open settings",
-      icon: <Settings2 className="size-icon-sm" />,
-      onSelect: () => setShowSettings(true),
-    },
+    ...DESKTOP_COMMANDS.map((command) => ({
+      ...command,
+      icon: commandIcons[command.id],
+      shortcut: "shortcut" in command ? desktopShortcutLabel(command.shortcut) : undefined,
+      detail: command.id === "change.undo"
+        ? latestUndoableCheckpoint?.trigger || (latestUndoableCheckpoint ? "Latest checkpoint" : undefined)
+        : undefined,
+      disabled:
+        (command.id === "session.new" && (!connected || running || isLoadingSession)) ||
+        (command.id === "workspace.open" && running) ||
+        (command.id === "session.resume" && (!connected || !activeSessionId || running)) ||
+        ((command.id === "model.switch" || command.id === "mode.switch") && (!connected || !settings)) ||
+        ((command.id === "view.diff" || command.id === "view.checkpoints") && !connected) ||
+        (command.id === "terminal.open" && (!connected || !workspacePath || isStartingTerminal)) ||
+        (command.id === "change.undo" && (!connected || running || !latestUndoableCheckpoint)),
+      onSelect: commandHandlers[command.id],
+    })),
+    ...recentSessions.map((session) => {
+      const title = session.title?.trim() || (session.event_count > 1 ? "Untitled session" : "New session");
+      return {
+        id: `resume.${session.id}`,
+        label: `Resume ${title}`,
+        group: "Recent sessions",
+        keywords: `${title} ${session.workspace_root} resume continue`,
+        icon: <MessageSquare className="size-icon-sm" />,
+        disabled: !connected || running,
+        onSelect: () => void resumeSession(session.id),
+      };
+    }),
   ];
+
+  const showSessionWorkspace = hasConversation || terminalVisible || inspectorOpen;
 
   return (
     <div className="flex h-screen min-h-[560px] overflow-hidden bg-app text-secondary">
@@ -306,6 +376,7 @@ function App() {
         workspacePath={workspacePath}
         status={status}
         projects={projects}
+        searchRequest={searchRequest}
         onSelectSession={(id) => void resumeSession(id)}
         onNewSession={() => void createSession()}
         disabled={!connected || running || isLoadingSession}
@@ -318,12 +389,13 @@ function App() {
           onAddressChange={setAddress}
           onConnect={connectRuntime}
           onChooseWorkspace={chooseWorkspace}
+          chooseWorkspaceDisabled={running}
           onToggleContext={() => setInspectorOpen((value) => !value)}
           onOpenCommands={() => setShowCommands(true)}
           showContext={inspectorOpen}
         />
         {railTarget === "home" ? (
-          hasConversation ? (
+          showSessionWorkspace ? (
             <SessionWorkspace
               events={events}
               hasConversation={hasConversation}
@@ -372,6 +444,7 @@ function App() {
               lastRestore={lastRestore}
               restoreDisabled={!connected || running}
               onRestore={(id) => void restoreCheckpoint(id)}
+              terminal={{ visible: terminalVisible, onVisibilityChange: setTerminalVisible }}
             />
           ) : (
             <LandingView
@@ -422,7 +495,7 @@ function App() {
         onClose={() => setShowCommands(false)}
         items={commandItems}
         label="Command palette"
-        placeholder="Jump to an action…"
+        placeholder="Search actions and sessions…"
       />
       {lastError ? <ErrorToast message={lastError} onClose={clearError} /> : null}
     </div>
@@ -457,6 +530,7 @@ function WorkspaceTopBar({
   onAddressChange,
   onConnect,
   onChooseWorkspace,
+  chooseWorkspaceDisabled,
   onToggleContext,
   onOpenCommands,
   showContext,
@@ -467,6 +541,7 @@ function WorkspaceTopBar({
   onAddressChange: (value: string) => void;
   onConnect: () => void;
   onChooseWorkspace: () => void;
+  chooseWorkspaceDisabled: boolean;
   onToggleContext: () => void;
   onOpenCommands: () => void;
   showContext: boolean;
@@ -486,7 +561,7 @@ function WorkspaceTopBar({
       </div>
 
       <Tooltip label="Choose workspace folder">
-        <IconButton label="Choose workspace" onClick={onChooseWorkspace}>
+        <IconButton label="Choose workspace" onClick={onChooseWorkspace} disabled={chooseWorkspaceDisabled}>
           <FolderOpen className="size-icon-lg" />
         </IconButton>
       </Tooltip>
@@ -507,7 +582,7 @@ function WorkspaceTopBar({
         {connected ? "Connected" : "Connect"}
       </Button>
 
-      <Tooltip label="Command palette (Ctrl+K)">
+      <Tooltip label={`Command palette (${paletteShortcutLabel()})`}>
         <IconButton label="Open command palette" onClick={onOpenCommands}>
           <Code2 className="size-icon-lg" />
         </IconButton>

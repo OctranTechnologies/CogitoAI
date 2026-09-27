@@ -28,6 +28,165 @@ use tui::{StartupInfo, Tui, TuiSender};
 
 mod tui;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InteractiveCommand {
+    Help,
+    Run,
+    Resume,
+    Inspect,
+    Sessions,
+    Status,
+    Diff,
+    Undo,
+    Config,
+    Model,
+    Mode,
+    Clear,
+    Cancel,
+    Exit,
+}
+
+struct InteractiveCommandDefinition {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+    command: InteractiveCommand,
+    plain_supported: bool,
+}
+
+/// The single source used for interactive dispatch, help, and Tab completion.
+const INTERACTIVE_COMMANDS: &[InteractiveCommandDefinition] = &[
+    InteractiveCommandDefinition {
+        name: "/help",
+        usage: "/help",
+        description: "Show commands and keyboard controls",
+        command: InteractiveCommand::Help,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/run",
+        usage: "/run <task>",
+        description: "Run a task",
+        command: InteractiveCommand::Run,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/resume",
+        usage: "/resume <session-id> [task]",
+        description: "Continue a saved session",
+        command: InteractiveCommand::Resume,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/inspect",
+        usage: "/inspect [path]",
+        description: "Inspect workspace metadata",
+        command: InteractiveCommand::Inspect,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/sessions",
+        usage: "/sessions [limit]",
+        description: "List recent sessions",
+        command: InteractiveCommand::Sessions,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/status",
+        usage: "/status [session-id]",
+        description: "Show session status",
+        command: InteractiveCommand::Status,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/diff",
+        usage: "/diff [file]",
+        description: "Show workspace changes",
+        command: InteractiveCommand::Diff,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/undo",
+        usage: "/undo [checkpoint-id]",
+        description: "Restore a checkpoint through the runtime",
+        command: InteractiveCommand::Undo,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/config",
+        usage: "/config",
+        description: "Show effective configuration",
+        command: InteractiveCommand::Config,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/model",
+        usage: "/model",
+        description: "Show the configured model and capabilities",
+        command: InteractiveCommand::Model,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/mode",
+        usage: "/mode",
+        description: "Show the workspace execution mode",
+        command: InteractiveCommand::Mode,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/clear",
+        usage: "/clear",
+        description: "Clear the visible activity feed",
+        command: InteractiveCommand::Clear,
+        plain_supported: false,
+    },
+    InteractiveCommandDefinition {
+        name: "/cancel",
+        usage: "/cancel",
+        description: "Cancel a running task",
+        command: InteractiveCommand::Cancel,
+        plain_supported: false,
+    },
+    InteractiveCommandDefinition {
+        name: "/exit",
+        usage: "/exit",
+        description: "Exit the interactive CLI",
+        command: InteractiveCommand::Exit,
+        plain_supported: true,
+    },
+];
+
+fn parse_interactive_command(line: &str) -> Option<(InteractiveCommand, &str)> {
+    let line = line.trim();
+    if !line.starts_with('/') {
+        return None;
+    }
+    let (name, arguments) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let command = if name == "/quit" {
+        Some(InteractiveCommand::Exit)
+    } else {
+        INTERACTIVE_COMMANDS
+            .iter()
+            .find(|definition| definition.name == name)
+            .map(|definition| definition.command)
+    }?;
+    Some((command, arguments.trim()))
+}
+
+fn interactive_help(plain: bool) -> String {
+    let commands = INTERACTIVE_COMMANDS
+        .iter()
+        .filter(|definition| !plain || definition.plain_supported)
+        .map(|definition| format!("{} — {}", definition.usage, definition.description))
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+    if plain {
+        format!("Commands: {commands}")
+    } else {
+        format!("Slash commands: {commands}  ·  Enter runs · Alt+Enter adds a line · Tab completes · Ctrl+C cancels")
+    }
+}
+
 #[derive(Clone, Debug, Parser)]
 #[command(name = "harness", about = "CogitoAI coding-agent harness")]
 struct Cli {
@@ -317,7 +476,7 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             model.api_key_env
         );
     }
-    println!("Enter a task, /help, or /exit. Ctrl+D exits.");
+    println!("Enter a task or type /help. Ctrl+D exits.");
     loop {
         print!("harness> ");
         io::stdout().flush()?;
@@ -329,29 +488,91 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         if line.is_empty() {
             continue;
         }
-        if matches!(line, "/exit" | "/quit") {
-            break;
-        }
-        if line == "/help" {
-            println!("Type a task to run it. /inspect and /sessions show workspace data; /exit leaves the prompt.");
+        if line.starts_with('/') {
+            let Some((command, arguments)) = parse_interactive_command(line) else {
+                eprintln!(
+                    "unknown command {}; type /help for available commands",
+                    line.split_whitespace().next().unwrap_or(line)
+                );
+                continue;
+            };
+            match command {
+                InteractiveCommand::Help => println!("{}", interactive_help(true)),
+                InteractiveCommand::Run => {
+                    if arguments.is_empty() {
+                        eprintln!("usage: /run <task>");
+                    } else {
+                        run_agent(
+                            cli,
+                            arguments.to_owned(),
+                            effective_path(cli, Path::new(".")),
+                            None,
+                        )?;
+                        break;
+                    }
+                }
+                InteractiveCommand::Resume => {
+                    let mut fields = arguments.splitn(2, char::is_whitespace);
+                    let id = fields.next().unwrap_or_default();
+                    if id.is_empty() {
+                        eprintln!("usage: /resume <session-id> [task]");
+                    } else {
+                        let task = fields
+                            .next()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned);
+                        resume_session(cli, id, task, None)?;
+                        break;
+                    }
+                }
+                InteractiveCommand::Inspect => {
+                    let path = if arguments.is_empty() {
+                        effective_path(cli, Path::new("."))
+                    } else {
+                        PathBuf::from(arguments.trim_matches('"'))
+                    };
+                    inspect(cli, &path)?;
+                }
+                InteractiveCommand::Sessions => {
+                    let limit = if arguments.is_empty() {
+                        20
+                    } else {
+                        arguments.parse::<usize>()?
+                    };
+                    sessions(cli, limit)?;
+                }
+                InteractiveCommand::Status => {
+                    status(cli, (!arguments.is_empty()).then_some(arguments), None)?
+                }
+                InteractiveCommand::Diff => {
+                    let file =
+                        (!arguments.is_empty()).then(|| PathBuf::from(arguments.trim_matches('"')));
+                    diff(cli, file.as_deref(), None)?;
+                }
+                InteractiveCommand::Undo => {
+                    undo(cli, (!arguments.is_empty()).then_some(arguments), None)?
+                }
+                InteractiveCommand::Config => config_command(cli, None)?,
+                InteractiveCommand::Model => model_info(cli)?,
+                InteractiveCommand::Mode => {
+                    if !arguments.is_empty() {
+                        eprintln!("usage: /mode (shows the workspace-configured mode)");
+                    } else {
+                        mode_info(cli)?;
+                    }
+                }
+                InteractiveCommand::Clear | InteractiveCommand::Cancel => {
+                    let name = if command == InteractiveCommand::Clear {
+                        "/clear"
+                    } else {
+                        "/cancel"
+                    };
+                    eprintln!("{name} is available in the full-screen TUI only");
+                }
+                InteractiveCommand::Exit => break,
+            }
             continue;
-        }
-        if line == "/inspect" {
-            inspect(cli, &effective_path(cli, Path::new(".")))?;
-            continue;
-        }
-        if line == "/sessions" {
-            sessions(cli, 20)?;
-            continue;
-        }
-        if let Some(task) = line.strip_prefix("/run ") {
-            run_agent(
-                cli,
-                task.to_owned(),
-                effective_path(cli, Path::new(".")),
-                None,
-            )?;
-            break;
         }
         run_agent(
             cli,
@@ -371,14 +592,18 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
     if !line.starts_with('/') {
         return start_interactive_run(cli, line, effective_path(cli, Path::new(".")), None, tui);
     }
-    let (command, arguments) = line.split_once(char::is_whitespace).unwrap_or((&line, ""));
-    let arguments = arguments.trim();
+    let Some((command, arguments)) = parse_interactive_command(&line) else {
+        let command = line.split_whitespace().next().unwrap_or(&line);
+        return Err(format!(
+            "unknown command {command}; type /help for available commands"
+        ));
+    };
     match command {
-        "/help" => {
-            tui.add_activity("Commands: /run <task>, /resume <id> [task], /inspect [path], /sessions, /status [id], /diff [file], /undo [id], /config, /model, /clear, /cancel, /exit".to_owned());
+        InteractiveCommand::Help => {
+            tui.add_activity(interactive_help(false));
             Ok(())
         }
-        "/run" => {
+        InteractiveCommand::Run => {
             if arguments.is_empty() {
                 Err("usage: /run <task>".to_owned())
             } else {
@@ -391,7 +616,7 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
                 )
             }
         }
-        "/resume" => {
+        InteractiveCommand::Resume => {
             let mut fields = arguments.splitn(2, char::is_whitespace);
             let id = fields.next().unwrap_or_default();
             if id.is_empty() {
@@ -411,19 +636,19 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
                 .to_owned();
             start_interactive_run(cli, task, existing.workspace_root, Some(session_id), tui)
         }
-        "/clear" => {
+        InteractiveCommand::Clear => {
             tui.clear_activity();
             Ok(())
         }
-        "/cancel" => {
+        InteractiveCommand::Cancel => {
             tui.cancel_run();
             Ok(())
         }
-        "/exit" | "/quit" => {
+        InteractiveCommand::Exit => {
             tui.request_exit();
             Ok(())
         }
-        "/inspect" => {
+        InteractiveCommand::Inspect => {
             let path = if arguments.is_empty() {
                 effective_path(cli, Path::new("."))
             } else {
@@ -431,7 +656,7 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
             };
             run_visible_command(tui, || inspect(cli, &path))
         }
-        "/sessions" => {
+        InteractiveCommand::Sessions => {
             let limit = if arguments.is_empty() {
                 20
             } else {
@@ -441,21 +666,24 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
             };
             run_visible_command(tui, || sessions(cli, limit))
         }
-        "/status" => run_visible_command(tui, || {
+        InteractiveCommand::Status => run_visible_command(tui, || {
             status(cli, (!arguments.is_empty()).then_some(arguments), None)
         }),
-        "/diff" => {
+        InteractiveCommand::Diff => {
             let file = (!arguments.is_empty()).then(|| PathBuf::from(arguments.trim_matches('"')));
             run_visible_command(tui, || diff(cli, file.as_deref(), None))
         }
-        "/undo" => run_visible_command(tui, || {
+        InteractiveCommand::Undo => run_visible_command(tui, || {
             undo(cli, (!arguments.is_empty()).then_some(arguments), None)
         }),
-        "/config" => run_visible_command(tui, || config_command(cli, None)),
-        "/model" => run_visible_command(tui, || model_info(cli)),
-        _ => Err(format!(
-            "unknown command {command}; type /help for available commands"
-        )),
+        InteractiveCommand::Config => run_visible_command(tui, || config_command(cli, None)),
+        InteractiveCommand::Model => run_visible_command(tui, || model_info(cli)),
+        InteractiveCommand::Mode => {
+            if !arguments.is_empty() {
+                return Err("usage: /mode (shows the workspace-configured mode)".to_owned());
+            }
+            run_visible_command(tui, || mode_info(cli))
+        }
     }
 }
 
@@ -587,6 +815,29 @@ fn model_info(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+fn mode_info(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let mode = configured_mode(cli)?;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "execution_mode": mode }))?
+        );
+    } else {
+        println!("execution mode: {mode}");
+    }
+    Ok(())
+}
+
+fn configured_mode(cli: &Cli) -> Result<&'static str, Box<dyn std::error::Error>> {
+    let workspace = discover_workspace(&effective_path(cli, Path::new(".")))?;
+    let project_root = workspace
+        .repository_root
+        .unwrap_or_else(|| workspace.current_directory.clone());
+    Ok(execution_mode_name(
+        policy_for_workspace(&project_root)?.mode(),
+    ))
 }
 
 fn sessions(cli: &Cli, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -1336,4 +1587,73 @@ fn print_summary(description: &harness_core::WorkspaceDescription) {
         "Test commands: {:?}",
         description.configuration.commands.test
     );
+}
+
+#[cfg(test)]
+mod interactive_command_tests {
+    use super::*;
+
+    #[test]
+    fn advertised_commands_have_a_dispatch_target_and_parse_arguments() {
+        for definition in INTERACTIVE_COMMANDS {
+            let (command, _) = parse_interactive_command(definition.usage)
+                .unwrap_or_else(|| panic!("{} should parse", definition.usage));
+            assert_eq!(command, definition.command, "{}", definition.name);
+        }
+
+        assert_eq!(
+            parse_interactive_command("  /resume session-123  finish the remaining work  "),
+            Some((
+                InteractiveCommand::Resume,
+                "session-123  finish the remaining work"
+            )),
+        );
+        assert_eq!(
+            parse_interactive_command("/quit"),
+            Some((InteractiveCommand::Exit, "")),
+        );
+        assert_eq!(parse_interactive_command("/not-a-command"), None);
+        assert_eq!(parse_interactive_command("ordinary task"), None);
+    }
+
+    #[test]
+    fn help_uses_the_command_catalog_and_limits_plain_mode_to_supported_commands() {
+        let full_help = interactive_help(false);
+        for command in [
+            "/help", "/model", "/mode", "/diff", "/undo", "/resume", "/clear", "/exit",
+        ] {
+            assert!(
+                full_help.contains(command),
+                "missing {command} from {full_help}"
+            );
+        }
+        let plain_help = interactive_help(true);
+        assert!(plain_help.contains("/mode"));
+        assert!(!plain_help.contains("/cancel"));
+        assert!(!plain_help.contains("/clear"));
+    }
+
+    #[test]
+    fn mode_command_reads_the_configured_workspace_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let agent_config = directory.path().join(".agent");
+        std::fs::create_dir_all(&agent_config).unwrap();
+        std::fs::write(
+            agent_config.join("config.toml"),
+            "[policy]\nmode = 'safe'\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            workspace: directory.path().to_path_buf(),
+            log_level: "info".to_owned(),
+            model_provider: None,
+            model: None,
+            session_root: directory.path().join("sessions"),
+            compaction_threshold: None,
+            json: false,
+            yes: false,
+            command: None,
+        };
+        assert_eq!(configured_mode(&cli).unwrap(), "safe");
+    }
 }

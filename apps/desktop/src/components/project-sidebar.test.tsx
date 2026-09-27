@@ -111,6 +111,14 @@ describe("project session sidebar", () => {
     expect(selected.getAllByTestId("sidebar-session").some((button) => button.getAttribute("aria-current") === "true")).toBe(true);
   });
 
+  it("opens and focuses search from the centralized keyboard shortcut request", () => {
+    const base = props(makeSessions(10));
+    const view = render(<ProjectSidebar {...base} searchRequest={0} />);
+    view.rerender(<ProjectSidebar {...base} searchRequest={1} />);
+    const search = screen.getByRole("searchbox", { name: "Filter sessions" });
+    expect(document.activeElement).toBe(search);
+  });
+
   it("provides project and session context actions", () => {
     render(<ProjectSidebar {...props(makeSessions(10))} />);
     fireEvent.contextMenu(screen.getByRole("button", { name: "Collapse Octran Website" }));
