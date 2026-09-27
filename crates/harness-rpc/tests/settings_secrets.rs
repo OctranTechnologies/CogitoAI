@@ -228,6 +228,31 @@ fn unknown_providers_and_modes_are_rejected() {
         settings::model_view(&mock, &EnvironmentSecretStore).provider,
         "Mock (offline)"
     );
+    let anthropic = ModelConfig::for_provider(ProviderKind::Anthropic);
+    assert_eq!(
+        settings::model_view(&anthropic, &EnvironmentSecretStore).provider,
+        "Anthropic"
+    );
+    assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
+    assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
+}
+
+#[test]
+fn anthropic_connection_status_uses_presence_only() {
+    let store = FakeSecretStore {
+        env_var: "ANTHROPIC_API_KEY".to_owned(),
+        secret: Some("anthropic-secret-not-for-rpc".to_owned()),
+    };
+    let model = ModelConfig::for_provider(ProviderKind::Anthropic);
+
+    let result = settings::test_model_connection(&model, &store);
+
+    assert!(result.ok);
+    assert!(!result.skipped);
+    assert!(result.message.contains("ANTHROPIC_API_KEY"));
+    assert!(!to_string(&result)
+        .unwrap()
+        .contains("anthropic-secret-not-for-rpc"));
 }
 
 #[test]

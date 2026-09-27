@@ -1,3 +1,4 @@
+mod anthropic;
 mod mock;
 mod openai;
 mod protocol;
@@ -9,6 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use anthropic::{AnthropicMessagesTransport, AnthropicProvider};
 pub use mock::{DeterministicMockProvider, MockProvider, MockScenario, ScriptedMockProvider};
 pub use openai::{OpenAIProvider, OpenAIResponsesTransport, OpenAiProvider};
 
@@ -492,6 +494,7 @@ pub trait ModelProvider: Send + Sync {
 pub enum ProviderKind {
     Mock,
     OpenAi,
+    Anthropic,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -505,17 +508,63 @@ pub struct ModelConfig {
 
 impl Default for ModelConfig {
     fn default() -> Self {
-        Self {
-            provider: ProviderKind::Mock,
-            model: "mock".to_owned(),
-            api_key_env: "OPENAI_API_KEY".to_owned(),
-            base_url: "https://api.openai.com/v1".to_owned(),
-            context_window: Some(8_192),
-        }
+        Self::for_provider(ProviderKind::Mock)
     }
 }
 
 impl ModelConfig {
+    /// Sensible provider-specific defaults for local runtime configuration.
+    /// Explicit model IDs remain valid even when absent from local metadata.
+    pub fn for_provider(provider: ProviderKind) -> Self {
+        match provider {
+            ProviderKind::Mock => Self {
+                provider,
+                model: "mock".to_owned(),
+                api_key_env: "OPENAI_API_KEY".to_owned(),
+                base_url: "https://api.openai.com/v1".to_owned(),
+                context_window: Some(8_192),
+            },
+            ProviderKind::OpenAi => Self {
+                provider,
+                model: "gpt-4.1-mini".to_owned(),
+                api_key_env: "OPENAI_API_KEY".to_owned(),
+                base_url: "https://api.openai.com/v1".to_owned(),
+                context_window: None,
+            },
+            ProviderKind::Anthropic => Self {
+                provider,
+                model: "claude-sonnet-4-6".to_owned(),
+                api_key_env: "ANTHROPIC_API_KEY".to_owned(),
+                base_url: "https://api.anthropic.com/v1".to_owned(),
+                context_window: None,
+            },
+        }
+    }
+
+    /// Changes providers and refreshes only fields that still use the old
+    /// provider's defaults. User-specified model IDs, endpoints, and key-env
+    /// names survive a provider switch.
+    pub fn select_provider(&mut self, provider: ProviderKind) {
+        if provider == self.provider {
+            return;
+        }
+        let previous = Self::for_provider(self.provider);
+        let next = Self::for_provider(provider);
+        if self.model == previous.model {
+            self.model.clone_from(&next.model);
+        }
+        if self.api_key_env == previous.api_key_env {
+            self.api_key_env.clone_from(&next.api_key_env);
+        }
+        if self.base_url == previous.base_url {
+            self.base_url.clone_from(&next.base_url);
+        }
+        if self.context_window == previous.context_window {
+            self.context_window = next.context_window;
+        }
+        self.provider = provider;
+    }
+
     /// Rejects settings that would leave the runtime unable to reach a model.
     ///
     /// Validation happens before anything is applied so an invalid value from a
@@ -554,12 +603,13 @@ impl ModelConfig {
     }
 
     pub fn from_env() -> Self {
-        let defaults = Self::default();
+        let provider = std::env::var("COGITO_MODEL_PROVIDER")
+            .ok()
+            .and_then(|value| serde_json::from_value(serde_json::Value::String(value)).ok())
+            .unwrap_or(ProviderKind::Mock);
+        let defaults = Self::for_provider(provider);
         Self {
-            provider: std::env::var("COGITO_MODEL_PROVIDER")
-                .ok()
-                .and_then(|value| serde_json::from_value(serde_json::Value::String(value)).ok())
-                .unwrap_or(defaults.provider),
+            provider,
             model: std::env::var("COGITO_MODEL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -581,6 +631,7 @@ pub fn provider_from_config(config: &ModelConfig) -> Result<Box<dyn ModelProvide
     match config.provider {
         ProviderKind::Mock => Ok(Box::new(MockProvider::new(config.model.clone()))),
         ProviderKind::OpenAi => Ok(Box::new(OpenAiProvider::from_config(config)?)),
+        ProviderKind::Anthropic => Ok(Box::new(AnthropicProvider::from_config(config)?)),
     }
 }
 

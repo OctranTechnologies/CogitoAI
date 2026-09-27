@@ -4,6 +4,7 @@
 //! interpretation. This module only handles generic HTTP requests, bounded
 //! retries before a response starts, and SSE framing.
 
+use std::error::Error as _;
 use std::io::{BufRead, ErrorKind};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,12 +70,14 @@ where
 fn is_transient(error: &ureq::Error) -> bool {
     match error {
         ureq::Error::Status(status, _) => *status == 408 || *status == 429 || *status >= 500,
-        ureq::Error::Transport(error) => matches!(
-            error.kind(),
-            ureq::ErrorKind::Dns
-                | ureq::ErrorKind::ConnectionFailed
-                | ureq::ErrorKind::ProxyConnect
-        ),
+        ureq::Error::Transport(error) => {
+            matches!(
+                error.kind(),
+                ureq::ErrorKind::Dns
+                    | ureq::ErrorKind::ConnectionFailed
+                    | ureq::ErrorKind::ProxyConnect
+            ) || is_io_timeout(error)
+        }
     }
 }
 
@@ -84,8 +87,18 @@ fn map_ureq_error(provider: &'static str, error: ureq::Error) -> ProviderError {
             provider,
             status: Some(status),
         },
+        ureq::Error::Transport(error) if is_io_timeout(&error) => {
+            ProviderError::Timeout { provider }
+        }
         ureq::Error::Transport(_) => ProviderError::Transport { provider },
     }
+}
+
+fn is_io_timeout(error: &ureq::Transport) -> bool {
+    error
+        .source()
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .is_some_and(|source| source.kind() == std::io::ErrorKind::TimedOut)
 }
 
 /// Delivers each SSE `data:` payload. Return `false` from the callback to stop

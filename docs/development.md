@@ -60,18 +60,17 @@ change, not a refactor.
 
 ## Adding a model provider
 
-A provider is anything implementing `ModelProvider` in
+A provider implements the normalized `ModelProvider` trait in
 `crates/harness-models/src/lib.rs`:
 
 ```rust
 pub trait ModelProvider: Send + Sync {
-    fn name(&self) -> &str;
-    fn capabilities(&self) -> ModelCapabilities;
+    fn descriptor(&self) -> ModelDescriptor;
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError>;
     fn stream(
         &self,
         request: &ModelRequest,
-        on_delta: &mut dyn FnMut(StreamDelta) -> Result<(), ProviderError>,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError>;
 }
 ```
@@ -79,21 +78,22 @@ pub trait ModelProvider: Send + Sync {
 To add one:
 
 1. Implement the trait in `harness-models`. Translate the vendor's wire format
-   into `ModelResponse` and never let a vendor type escape the crate. Report
-   failures as `ProviderError` variants rather than panicking.
+   into canonical responses and normalized events. Keep vendor types private to
+   the adapter and report failures as `ProviderError` variants.
 2. Add a variant to `ProviderKind`. It is `#[serde(rename_all = "lowercase")]`, so
    the variant name is the configuration value.
 3. Register the constructor in `provider_from_config`, which both clients call.
-4. Extend `ModelConfig` if the provider needs settings, and add an environment
-   variable in `harness-core` with a sensible default. Never add a field that
-   holds a secret value.
-5. Decide the credential story: read the key from the environment variable named
-   by `api_key_env` inside the provider's constructor and keep it there.
-6. Add a test that exercises `complete` and `stream` against a recorded fixture
-   rather than a live endpoint, so the suite stays offline.
+4. Add provider defaults to `ModelConfig` when needed. Keep only the API-key
+   environment variable name in configuration, never the secret value.
+5. Read the key from `api_key_env` inside the provider constructor and keep it
+   in the private transport. Redact it from Debug output and errors.
+6. Add mock-server coverage for `complete`, streaming, tools, errors, and
+   cancellation rather than requiring a live endpoint.
 
-`ScriptedMockProvider` is the reference implementation for deterministic tests,
-and `OpenAiProvider` is the reference for a real HTTP provider.
+`ScriptedMockProvider` is the reference implementation for deterministic tests.
+`OpenAIProvider` and `AnthropicProvider` are the real HTTP adapter references;
+both share the normalized model contract but keep Responses and Messages wire
+protocols private to their respective transports.
 
 ## Adding a tool
 

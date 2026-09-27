@@ -142,7 +142,7 @@ mock that executes a fixed, scripted workflow through the real agent loop, polic
 engine, checkpoint store, and verification commands, so you can exercise the whole
 system offline.
 
-To use OpenAI, create an API key in the OpenAI API dashboard, then set it in the
+To use OpenAI or Anthropic, create an API key with the provider and set it in the
 environment of the process that starts Harness. Never put the key in project
 configuration, a session file, or a command-line argument.
 
@@ -162,12 +162,44 @@ export COGITO_MODEL="gpt-4o-mini" # replace with any model ID available to your 
 cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
+To use Anthropic, set `ANTHROPIC_API_KEY` and select a Claude model ID. This
+example uses a model with adaptive thinking support; model IDs remain freely
+configurable:
+
+```powershell
+$env:ANTHROPIC_API_KEY = "<your-key>"
+$env:COGITO_MODEL_PROVIDER = "anthropic"
+$env:COGITO_MODEL = "claude-sonnet-4-6"
+cargo run -p harness-cli -- run "Summarize the repository"
+```
+
+```bash
+export ANTHROPIC_API_KEY="<your-key>"
+export COGITO_MODEL_PROVIDER="anthropic"
+export COGITO_MODEL="claude-sonnet-4-6"
+cargo run -p harness-cli -- run "Summarize the repository"
+```
+
+For the desktop, the key must be present in the runtime process environment.
+In one terminal, configure the provider and start the local runtime:
+
+```powershell
+$env:ANTHROPIC_API_KEY = "<your-key>"
+$env:COGITO_MODEL_PROVIDER = "anthropic"
+$env:COGITO_MODEL = "claude-sonnet-4-6"
+cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+```
+
+Then start the desktop in another terminal using the [desktop development
+instructions](apps/desktop/README.md#development). API keys are never sent to
+the desktop client.
+
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `COGITO_MODEL_PROVIDER` | `mock` or `openai` | `mock` |
+| `COGITO_MODEL_PROVIDER` | `mock`, `openai`, or `anthropic` | `mock` |
 | `COGITO_MODEL` | Model name passed to the provider | provider default |
-| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | `OPENAI_API_KEY` |
-| `COGITO_MODEL_BASE_URL` | OpenAI API root; the provider calls its `/responses` and `/models` endpoints | `https://api.openai.com/v1` |
+| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, by provider |
+| `COGITO_MODEL_BASE_URL` | Provider API root; OpenAI uses `/responses` and `/models`, Anthropic uses `/messages` and `/models` | Provider API root |
 | `COGITO_MOCK_REPAIR` | Mock-only test hook; see [Testing the repair loop](#testing-the-repair-loop) | unset |
 | `RUST_LOG` | Runtime log level for the RPC runtime | `info` |
 
@@ -176,13 +208,18 @@ API, never placed in an RPC frame, and never logged; clients are told only wheth
 a credential is present and which variable holds it. The harness stores no key on
 disk and implements no home-grown encryption.
 
-The OpenAI adapter uses the Responses API for both streaming and function calls.
-`COGITO_MODEL` is sent as configured, including model IDs that are not in the
-local discovery catalog. Model discovery calls `GET /models` and returns only
-families with local coding-agent capability metadata; OpenAI's listing endpoint
-does not itself describe tool support or coding suitability. A custom
-`COGITO_MODEL_BASE_URL` must implement the Responses API shape at `/responses`;
-model discovery additionally requires the model listing shape at `/models`.
+The OpenAI adapter uses the Responses API for streaming and function calls. The
+Anthropic adapter uses the Messages API, native tool-use/result blocks, and its
+SSE event stream. `COGITO_MODEL` is sent as configured, including model IDs that
+are not in the local discovery catalog. Both providers filter their official
+model-list endpoints through local capability metadata because those endpoints
+do not describe coding suitability or all runtime features. A custom
+`COGITO_MODEL_BASE_URL` must implement the selected provider's API shape; model
+discovery additionally requires its `/models` listing endpoint. Anthropic uses
+the official `2023-06-01` API version header. Its adaptive versus manual
+thinking parameters and supported effort levels are selected from model
+capability metadata; signed thinking blocks needed for tool continuation remain
+inside the provider adapter.
 
 ## Current v0 capabilities
 

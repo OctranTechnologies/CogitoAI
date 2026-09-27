@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use harness_models::{
-    ContentBlock, DeterministicMockProvider, FinishReason, Message, MockProvider, MockScenario,
-    ModelProvider, ModelRequest, ModelStreamEvent, OpenAiProvider, ProviderError, Role, ToolCall,
-    ToolDefinition,
+    AnthropicProvider, ContentBlock, DeterministicMockProvider, FinishReason, Message,
+    MockProvider, MockScenario, ModelConfig, ModelProvider, ModelRequest, ModelStreamEvent,
+    OpenAiProvider, ProviderError, ProviderKind, Role, ToolCall, ToolDefinition,
 };
 use serde_json::json;
 
@@ -144,6 +144,54 @@ fn missing_real_provider_credentials_fail_without_exposing_a_key() {
         }
     ));
     assert!(!error.to_string().contains("Bearer"));
+}
+
+#[test]
+fn anthropic_model_metadata_and_provider_defaults_are_model_aware() {
+    let known = AnthropicProvider::with_api_key(
+        "https://api.anthropic.com/v1",
+        "claude-sonnet-4-6",
+        "ANTHROPIC_API_KEY",
+        "test-key",
+    );
+    let descriptor = known.descriptor();
+    assert_eq!(descriptor.provider, "anthropic");
+    assert!(descriptor.capabilities.streaming);
+    assert!(descriptor.capabilities.tool_calling);
+    assert!(descriptor.capabilities.parallel_tool_calls);
+    assert!(descriptor.capabilities.reasoning);
+    assert!(descriptor.capabilities.configurable_reasoning_effort);
+
+    let unknown = AnthropicProvider::with_api_key(
+        "https://api.anthropic.com/v1",
+        "claude-private-experiment",
+        "ANTHROPIC_API_KEY",
+        "test-key",
+    );
+    assert!(!unknown.descriptor().capabilities.reasoning);
+    assert!(!unknown.descriptor().capabilities.image_input);
+    assert!(unknown.descriptor().capabilities.tool_calling);
+
+    let anthropic_defaults = ModelConfig::for_provider(ProviderKind::Anthropic);
+    assert_eq!(anthropic_defaults.model, "claude-sonnet-4-6");
+    assert_eq!(anthropic_defaults.api_key_env, "ANTHROPIC_API_KEY");
+    assert_eq!(anthropic_defaults.base_url, "https://api.anthropic.com/v1");
+    assert_eq!(anthropic_defaults.context_window, None);
+
+    let mut config = ModelConfig::default();
+    config.select_provider(ProviderKind::Anthropic);
+    assert_eq!(config.model, anthropic_defaults.model);
+    assert_eq!(config.api_key_env, anthropic_defaults.api_key_env);
+    assert_eq!(config.base_url, anthropic_defaults.base_url);
+
+    let mut customized = anthropic_defaults.clone();
+    customized.model = "claude-custom-model-id".to_owned();
+    customized.base_url = "https://gateway.example/v1".to_owned();
+    customized.api_key_env = "CUSTOM_ANTHROPIC_KEY".to_owned();
+    customized.select_provider(ProviderKind::OpenAi);
+    assert_eq!(customized.model, "claude-custom-model-id");
+    assert_eq!(customized.base_url, "https://gateway.example/v1");
+    assert_eq!(customized.api_key_env, "CUSTOM_ANTHROPIC_KEY");
 }
 
 #[test]

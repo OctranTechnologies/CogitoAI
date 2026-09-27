@@ -9,8 +9,9 @@ use harness_agent::{
 };
 use harness_context::{ContextBudget, ContextBuilder, WorkspaceMetadata};
 use harness_models::{
-    ContentBlock, ModelCapabilities, ModelDescriptor, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamEvent, OpenAIProvider, ProviderError, ScriptedMockProvider, ToolCall, Usage,
+    AnthropicProvider, ContentBlock, ModelCapabilities, ModelDescriptor, ModelProvider,
+    ModelRequest, ModelResponse, ModelStreamEvent, OpenAIProvider, ProviderError,
+    ScriptedMockProvider, ToolCall, Usage,
 };
 use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
 use harness_session::{JsonlSessionStore, SessionStatus, SessionStore};
@@ -630,6 +631,153 @@ fn openai_mock_tool_use_round_trip_executes_and_returns_tool_observation() {
         .expect("follow-up prompt is text")
         .contains("agent-visible-file-content"));
     assert_eq!(requests[0]["body"]["tools"][0]["name"], "read_file");
+}
+
+#[test]
+fn anthropic_messages_tool_use_runs_through_policy_and_workspace_tool() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    std::fs::write(
+        workspace.join("readme.txt"),
+        "anthropic-agent-visible-content",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Anthropic server");
+    let address = listener.local_addr().expect("mock server address");
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        for turn in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept Messages request");
+            let captured = read_http_request_for_response(&mut stream);
+            server_requests
+                .lock()
+                .expect("Anthropic requests lock")
+                .push(captured);
+            let events = if turn == 0 {
+                vec![
+                    serde_json::json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg-tool",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-6",
+                            "content": [],
+                            "stop_reason": null,
+                            "usage": { "input_tokens": 32, "output_tokens": 1 }
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "tool_use", "id": "toolu-readme", "name": "read_file", "input": {} }
+                    }),
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"readme.txt\"}" }
+                    }),
+                    serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+                    serde_json::json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "tool_use" },
+                        "usage": { "output_tokens": 6 }
+                    }),
+                    serde_json::json!({ "type": "message_stop" }),
+                ]
+            } else {
+                vec![
+                    serde_json::json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg-final",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-6",
+                            "content": [],
+                            "stop_reason": null,
+                            "usage": { "input_tokens": 48, "output_tokens": 1 }
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" }
+                    }),
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "text_delta", "text": "The file contains anthropic-agent-visible-content." }
+                    }),
+                    serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+                    serde_json::json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "end_turn" },
+                        "usage": { "output_tokens": 11 }
+                    }),
+                    serde_json::json!({ "type": "message_stop" }),
+                ]
+            };
+            respond_with_sse(&mut stream, &events);
+        }
+    });
+
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let session_store: Arc<dyn SessionStore> = sessions.clone();
+    let provider = Arc::new(AnthropicProvider::with_api_key(
+        format!("http://{address}/v1"),
+        "claude-sonnet-4-6",
+        "MOCK_ANTHROPIC_KEY",
+        "anthropic-agent-test-key",
+    ));
+    let runner = AgentRunner::new(
+        provider,
+        "claude-sonnet-4-6",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(AllowAllPolicy),
+        session_store,
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    );
+
+    let outcome = runner
+        .run(
+            &AgentTask {
+                workspace_root: workspace.to_path_buf(),
+                user_task: "Read readme.txt and report its contents".to_owned(),
+                ..AgentTask::default()
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    server.join().expect("mock Anthropic server");
+
+    assert_eq!(outcome.tool_calls, 1);
+    assert_eq!(outcome.turns, 2);
+    assert_eq!(
+        outcome.final_message,
+        "The file contains anthropic-agent-visible-content."
+    );
+    let session = sessions.load(&outcome.session_id).unwrap();
+    assert!(!serde_json::to_string(&session.events)
+        .unwrap()
+        .contains("anthropic-agent-test-key"));
+    let requests = requests.lock().expect("Anthropic requests lock");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]["headers"]
+        .as_str()
+        .unwrap()
+        .to_ascii_lowercase()
+        .contains("anthropic-version: 2023-06-01"));
+    assert_eq!(requests[0]["body"]["tools"][0]["name"], "read_file");
+    assert_eq!(requests[0]["body"]["stream"], true);
+    let follow_up = &requests[1]["body"]["messages"][0]["content"][0]["text"];
+    assert!(follow_up
+        .as_str()
+        .expect("follow-up is rebuilt as a text prompt")
+        .contains("anthropic-agent-visible-content"));
 }
 
 fn read_http_request_for_response(stream: &mut TcpStream) -> serde_json::Value {

@@ -747,13 +747,14 @@ fn inspect(cli: &Cli, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn model_config(cli: &Cli) -> Result<ModelConfig, ProviderError> {
     let mut config = ModelConfig::from_env();
     if let Some(provider) = &cli.model_provider {
-        config.provider =
+        let provider =
             serde_json::from_value(Value::String(provider.clone())).map_err(|error| {
                 ProviderError::InvalidResponse {
                     provider: "configuration",
                     reason: error.to_string(),
                 }
             })?;
+        config.select_provider(provider);
     }
     if let Some(model) = &cli.model {
         config.model = model.clone();

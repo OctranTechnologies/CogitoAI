@@ -272,6 +272,11 @@ fn available_models(provider: &ProviderKind) -> Vec<String> {
             "gpt-4.1-mini".to_owned(),
             "o3-mini".to_owned(),
         ],
+        ProviderKind::Anthropic => vec![
+            "claude-sonnet-4-6".to_owned(),
+            "claude-opus-4-6".to_owned(),
+            "claude-haiku-4-5".to_owned(),
+        ],
     }
 }
 
@@ -279,6 +284,7 @@ fn parse_provider(value: &str) -> Result<ProviderKind, SettingsError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "mock" => Ok(ProviderKind::Mock),
         "openai" | "open_ai" | "open-ai" => Ok(ProviderKind::OpenAi),
+        "anthropic" => Ok(ProviderKind::Anthropic),
         other => Err(SettingsError::UnknownProvider(other.to_owned())),
     }
 }
@@ -287,6 +293,7 @@ fn provider_label(provider: &ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Mock => "Mock (offline)",
         ProviderKind::OpenAi => "OpenAI",
+        ProviderKind::Anthropic => "Anthropic",
     }
 }
 
@@ -485,7 +492,7 @@ pub fn model_view(model: &ModelConfig, store: &dyn SecretStore) -> ModelSettings
         // The mock provider needs no credential, so it is always "configured".
         configured: match model.provider {
             ProviderKind::Mock => true,
-            ProviderKind::OpenAi => credential.available,
+            ProviderKind::OpenAi | ProviderKind::Anthropic => credential.available,
         },
         available_models: available_models(&model.provider),
         credential,
@@ -650,7 +657,8 @@ pub fn apply_model(
 ) -> Result<ModelConfig, SettingsError> {
     let mut next = runtime.model();
     if let Some(provider) = &request.provider {
-        next.provider = parse_provider(provider)?;
+        let provider = parse_provider(provider)?;
+        next.select_provider(provider);
     }
     if let Some(model) = &request.model {
         next.model = model.trim().to_owned();
@@ -703,6 +711,23 @@ pub fn test_model_connection(model: &ModelConfig, store: &dyn SecretStore) -> Co
             message: "The mock provider runs locally; no connection is required.".to_owned(),
         },
         ProviderKind::OpenAi => {
+            if !credential.available {
+                return ConnectionTestResult {
+                    ok: false,
+                    skipped: true,
+                    message: format!(
+                        "No credential found. Set {} in the runtime environment.",
+                        credential.env_var
+                    ),
+                };
+            }
+            ConnectionTestResult {
+                ok: true,
+                skipped: false,
+                message: format!("Ready. The runtime can read {}.", credential.env_var),
+            }
+        }
+        ProviderKind::Anthropic => {
             if !credential.available {
                 return ConnectionTestResult {
                     ok: false,

@@ -137,14 +137,28 @@ API keys are read from the runtime process environment and are never sent to the
 desktop. The Models screen shows only whether a credential is configured and
 which environment variable holds it; the value is never displayed, editable, or
 logged. The runtime keeps no key in its configuration and does not implement any
-home-grown encryption.
+home-grown encryption. To run against Anthropic, set the key and model on the
+runtime process before starting it, then connect the desktop shell as usual:
+
+```powershell
+$env:ANTHROPIC_API_KEY = "<your-key>"
+$env:COGITO_MODEL_PROVIDER = "anthropic"
+$env:COGITO_MODEL = "claude-sonnet-4-6"
+cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+```
+
+For OpenAI, use `OPENAI_API_KEY` and `COGITO_MODEL_PROVIDER=openai`. Start the
+desktop from a second terminal with the commands under [Development](#development).
+The runtime defaults Anthropic requests to `https://api.anthropic.com/v1` and
+reads `ANTHROPIC_API_KEY`; `COGITO_MODEL_BASE_URL` and
+`COGITO_MODEL_API_KEY_ENV` override those defaults.
 
 | Variable | Purpose |
 | --- | --- |
-| `COGITO_MODEL_PROVIDER` | `mock` or `openai` |
+| `COGITO_MODEL_PROVIDER` | `mock`, `openai`, or `anthropic` |
 | `COGITO_MODEL` | Model name |
-| `COGITO_MODEL_API_KEY_ENV` | Variable holding the API key (default `OPENAI_API_KEY`) |
-| `COGITO_MODEL_BASE_URL` | Provider base URL |
+| `COGITO_MODEL_API_KEY_ENV` | Variable holding the API key (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY` by provider) |
+| `COGITO_MODEL_BASE_URL` | Provider API root (`https://api.openai.com/v1` or `https://api.anthropic.com/v1` by provider) |
 | `RUST_LOG` | Runtime log level |
 
 ## Design system
@@ -209,4 +223,3 @@ under `target/debug/` rather than a packaged installer.
 
 The v0 transport is loopback-only and unauthenticated. Do not bind it to a
 public interface.
-

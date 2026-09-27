@@ -100,18 +100,24 @@ Provider facades are responsible for selecting a private protocol adapter for
 the configured model. The private `ProtocolAdapter` boundary and shared HTTP
 JSON/SSE framing utilities allow one provider facade to route models to
 different protocols without leaking JSON payloads into runtime types. The
-native OpenAI adapter uses `OpenAIResponsesTransport` and the Responses API for
-streaming text, function calls, tool results, usage, and reasoning effort. The
-transport normalizes API errors, retries only transient failures before stream
-consumption, and checks cancellation while waiting for SSE data. API keys are
-held only in memory and are not included in adapter errors or events. OpenAI's
-`GET /models` results are filtered through local capability metadata because the
-listing endpoint does not report tool or Responses API support; explicitly
-configured model IDs remain usable even when they are not in that metadata.
-Deterministic mock adapters cover text, single and multiple tool calls, and a
-mid-stream failure. Anthropic, Gemini, OpenCode Zen, and OpenCode Go are not
-implemented yet; future Zen/Go catalog entries can choose Responses, Chat
-Completions, or Messages adapters individually.
+native OpenAI adapter uses `OpenAIResponsesTransport` and the Responses API
+for streaming text, function calls, tool results, usage, and reasoning effort.
+The Anthropic adapter uses `AnthropicMessagesTransport` and Messages API content
+blocks for streamed text, `tool_use`, `tool_result`, usage, and model-aware
+thinking controls. Both transports normalize API errors, retry only transient
+failures before stream consumption, and check cancellation while waiting for SSE
+data. API keys are held only in memory and are not included in adapter errors or
+events. Anthropic thinking signatures required for tool continuation are held in
+private in-memory adapter state and replayed without entering canonical events or
+session records. Both providers filter their official `GET /models` results
+through local capability metadata because the listing endpoints do not report
+tool or coding-agent suitability; explicitly configured model IDs remain usable
+even when they are not in that metadata. Anthropic thinking style and effort
+controls are selected from model-specific local metadata rather than inferred
+from the provider name alone. Deterministic mock adapters cover text, single and
+multiple tool calls, and a mid-stream failure. Gemini, OpenCode Zen, and
+OpenCode Go are not implemented yet; future Zen/Go catalog entries can choose
+Responses, Chat Completions, or Messages adapters individually.
 
 Capabilities describe what the selected model adapter can substantiate, not
 what a provider family might support in general. Unknown limits and features
