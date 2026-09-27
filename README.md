@@ -321,7 +321,15 @@ requires terminal stdin and stdout; for pipes, scripts, and automation, keep usi
 the existing commands such as `harness run` and `--json`. The interactive UI cannot
 be combined with `--json`.
 
+The TUI runs one foreground task at a time. It does not keep tasks running in the
+background after the interface exits. Use the existing `run`, `resume`, and
+`--json` commands for scripts and automation.
+
 ## Running the desktop application
+
+Prerequisites are Rust 1.78+, Node.js 20+, pnpm 10+, and the Tauri 2 platform
+dependencies: WebView2 on Windows, Xcode command-line tools on macOS, or
+WebKitGTK development packages on Linux.
 
 The desktop is a client: it does not start or own the runtime, so run the
 development runtime first. In one terminal, from the repository root:
@@ -343,6 +351,9 @@ pnpm tauri dev
 
 `pnpm tauri dev` starts the Vite dev server itself and compiles the Rust shell. In
 the app, enter the runtime address and a repository path, then select Connect.
+The v0 client connects to one local runtime at a time; the runtime and desktop
+communicate over an unauthenticated loopback RPC endpoint. Keep that endpoint on
+the local machine.
 
 The desktop command palette opens with `Ctrl+K` or `Ctrl+Shift+P` (use `Cmd` on
 macOS). It can create a task, open a project, resume a session, switch model or
@@ -359,10 +370,11 @@ pnpm tauri build --debug
 ```
 
 Installer bundling is disabled in `tauri.conf.json` (`bundle.active` is `false`),
-so this produces an executable at `<repo-root>/target/debug/cogitoai-desktop`
-rather than a packaged installer. The interactive terminal requires a real terminal
-emulator to answer the console host's cursor-position query, which xterm.js does;
-the CLI's non-interactive shell tool does not.
+so this produces an executable under `<repo-root>/target/debug/`
+(`cogitoai-desktop.exe` on Windows) rather than a packaged installer. The
+interactive terminal requires a real terminal emulator to answer the console
+host's cursor-position query, which xterm.js does; the CLI's non-interactive shell
+tool does not.
 
 See [`apps/desktop/README.md`](apps/desktop/README.md) for the desktop-specific
 behaviour, including the human-versus-agent terminal boundary.

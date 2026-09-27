@@ -74,7 +74,7 @@ export function Inspector({
 }) {
   return (
     <aside
-      className="flex w-[420px] shrink-0 flex-col border-l border-line bg-panel"
+      className="absolute inset-y-0 right-0 z-20 flex w-[min(420px,100%)] shrink-0 flex-col border-l border-line bg-panel shadow-overlay xl:static xl:z-auto xl:w-[420px] xl:shadow-none"
       data-testid="inspector"
       aria-label="Inspector"
     >

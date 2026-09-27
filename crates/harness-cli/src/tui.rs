@@ -838,7 +838,16 @@ fn draw_ui(frame: &mut Frame<'_>, state: &AppState, colors: bool) {
     let area = frame.area();
     let input_rows = state.input.lines().count().clamp(1, 5) as u16;
     let footer_height = 3.min(area.height);
-    let header_height = 4.min(area.height.saturating_sub(footer_height + 4)).max(1);
+    let notice = state
+        .startup
+        .notice
+        .as_deref()
+        .map(str::trim)
+        .filter(|notice| !notice.is_empty());
+    let preferred_header_height = 3 + u16::from(notice.is_some());
+    let header_height = preferred_header_height
+        .min(area.height.saturating_sub(footer_height + 4))
+        .max(1);
     let input_space = area
         .height
         .saturating_sub(header_height + footer_height + 1)
@@ -858,7 +867,17 @@ fn draw_ui(frame: &mut Frame<'_>, state: &AppState, colors: bool) {
     } else {
         Color::Reset
     };
-    let header = Paragraph::new(vec![
+    let header_width = usize::from(areas[0].width);
+    let model_label = truncate_status(
+        &sanitize(&state.startup.model),
+        header_width.saturating_sub(18).saturating_mul(2) / 3,
+    );
+    let provider_label = sanitize(&state.startup.provider);
+    let workspace_label = truncate_path(
+        &sanitize(&state.startup.workspace),
+        header_width.saturating_sub(" workspace: ".chars().count()),
+    );
+    let mut header_lines = vec![
         Line::from(vec![
             Span::styled(
                 " [<>] COGITOAI",
@@ -869,29 +888,24 @@ fn draw_ui(frame: &mut Frame<'_>, state: &AppState, colors: bool) {
                 Style::default().fg(muted),
             ),
         ]),
-        Line::from(format!(
-            " Model: {}  |  Provider: {}",
-            sanitize(&state.startup.model),
-            sanitize(&state.startup.provider)
-        )),
-        Line::from(format!(
-            " Workspace: {}",
-            sanitize(&state.startup.workspace)
-        )),
-        Line::from(
-            state
-                .startup
-                .notice
-                .as_deref()
-                .map(sanitize)
-                .unwrap_or_default(),
-        ),
-    ]);
+        Line::from(format!(" model: {model_label} · {provider_label}")),
+        Line::from(format!(" workspace: {workspace_label}")),
+    ];
+    if let Some(notice) = notice {
+        header_lines.push(Line::from(Span::styled(
+            format!(
+                " {}",
+                truncate_status(&sanitize(notice), header_width.saturating_sub(1))
+            ),
+            Style::default().fg(if colors { Color::Yellow } else { Color::Reset }),
+        )));
+    }
+    let header = Paragraph::new(header_lines);
     frame.render_widget(header, areas[0]);
 
     let activity_block = Block::default()
         .title(" ACTIVITY ")
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .border_style(Style::default().fg(muted));
     let inner_height = activity_block.inner(areas[1]).height as usize;
     let end = state
@@ -1156,10 +1170,28 @@ fn status_detail(state: &AppState) -> String {
         };
         return format!("{action} · Ctrl+C cancel · PgUp/PgDn scroll");
     }
-    if state.status.starts_with("Task failed") {
+    if state.status != "Ready  |  Enter a task or type /help" {
         state.status.clone()
     } else {
         "Enter run · ↑/↓ history · /help · Ctrl+C exit".to_owned()
+    }
+}
+
+fn truncate_path(value: &str, max_chars: usize) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= max_chars {
+        value.to_owned()
+    } else if max_chars == 0 {
+        String::new()
+    } else if max_chars == 1 {
+        "…".to_owned()
+    } else {
+        format!(
+            "…{}",
+            characters[characters.len() - max_chars + 1..]
+                .iter()
+                .collect::<String>()
+        )
     }
 }
 
@@ -1321,6 +1353,75 @@ mod tests {
             terminal.backend().buffer().area,
             ratatui::layout::Rect::new(0, 0, 36, 12)
         );
+    }
+
+    #[test]
+    fn startup_snapshot_stays_compact_without_an_empty_notice_row() {
+        let mut state = AppState::new(startup(), false);
+        state.startup.notice = None;
+        let mut terminal = Terminal::new(TestBackend::new(72, 16)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, &state, false))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let startup_rows = (0..3)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            startup_rows,
+            [
+                " [<>] COGITOAI  harness v0.1.0",
+                " model: mock · Mock",
+                " workspace: C:/work/project",
+            ]
+        );
+
+        let activity_heading = (0..buffer.area.width)
+            .map(|column| buffer[(column, 3)].symbol())
+            .collect::<String>();
+        assert!(activity_heading.contains("ACTIVITY"));
+        assert!(!activity_heading.contains('┌'));
+    }
+
+    #[test]
+    fn startup_and_status_truncate_long_context_without_losing_workspace_tail() {
+        let mut state = AppState::new(startup(), false);
+        state.startup.workspace =
+            "C:/Users/Developer/Documents/GitHub/OctranTechnologies/CogitoAI".to_owned();
+        state.startup.model = "anthropic/claude-sonnet-4.5-with-a-long-model-name".to_owned();
+        state.startup.notice = None;
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, &state, false))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let model_row = (0..buffer.area.width)
+            .map(|column| buffer[(column, 1)].symbol())
+            .collect::<String>();
+        let workspace_row = (0..buffer.area.width)
+            .map(|column| buffer[(column, 2)].symbol())
+            .collect::<String>();
+        assert!(model_row.contains("anthropic/claude"));
+        assert!(model_row.chars().count() <= usize::from(buffer.area.width));
+        assert!(workspace_row.contains("…"));
+        assert!(workspace_row.contains("OctranTechnologies/CogitoAI"));
+        assert!(workspace_row.chars().count() <= usize::from(buffer.area.width));
+    }
+
+    #[test]
+    fn idle_footer_surfaces_recent_feedback_before_shortcut_hints() {
+        let mut state = AppState::new(startup(), false);
+        state.status = "Input cleared".to_owned();
+
+        assert_eq!(status_detail(&state), "Input cleared");
     }
 
     fn status_text(state: &AppState, width: u16) -> String {

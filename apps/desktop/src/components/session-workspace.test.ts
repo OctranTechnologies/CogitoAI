@@ -329,6 +329,21 @@ describe("composer placement", () => {
   });
 });
 
+describe("responsive inspector layout", () => {
+  it("overlays the inspector below the wide-window breakpoint without shrinking the activity column", () => {
+    const props = baseProps();
+    props.inspector.open = true;
+    setup(props);
+
+    const inspector = screen.getByLabelText("Inspector");
+    for (const className of ["absolute", "inset-y-0", "right-0", "xl:static"]) {
+      expect(inspector.classList.contains(className)).toBe(true);
+    }
+    expect(screen.getByTestId("activity-scroll")).toBeTruthy();
+    expect(screen.getByLabelText("Message the agent")).toBeTruthy();
+  });
+});
+
 describe("auto-scroll", () => {
   it("follows new activity while the reader is at the bottom", async () => {
     const { rerender } = render(

@@ -28,7 +28,12 @@ const css = readdirSync(ASSETS)
 // Tailwind escapes the characters that are special in a selector, so `gap-1.5`
 // becomes `.gap-1\.5` and `hover:bg-hover` becomes `.hover\:bg-hover:hover`.
 function selectorFor(name) {
-  return `.${name.replace(/[!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~]/g, "\\$&")}`;
+  let escaped = name.replace(/[!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~]/g, "\\$&");
+  // CSS requires a leading digit to be escaped as a hexadecimal code point.
+  // Tailwind emits `2xl:*` as `\\32xl:*`, so the ordinary punctuation escape
+  // above would otherwise report valid breakpoint utilities as missing.
+  if (/^[0-9]/.test(name)) escaped = `\\3${name[0]}${escaped.slice(1)}`;
+  return `.${escaped}`;
 }
 
 const used = new Set();

@@ -33,15 +33,15 @@ export function SessionHeader({
   const busy = runPhase === "pending" || runPhase === "running" || runPhase === "cancelling";
 
   return (
-    <header className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-line px-4 py-1.5 text-2xs text-faint">
+    <header className="flex h-9 min-w-0 flex-1 shrink-0 flex-nowrap items-center gap-x-3 overflow-hidden border-b border-line px-4 text-2xs text-faint">
       {projectName ? (
-        <span className="truncate font-medium text-secondary" data-testid="header-project">
+        <span className="min-w-0 max-w-[35%] shrink truncate font-medium text-secondary" title={projectName} data-testid="header-project">
           {projectName}
         </span>
       ) : null}
 
       {branch ? (
-        <span className="inline-flex min-w-0 items-center gap-1" data-testid="header-branch">
+        <span className="inline-flex min-w-0 max-w-[22%] shrink items-center gap-1" title={branch} data-testid="header-branch">
           <GitBranch className="size-icon-xs shrink-0 opacity-70" />
           <span className="truncate">{branch}</span>
         </span>
@@ -56,7 +56,11 @@ export function SessionHeader({
       </span>
 
       {models ? (
-        <span className="inline-flex min-w-0 items-center gap-1" data-testid="header-model">
+        <span
+          className="hidden min-w-0 max-w-[240px] shrink items-center gap-1 2xl:inline-flex"
+          title={`${models.provider}/${models.model}`}
+          data-testid="header-model"
+        >
           <Cpu className="size-icon-xs shrink-0 opacity-70" />
           <span className="truncate">
             {models.provider}/{models.model}
@@ -65,20 +69,20 @@ export function SessionHeader({
       ) : null}
 
       {permissions ? (
-        <span className="inline-flex items-center gap-1" data-testid="header-mode">
+        <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap" data-testid="header-mode">
           <ShieldCheck className="size-icon-xs shrink-0 opacity-70" />
           {modeLabel(permissions.mode)}
         </span>
       ) : null}
 
       {activeTools > 0 ? (
-        <span className="tabular-nums" data-testid="header-active-tools">
+        <span className="shrink-0 whitespace-nowrap tabular-nums" data-testid="header-active-tools">
           {activeTools} in flight
         </span>
       ) : null}
 
       {failures > 0 ? (
-        <span className="text-error tabular-nums" data-testid="header-failures">
+        <span className="shrink-0 whitespace-nowrap text-error tabular-nums" data-testid="header-failures">
           {failures} failed
         </span>
       ) : null}
