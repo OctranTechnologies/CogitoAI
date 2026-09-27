@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +10,7 @@ use harness_agent::{
 use harness_context::{ContextBudget, ContextBuilder, WorkspaceMetadata};
 use harness_models::{
     ContentBlock, ModelCapabilities, ModelDescriptor, ModelProvider, ModelRequest, ModelResponse,
-    ModelStreamEvent, ProviderError, ScriptedMockProvider, ToolCall, Usage,
+    ModelStreamEvent, OpenAIProvider, ProviderError, ScriptedMockProvider, ToolCall, Usage,
 };
 use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
 use harness_session::{JsonlSessionStore, SessionStatus, SessionStore};
@@ -17,6 +19,56 @@ use harness_verification::{
     CommandVerifier, VerificationCategory, VerificationPlan, VerificationStep,
 };
 use tempfile::tempdir;
+
+fn read_http_request(stream: &mut TcpStream) -> (String, String) {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let (header_end, content_length) = loop {
+        let count = stream.read(&mut chunk).expect("read test request");
+        assert!(count > 0, "request closed before headers");
+        bytes.extend_from_slice(&chunk[..count]);
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = end + 4;
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + content_length {
+                break (header_end, content_length);
+            }
+        }
+    };
+    while bytes.len() < header_end + content_length {
+        let count = stream.read(&mut chunk).expect("read test request body");
+        assert!(count > 0, "request closed before body");
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    (
+        String::from_utf8_lossy(&bytes[..header_end]).into_owned(),
+        String::from_utf8_lossy(&bytes[header_end..header_end + content_length]).into_owned(),
+    )
+}
+
+fn respond_with_sse(stream: &mut TcpStream, events: &[serde_json::Value]) {
+    let body = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .expect("write SSE headers");
+    stream.write_all(body.as_bytes()).expect("write SSE body");
+    stream.flush().expect("flush SSE response");
+}
 
 fn response(text: &str, tool: Option<(&str, serde_json::Value)>) -> ModelResponse {
     let has_tool = tool.is_some();
@@ -469,4 +521,121 @@ fn long_mock_session_compacts_resumes_and_preserves_history() {
         )
     }));
     assert_eq!(resumed.state().unwrap().context_compactions, 2);
+}
+
+#[test]
+fn openai_mock_tool_use_round_trip_executes_and_returns_tool_observation() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    std::fs::write(workspace.join("readme.txt"), "agent-visible-file-content").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock OpenAI server");
+    let address = listener.local_addr().expect("mock OpenAI address");
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        for turn in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept Responses request");
+            let headers_and_body = read_http_request_for_response(&mut stream);
+            let events = if turn == 0 {
+                vec![
+                    serde_json::json!({ "type": "response.created", "response": { "id": "resp-tool" } }),
+                    serde_json::json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": { "type": "function_call", "id": "fc-read", "call_id": "call-read", "name": "read_file", "arguments": "" }
+                    }),
+                    serde_json::json!({ "type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{\"path\":\"readme.txt\"}" }),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": { "type": "function_call", "id": "fc-read", "call_id": "call-read", "name": "read_file", "arguments": "{\"path\":\"readme.txt\"}" }
+                    }),
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-tool", "model": "gpt-test", "status": "completed",
+                            "output": [{ "type": "function_call", "id": "fc-read", "call_id": "call-read", "name": "read_file", "arguments": "{\"path\":\"readme.txt\"}" }],
+                            "usage": { "input_tokens": 20, "output_tokens": 5, "total_tokens": 25 }
+                        }
+                    }),
+                ]
+            } else {
+                vec![
+                    serde_json::json!({ "type": "response.created", "response": { "id": "resp-final" } }),
+                    serde_json::json!({ "type": "response.output_text.delta", "output_index": 0, "delta": "The file contains agent-visible-file-content." }),
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-final", "model": "gpt-test", "status": "completed",
+                            "output": [{ "type": "message", "content": [{ "type": "output_text", "text": "The file contains agent-visible-file-content." }] }],
+                            "usage": { "input_tokens": 45, "output_tokens": 10, "total_tokens": 55 }
+                        }
+                    }),
+                ]
+            };
+            server_requests
+                .lock()
+                .expect("OpenAI requests lock")
+                .push(headers_and_body);
+            respond_with_sse(&mut stream, &events);
+        }
+    });
+
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let session_store: Arc<dyn SessionStore> = sessions.clone();
+    let provider = Arc::new(OpenAIProvider::with_api_key(
+        format!("http://{address}/v1"),
+        "gpt-test",
+        "MOCK_OPENAI_KEY",
+        "agent-test-key",
+    ));
+    let runner = AgentRunner::new(
+        provider,
+        "gpt-test",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(AllowAllPolicy),
+        session_store,
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    );
+
+    let outcome = runner
+        .run(
+            &AgentTask {
+                workspace_root: workspace.to_path_buf(),
+                user_task: "Read readme.txt and tell me what it contains".to_owned(),
+                ..AgentTask::default()
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    server.join().expect("mock OpenAI server");
+
+    assert_eq!(outcome.tool_calls, 1);
+    assert_eq!(outcome.turns, 2);
+    assert_eq!(
+        outcome.final_message,
+        "The file contains agent-visible-file-content."
+    );
+    let session = sessions.load(&outcome.session_id).unwrap();
+    assert!(!serde_json::to_string(&session.events)
+        .unwrap()
+        .contains("agent-test-key"));
+    let requests = requests.lock().expect("OpenAI requests lock");
+    assert_eq!(requests.len(), 2);
+    let follow_up = &requests[1]["body"]["input"][0]["content"];
+    assert!(follow_up
+        .as_str()
+        .expect("follow-up prompt is text")
+        .contains("agent-visible-file-content"));
+    assert_eq!(requests[0]["body"]["tools"][0]["name"], "read_file");
+}
+
+fn read_http_request_for_response(stream: &mut TcpStream) -> serde_json::Value {
+    let (headers, body) = read_http_request(stream);
+    serde_json::json!({
+        "headers": headers,
+        "body": serde_json::from_str::<serde_json::Value>(&body).expect("Responses request JSON"),
+    })
 }

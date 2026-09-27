@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use mock::{DeterministicMockProvider, MockProvider, MockScenario, ScriptedMockProvider};
-pub use openai::OpenAiProvider;
+pub use openai::{OpenAIProvider, OpenAIResponsesTransport, OpenAiProvider};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,6 +38,14 @@ pub struct Message {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_error: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl Message {
@@ -47,6 +55,8 @@ impl Message {
             content: vec![ContentBlock::Text { text: text.into() }],
             name: None,
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            is_error: false,
         }
     }
 
@@ -56,6 +66,19 @@ impl Message {
             content: vec![ContentBlock::Text { text: text.into() }],
             name: None,
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            is_error: false,
+        }
+    }
+
+    pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: Vec::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: calls,
+            is_error: false,
         }
     }
 
@@ -67,6 +90,8 @@ impl Message {
             }],
             name: None,
             tool_call_id: Some(result.tool_call_id),
+            tool_calls: Vec::new(),
+            is_error: result.is_error,
         }
     }
 }
@@ -175,6 +200,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -334,6 +360,10 @@ pub enum ProviderError {
     Transport { provider: &'static str },
     #[error("provider stream consumer failed")]
     StreamConsumer,
+    #[error("provider request was cancelled")]
+    Cancelled,
+    #[error("provider {provider} request timed out")]
+    Timeout { provider: &'static str },
     #[error("provider configuration is invalid: {reason}")]
     Configuration { reason: String },
     #[error("model does not support requested capability: {capability}")]
@@ -349,13 +379,42 @@ pub trait ModelProvider: Send + Sync {
         on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError>;
 
+    /// Cancellation-aware streaming hook. Providers with blocking transports
+    /// should override this to interrupt reads promptly; simpler providers can
+    /// rely on the generic preflight check and consumer callback.
+    fn stream_cancellable(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, ProviderError> {
+        if is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        self.stream(request, on_event)
+    }
+
     /// Validates generic capability requirements and exposes one normalized stream contract.
     fn generate(
         &self,
         request: &ModelRequest,
         on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError> {
+        self.generate_cancellable(request, on_event, &|| false)
+    }
+
+    /// Validates generic capability requirements and exposes one normalized
+    /// event stream while allowing the transport to observe cancellation.
+    fn generate_cancellable(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, ProviderError> {
         let result = (|| {
+            if is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
             let capabilities = self.descriptor().capabilities;
             if !capabilities.text_input {
                 return Err(ProviderError::UnsupportedCapability {
@@ -412,7 +471,7 @@ pub trait ModelProvider: Send + Sync {
                 });
             }
             if capabilities.streaming {
-                self.stream(request, on_event)
+                self.stream_cancellable(request, on_event, is_cancelled)
             } else {
                 let response = self.complete(request)?;
                 emit_response_events(&response, on_event)?;

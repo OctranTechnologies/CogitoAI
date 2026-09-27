@@ -111,6 +111,8 @@ fn common_message_and_content_types_are_serializable() {
         ],
         name: Some("user".to_owned()),
         tool_call_id: None,
+        tool_calls: Vec::new(),
+        is_error: false,
     };
     let serialized = serde_json::to_value(&message).unwrap();
 

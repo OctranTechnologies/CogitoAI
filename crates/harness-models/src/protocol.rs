@@ -15,4 +15,16 @@ pub(crate) trait ProtocolAdapter: Send + Sync {
         request: &ModelRequest,
         on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError>;
+
+    fn stream_cancellable(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ModelResponse, ProviderError> {
+        if is_cancelled() {
+            return Err(ProviderError::Cancelled);
+        }
+        self.stream(request, on_event)
+    }
 }

@@ -407,20 +407,24 @@ impl AgentRunner {
                 },
                 &collector,
             )?;
-            let response = match self.provider.generate(&model_request, &mut |event| {
-                if cancellation.is_cancelled() {
-                    return Err(ProviderError::StreamConsumer);
-                }
-                if let ModelStreamEvent::TextDelta { text } = event {
-                    self.event_bus.publish(&HarnessEvent::new(
-                        session_id.clone(),
-                        EventPayload::AssistantDelta { text },
-                        None,
-                        None,
-                    ));
-                }
-                Ok(())
-            }) {
+            let response = match self.provider.generate_cancellable(
+                &model_request,
+                &mut |event| {
+                    if cancellation.is_cancelled() {
+                        return Err(ProviderError::StreamConsumer);
+                    }
+                    if let ModelStreamEvent::TextDelta { text } = event {
+                        self.event_bus.publish(&HarnessEvent::new(
+                            session_id.clone(),
+                            EventPayload::AssistantDelta { text },
+                            None,
+                            None,
+                        ));
+                    }
+                    Ok(())
+                },
+                &|| cancellation.is_cancelled(),
+            ) {
                 Ok(response) => response,
                 Err(_) if cancellation.is_cancelled() => {
                     return self.fail(session_id, collector, AgentError::Cancelled);

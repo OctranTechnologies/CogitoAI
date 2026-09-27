@@ -100,11 +100,18 @@ Provider facades are responsible for selecting a private protocol adapter for
 the configured model. The private `ProtocolAdapter` boundary and shared HTTP
 JSON/SSE framing utilities allow one provider facade to route models to
 different protocols without leaking JSON payloads into runtime types. The
-existing OpenAI adapter uses Chat Completions. Deterministic mock adapters cover
-text, single and multiple tool calls, and a mid-stream failure. Anthropic,
-Gemini, OpenCode Zen, and OpenCode Go are not implemented yet; future Zen/Go
-catalog entries can choose Responses, Chat Completions, or Messages adapters
-individually.
+native OpenAI adapter uses `OpenAIResponsesTransport` and the Responses API for
+streaming text, function calls, tool results, usage, and reasoning effort. The
+transport normalizes API errors, retries only transient failures before stream
+consumption, and checks cancellation while waiting for SSE data. API keys are
+held only in memory and are not included in adapter errors or events. OpenAI's
+`GET /models` results are filtered through local capability metadata because the
+listing endpoint does not report tool or Responses API support; explicitly
+configured model IDs remain usable even when they are not in that metadata.
+Deterministic mock adapters cover text, single and multiple tool calls, and a
+mid-stream failure. Anthropic, Gemini, OpenCode Zen, and OpenCode Go are not
+implemented yet; future Zen/Go catalog entries can choose Responses, Chat
+Completions, or Messages adapters individually.
 
 Capabilities describe what the selected model adapter can substantiate, not
 what a provider family might support in general. Unknown limits and features

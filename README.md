@@ -142,21 +142,24 @@ mock that executes a fixed, scripted workflow through the real agent loop, polic
 engine, checkpoint store, and verification commands, so you can exercise the whole
 system offline.
 
-To use a real provider, set the API key in the environment of the process you
-start. Never put a key in a file, and never commit one.
+To use OpenAI, create an API key in the OpenAI API dashboard, then set it in the
+environment of the process that starts Harness. Never put the key in project
+configuration, a session file, or a command-line argument.
 
 ```bash
 # PowerShell
 $env:OPENAI_API_KEY = "<your-key>"
 $env:COGITO_MODEL_PROVIDER = "openai"
-$env:COGITO_MODEL = "gpt-4o-mini"
+$env:COGITO_MODEL = "gpt-4o-mini" # replace with any model ID available to your API account
+cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
 ```bash
 # bash
 export OPENAI_API_KEY="<your-key>"
 export COGITO_MODEL_PROVIDER="openai"
-export COGITO_MODEL="gpt-4o-mini"
+export COGITO_MODEL="gpt-4o-mini" # replace with any model ID available to your API account
+cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
 | Variable | Purpose | Default |
@@ -164,7 +167,7 @@ export COGITO_MODEL="gpt-4o-mini"
 | `COGITO_MODEL_PROVIDER` | `mock` or `openai` | `mock` |
 | `COGITO_MODEL` | Model name passed to the provider | provider default |
 | `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | `OPENAI_API_KEY` |
-| `COGITO_MODEL_BASE_URL` | Provider base URL, for OpenAI-compatible endpoints | provider default |
+| `COGITO_MODEL_BASE_URL` | OpenAI API root; the provider calls its `/responses` and `/models` endpoints | `https://api.openai.com/v1` |
 | `COGITO_MOCK_REPAIR` | Mock-only test hook; see [Testing the repair loop](#testing-the-repair-loop) | unset |
 | `RUST_LOG` | Runtime log level for the RPC runtime | `info` |
 
@@ -172,6 +175,14 @@ The key is read from the environment only. It is never returned by the settings
 API, never placed in an RPC frame, and never logged; clients are told only whether
 a credential is present and which variable holds it. The harness stores no key on
 disk and implements no home-grown encryption.
+
+The OpenAI adapter uses the Responses API for both streaming and function calls.
+`COGITO_MODEL` is sent as configured, including model IDs that are not in the
+local discovery catalog. Model discovery calls `GET /models` and returns only
+families with local coding-agent capability metadata; OpenAI's listing endpoint
+does not itself describe tool support or coding suitability. A custom
+`COGITO_MODEL_BASE_URL` must implement the Responses API shape at `/responses`;
+model discovery additionally requires the model listing shape at `/models`.
 
 ## Current v0 capabilities
 
