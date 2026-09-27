@@ -1,5 +1,7 @@
 mod mock;
 mod openai;
+mod protocol;
+mod transport;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -7,13 +9,14 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use mock::{MockProvider, ScriptedMockProvider};
+pub use mock::{DeterministicMockProvider, MockProvider, MockScenario, ScriptedMockProvider};
 pub use openai::OpenAiProvider;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
+    Developer,
     User,
     Assistant,
     Tool,
@@ -55,6 +58,17 @@ impl Message {
             tool_call_id: None,
         }
     }
+
+    pub fn tool_result(result: ToolResult) -> Self {
+        Self {
+            role: Role::Tool,
+            content: vec![ContentBlock::Text {
+                text: result.content,
+            }],
+            name: None,
+            tool_call_id: Some(result.tool_call_id),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,6 +83,14 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub tool_call_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -102,13 +124,66 @@ impl Usage {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
+    #[serde(default = "default_true")]
+    pub text_input: bool,
+    #[serde(rename = "vision", alias = "image_input", default)]
+    pub image_input: bool,
+    #[serde(default)]
     pub streaming: bool,
+    #[serde(default)]
     pub tool_calling: bool,
-    pub vision: bool,
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
+    #[serde(default)]
     pub reasoning: bool,
+    #[serde(default)]
+    pub configurable_reasoning_effort: bool,
+    #[serde(default)]
     pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub system_instructions: bool,
+    #[serde(default)]
+    pub developer_instructions: bool,
+    #[serde(default)]
+    pub prompt_caching: bool,
+    #[serde(default)]
+    pub structured_output: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelDescriptor {
+    /// Stable provider family identifier, used for display and configuration only.
+    pub provider: String,
+    /// Provider-native model identifier selected for this descriptor.
+    pub id: String,
+    pub display_name: String,
+    pub capabilities: ModelCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningConfig {
+    pub effort: Option<ReasoningEffort>,
+    pub budget_tokens: Option<u32>,
+    #[serde(default)]
+    pub include_summary: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,6 +194,7 @@ pub struct ModelRequest {
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub metadata: BTreeMap<String, String>,
+    pub reasoning: Option<ReasoningConfig>,
 }
 
 impl ModelRequest {
@@ -130,6 +206,7 @@ impl ModelRequest {
             max_output_tokens: None,
             temperature: None,
             metadata: BTreeMap::new(),
+            reasoning: None,
         }
     }
 }
@@ -158,27 +235,82 @@ impl ModelResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallDelta {
-    pub index: u32,
-    pub id: Option<String>,
-    pub name: Option<String>,
-    pub arguments_delta: Option<String>,
+#[serde(tag = "type")]
+pub enum ModelStreamEvent {
+    #[serde(rename = "response.started")]
+    ResponseStarted { id: Option<String>, model: String },
+    #[serde(rename = "text.delta")]
+    TextDelta { text: String },
+    /// Only adapters that can safely expose a reasoning summary should emit this.
+    #[serde(rename = "reasoning.delta")]
+    ReasoningDelta { text: String },
+    #[serde(rename = "tool_call.started")]
+    ToolCallStarted {
+        index: u32,
+        id: Option<String>,
+        name: Option<String>,
+    },
+    #[serde(rename = "tool_call.arguments.delta")]
+    ToolCallArgumentsDelta { index: u32, delta: String },
+    #[serde(rename = "tool_call.completed")]
+    ToolCallCompleted { index: u32, call: ToolCall },
+    #[serde(rename = "usage.updated")]
+    UsageUpdated { usage: Usage },
+    #[serde(rename = "response.completed")]
+    ResponseCompleted { finish_reason: FinishReason },
+    #[serde(rename = "response.failed")]
+    ResponseFailed { error: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum StreamDeltaKind {
-    Text { text: String },
-    Reasoning { text: String },
-    ToolCall { call: ToolCallDelta },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StreamDelta {
-    pub sequence: u32,
-    pub delta: StreamDeltaKind,
-    pub finish_reason: Option<FinishReason>,
-    pub usage: Option<Usage>,
+/// Emits the normalized event sequence for a completed non-streaming response.
+pub fn emit_response_events(
+    response: &ModelResponse,
+    on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    on_event(ModelStreamEvent::ResponseStarted {
+        id: Some(response.id.clone()),
+        model: response.model.clone(),
+    })?;
+    for block in &response.content {
+        match block {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                let characters = text.chars().collect::<Vec<_>>();
+                for chunk in characters.chunks(8) {
+                    on_event(ModelStreamEvent::TextDelta {
+                        text: chunk.iter().collect(),
+                    })?;
+                }
+            }
+            // Reasoning is intentionally omitted from generic synthesis. An adapter
+            // must explicitly opt in only when it has a safe summary to expose.
+            ContentBlock::Image { .. }
+            | ContentBlock::Reasoning { .. }
+            | ContentBlock::Text { .. } => {}
+        }
+    }
+    for (index, call) in response.tool_calls.iter().enumerate() {
+        on_event(ModelStreamEvent::ToolCallStarted {
+            index: index as u32,
+            id: Some(call.id.clone()),
+            name: Some(call.name.clone()),
+        })?;
+        on_event(ModelStreamEvent::ToolCallArgumentsDelta {
+            index: index as u32,
+            delta: call.arguments.to_string(),
+        })?;
+        on_event(ModelStreamEvent::ToolCallCompleted {
+            index: index as u32,
+            call: call.clone(),
+        })?;
+    }
+    if let Some(usage) = &response.usage {
+        on_event(ModelStreamEvent::UsageUpdated {
+            usage: usage.clone(),
+        })?;
+    }
+    on_event(ModelStreamEvent::ResponseCompleted {
+        finish_reason: response.finish_reason.clone(),
+    })
 }
 
 #[derive(Debug, Error)]
@@ -204,17 +336,96 @@ pub enum ProviderError {
     StreamConsumer,
     #[error("provider configuration is invalid: {reason}")]
     Configuration { reason: String },
+    #[error("model does not support requested capability: {capability}")]
+    UnsupportedCapability { capability: &'static str },
 }
 
 pub trait ModelProvider: Send + Sync {
-    fn name(&self) -> &str;
-    fn capabilities(&self) -> ModelCapabilities;
+    fn descriptor(&self) -> ModelDescriptor;
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError>;
     fn stream(
         &self,
         request: &ModelRequest,
-        on_delta: &mut dyn FnMut(StreamDelta) -> Result<(), ProviderError>,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError>;
+
+    /// Validates generic capability requirements and exposes one normalized stream contract.
+    fn generate(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
+    ) -> Result<ModelResponse, ProviderError> {
+        let result = (|| {
+            let capabilities = self.descriptor().capabilities;
+            if !capabilities.text_input {
+                return Err(ProviderError::UnsupportedCapability {
+                    capability: "text input",
+                });
+            }
+            if request.messages.iter().any(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Image { .. }))
+            }) && !capabilities.image_input
+            {
+                return Err(ProviderError::UnsupportedCapability {
+                    capability: "image input",
+                });
+            }
+            if !request.tools.is_empty() && !capabilities.tool_calling {
+                return Err(ProviderError::UnsupportedCapability {
+                    capability: "tool calling",
+                });
+            }
+            if request.reasoning.is_some() && !capabilities.reasoning {
+                return Err(ProviderError::UnsupportedCapability {
+                    capability: "reasoning",
+                });
+            }
+            if request.reasoning.as_ref().is_some_and(|reasoning| {
+                reasoning.effort.is_some() || reasoning.budget_tokens.is_some()
+            }) && !capabilities.configurable_reasoning_effort
+            {
+                return Err(ProviderError::UnsupportedCapability {
+                    capability: "configurable reasoning effort",
+                });
+            }
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == Role::System)
+                && !capabilities.system_instructions
+            {
+                return Err(ProviderError::UnsupportedCapability {
+                    capability: "system instructions",
+                });
+            }
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Developer)
+                && !capabilities.developer_instructions
+            {
+                return Err(ProviderError::UnsupportedCapability {
+                    capability: "developer instructions",
+                });
+            }
+            if capabilities.streaming {
+                self.stream(request, on_event)
+            } else {
+                let response = self.complete(request)?;
+                emit_response_events(&response, on_event)?;
+                Ok(response)
+            }
+        })();
+        if let Err(error) = &result {
+            let _ = on_event(ModelStreamEvent::ResponseFailed {
+                error: error.to_string(),
+            });
+        }
+        result
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

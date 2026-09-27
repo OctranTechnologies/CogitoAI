@@ -1,15 +1,21 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 
+use super::protocol::ProtocolAdapter;
+use super::transport::{for_each_sse_data, request_json};
 use serde_json::{json, Value};
 
 use super::{
-    ContentBlock, FinishReason, Message, ModelCapabilities, ModelConfig, ModelProvider,
-    ModelRequest, ModelResponse, ProviderError, Role, StreamDelta, StreamDeltaKind, ToolCall,
-    ToolCallDelta, Usage,
+    ContentBlock, FinishReason, Message, ModelCapabilities, ModelConfig, ModelDescriptor,
+    ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent, ProviderError, Role, ToolCall,
+    Usage,
 };
 
 pub struct OpenAiProvider {
+    adapter: OpenAiChatCompletionsAdapter,
+}
+
+struct OpenAiChatCompletionsAdapter {
     base_url: String,
     model: String,
     api_key_env: String,
@@ -20,13 +26,15 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn from_config(config: &ModelConfig) -> Result<Self, ProviderError> {
         Ok(Self {
-            base_url: config.base_url.clone(),
-            model: config.model.clone(),
-            api_key_env: config.api_key_env.clone(),
-            api_key: std::env::var(&config.api_key_env)
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            context_window: config.context_window,
+            adapter: OpenAiChatCompletionsAdapter {
+                base_url: config.base_url.clone(),
+                model: config.model.clone(),
+                api_key_env: config.api_key_env.clone(),
+                api_key: std::env::var(&config.api_key_env)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty()),
+                context_window: config.context_window,
+            },
         })
     }
 
@@ -38,14 +46,23 @@ impl OpenAiProvider {
     ) -> Self {
         let api_key = api_key.into();
         Self {
-            base_url: base_url.into(),
-            model: model.into(),
-            api_key_env: api_key_env.into(),
-            api_key: (!api_key.trim().is_empty()).then_some(api_key),
-            context_window: Some(128_000),
+            adapter: OpenAiChatCompletionsAdapter {
+                base_url: base_url.into(),
+                model: model.into(),
+                api_key_env: api_key_env.into(),
+                api_key: (!api_key.trim().is_empty()).then_some(api_key),
+                context_window: Some(128_000),
+            },
         }
     }
 
+    #[cfg(test)]
+    fn request_body(&self, request: &ModelRequest, stream: bool) -> Value {
+        self.adapter.request_body(request, stream)
+    }
+}
+
+impl OpenAiChatCompletionsAdapter {
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
@@ -80,11 +97,17 @@ impl OpenAiProvider {
 
     fn send(&self, body: &Value) -> Result<ureq::Response, ProviderError> {
         let api_key = self.require_api_key()?;
-        ureq::post(&self.endpoint())
-            .set("Authorization", &format!("Bearer {api_key}"))
-            .set("Content-Type", "application/json")
-            .send_json(body)
-            .map_err(map_ureq_error)
+        let authorization = format!("Bearer {api_key}");
+        request_json(
+            "POST",
+            &self.endpoint(),
+            &[
+                ("Authorization", authorization.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+            body,
+            "openai",
+        )
     }
 
     fn complete_response(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
@@ -101,20 +124,38 @@ impl OpenAiProvider {
 }
 
 impl ModelProvider for OpenAiProvider {
-    fn name(&self) -> &str {
-        "openai"
-    }
-
-    fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities {
-            streaming: true,
-            tool_calling: true,
-            vision: true,
-            reasoning: true,
-            context_window: self.context_window,
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: "openai".to_owned(),
+            id: self.adapter.model.clone(),
+            display_name: self.adapter.model.clone(),
+            capabilities: ModelCapabilities {
+                text_input: true,
+                streaming: true,
+                tool_calling: true,
+                parallel_tool_calls: true,
+                system_instructions: true,
+                developer_instructions: true,
+                context_window: self.adapter.context_window,
+                ..ModelCapabilities::default()
+            },
         }
     }
 
+    fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        self.adapter.complete(request)
+    }
+
+    fn stream(
+        &self,
+        request: &ModelRequest,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.adapter.stream(request, on_event)
+    }
+}
+
+impl ProtocolAdapter for OpenAiChatCompletionsAdapter {
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
         self.complete_response(request)
     }
@@ -122,24 +163,21 @@ impl ModelProvider for OpenAiProvider {
     fn stream(
         &self,
         request: &ModelRequest,
-        on_delta: &mut dyn FnMut(StreamDelta) -> Result<(), ProviderError>,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError> {
         let response = self.send(&self.request_body(request, true))?;
         let reader = BufReader::new(response.into_reader());
-        let mut sequence = 0;
         let mut text = String::new();
-        let mut reasoning = String::new();
         let mut tool_calls = BTreeMap::<u32, ToolAccumulator>::new();
         let mut finish_reason = None;
         let mut usage = None;
-        for line in reader.lines() {
-            let line = line.map_err(|_| ProviderError::Transport { provider: "openai" })?;
-            if !line.starts_with("data:") {
-                continue;
-            }
-            let data = line[5..].trim();
+        on_event(ModelStreamEvent::ResponseStarted {
+            id: None,
+            model: self.model.clone(),
+        })?;
+        for_each_sse_data(reader, "openai", |data| {
             if data == "[DONE]" {
-                break;
+                return Ok(false);
             }
             let chunk = serde_json::from_str::<Value>(data).map_err(|error| {
                 ProviderError::InvalidResponse {
@@ -148,45 +186,31 @@ impl ModelProvider for OpenAiProvider {
                 }
             })?;
             if let Some(value) = chunk.get("usage").filter(|value| !value.is_null()) {
-                usage = Some(parse_usage(value));
+                let current = parse_usage(value);
+                usage = Some(current.clone());
+                on_event(ModelStreamEvent::UsageUpdated { usage: current })?;
             }
             let Some(choice) = chunk
                 .get("choices")
                 .and_then(Value::as_array)
                 .and_then(|choices| choices.first())
             else {
-                continue;
+                return Ok(true);
             };
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 finish_reason = Some(parse_finish_reason(reason));
             }
             let Some(delta) = choice.get("delta") else {
-                continue;
+                return Ok(true);
             };
             if let Some(value) = delta.get("content").and_then(Value::as_str) {
                 text.push_str(value);
-                on_delta(StreamDelta {
-                    sequence,
-                    delta: StreamDeltaKind::Text {
-                        text: value.to_owned(),
-                    },
-                    finish_reason: None,
-                    usage: None,
+                on_event(ModelStreamEvent::TextDelta {
+                    text: value.to_owned(),
                 })?;
-                sequence += 1;
             }
-            if let Some(value) = delta.get("reasoning_content").and_then(Value::as_str) {
-                reasoning.push_str(value);
-                on_delta(StreamDelta {
-                    sequence,
-                    delta: StreamDeltaKind::Reasoning {
-                        text: value.to_owned(),
-                    },
-                    finish_reason: None,
-                    usage: None,
-                })?;
-                sequence += 1;
-            }
+            // `reasoning_content` may contain private chain-of-thought. This adapter
+            // intentionally does not expose it through the normalized event stream.
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
                     let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -198,52 +222,53 @@ impl ModelProvider for OpenAiProvider {
                         if let Some(name) = function.get("name").and_then(Value::as_str) {
                             accumulator.name.get_or_insert_with(|| name.to_owned());
                         }
-                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                            accumulator.arguments.push_str(arguments);
-                        }
                     }
-                    let delta = ToolCallDelta {
-                        index,
-                        id: call.get("id").and_then(Value::as_str).map(str::to_owned),
-                        name: call
-                            .get("function")
-                            .and_then(|function| function.get("name"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        arguments_delta: call
-                            .get("function")
-                            .and_then(|function| function.get("arguments"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    };
-                    on_delta(StreamDelta {
-                        sequence,
-                        delta: StreamDeltaKind::ToolCall { call: delta },
-                        finish_reason: None,
-                        usage: None,
-                    })?;
-                    sequence += 1;
+                    if !accumulator.started {
+                        accumulator.started = true;
+                        on_event(ModelStreamEvent::ToolCallStarted {
+                            index,
+                            id: accumulator.id.clone(),
+                            name: accumulator.name.clone(),
+                        })?;
+                    }
+                    if let Some(arguments) = call
+                        .get("function")
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str)
+                    {
+                        accumulator.arguments.push_str(arguments);
+                        on_event(ModelStreamEvent::ToolCallArgumentsDelta {
+                            index,
+                            delta: arguments.to_owned(),
+                        })?;
+                    }
                 }
             }
-        }
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
-        }
-        if !reasoning.is_empty() {
-            content.push(ContentBlock::Reasoning { text: reasoning });
-        }
-        let tool_calls = tool_calls
-            .into_values()
-            .enumerate()
-            .map(|(index, call)| call.finish(index))
+            Ok(true)
+        })?;
+        let content = (!text.is_empty())
+            .then_some(ContentBlock::Text { text })
+            .into_iter()
             .collect();
+        let mut completed_calls = Vec::new();
+        for (index, accumulator) in tool_calls {
+            let call = accumulator.finish(index as usize);
+            on_event(ModelStreamEvent::ToolCallCompleted {
+                index,
+                call: call.clone(),
+            })?;
+            completed_calls.push(call);
+        }
+        let finish_reason = finish_reason.unwrap_or(FinishReason::Stop);
+        on_event(ModelStreamEvent::ResponseCompleted {
+            finish_reason: finish_reason.clone(),
+        })?;
         Ok(ModelResponse {
             id: format!("openai-stream-{}", self.model),
             model: self.model.clone(),
             content,
-            tool_calls,
-            finish_reason: finish_reason.unwrap_or(FinishReason::Stop),
+            tool_calls: completed_calls,
+            finish_reason,
             usage,
         })
     }
@@ -254,6 +279,7 @@ struct ToolAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    started: bool,
 }
 
 impl ToolAccumulator {
@@ -315,6 +341,7 @@ fn openai_tool(tool: &super::ToolDefinition) -> Value {
 fn role_name(role: Role) -> &'static str {
     match role {
         Role::System => "system",
+        Role::Developer => "developer",
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
@@ -424,16 +451,6 @@ fn parse_finish_reason(value: &str) -> FinishReason {
         "content_filter" => FinishReason::ContentFilter,
         "error" => FinishReason::Error,
         other => FinishReason::Other(other.to_owned()),
-    }
-}
-
-fn map_ureq_error(error: ureq::Error) -> ProviderError {
-    match error {
-        ureq::Error::Status(status, _) => ProviderError::Request {
-            provider: "openai",
-            status: Some(status),
-        },
-        ureq::Error::Transport(_) => ProviderError::Transport { provider: "openai" },
     }
 }
 

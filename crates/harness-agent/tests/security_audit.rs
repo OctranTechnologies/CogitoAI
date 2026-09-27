@@ -523,20 +523,26 @@ fn a_dirty_repository_is_handled_without_losing_the_users_work() {
 
 #[test]
 fn a_provider_that_fails_mid_run_closes_the_session_and_leaves_no_orphan() {
-    use harness_models::{ModelProvider, ModelRequest, ModelResponse, ProviderError};
+    use harness_models::{
+        ModelCapabilities, ModelDescriptor, ModelProvider, ModelRequest, ModelResponse,
+        ModelStreamEvent, ProviderError,
+    };
 
     struct FailingProvider;
     impl ModelProvider for FailingProvider {
-        fn name(&self) -> &str {
-            "failing"
-        }
-        fn capabilities(&self) -> harness_models::ModelCapabilities {
-            harness_models::ModelCapabilities {
-                streaming: true,
-                tool_calling: true,
-                vision: false,
-                reasoning: false,
-                context_window: None,
+        fn descriptor(&self) -> ModelDescriptor {
+            ModelDescriptor {
+                provider: "failing".to_owned(),
+                id: "failing".to_owned(),
+                display_name: "Failing".to_owned(),
+                capabilities: ModelCapabilities {
+                    text_input: true,
+                    streaming: true,
+                    tool_calling: true,
+                    system_instructions: true,
+                    context_window: None,
+                    ..ModelCapabilities::default()
+                },
             }
         }
         fn complete(&self, _request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
@@ -547,7 +553,7 @@ fn a_provider_that_fails_mid_run_closes_the_session_and_leaves_no_orphan() {
         fn stream(
             &self,
             _request: &ModelRequest,
-            _on_delta: &mut dyn FnMut(harness_models::StreamDelta) -> Result<(), ProviderError>,
+            _on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
         ) -> Result<ModelResponse, ProviderError> {
             Err(ProviderError::Transport {
                 provider: "failing",

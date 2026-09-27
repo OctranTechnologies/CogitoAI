@@ -7,8 +7,8 @@ use harness_agent::{
 };
 use harness_context::{ContextBudget, ContextBuilder, WorkspaceMetadata};
 use harness_models::{
-    ContentBlock, ModelCapabilities, ModelProvider, ModelRequest, ModelResponse, ProviderError,
-    ScriptedMockProvider, StreamDelta, StreamDeltaKind, ToolCall, Usage,
+    ContentBlock, ModelCapabilities, ModelDescriptor, ModelProvider, ModelRequest, ModelResponse,
+    ModelStreamEvent, ProviderError, ScriptedMockProvider, ToolCall, Usage,
 };
 use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
 use harness_session::{JsonlSessionStore, SessionStatus, SessionStore};
@@ -78,17 +78,19 @@ impl RecordingProvider {
 }
 
 impl ModelProvider for RecordingProvider {
-    fn name(&self) -> &str {
-        "recording"
-    }
-
-    fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities {
-            streaming: true,
-            tool_calling: true,
-            vision: false,
-            reasoning: false,
-            context_window: Some(4096),
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: "recording".to_owned(),
+            id: "recording".to_owned(),
+            display_name: "Recording".to_owned(),
+            capabilities: ModelCapabilities {
+                text_input: true,
+                streaming: true,
+                tool_calling: true,
+                system_instructions: true,
+                context_window: Some(4096),
+                ..ModelCapabilities::default()
+            },
         }
     }
 
@@ -99,16 +101,18 @@ impl ModelProvider for RecordingProvider {
     fn stream(
         &self,
         request: &ModelRequest,
-        on_delta: &mut dyn FnMut(StreamDelta) -> Result<(), ProviderError>,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError> {
         let response = self.response(request)?;
-        on_delta(StreamDelta {
-            sequence: 0,
-            delta: StreamDeltaKind::Text {
-                text: response.text(),
-            },
-            finish_reason: Some(response.finish_reason.clone()),
-            usage: response.usage.clone(),
+        on_event(ModelStreamEvent::ResponseStarted {
+            id: Some(response.id.clone()),
+            model: response.model.clone(),
+        })?;
+        on_event(ModelStreamEvent::TextDelta {
+            text: response.text(),
+        })?;
+        on_event(ModelStreamEvent::ResponseCompleted {
+            finish_reason: response.finish_reason.clone(),
         })?;
         Ok(response)
     }

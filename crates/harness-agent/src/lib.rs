@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use harness_context::{ContextBuilder, ContextInput, ToolContextResult, WorkspaceMetadata};
 use harness_core::{Error, SessionId};
 use harness_git::CheckpointStore;
-use harness_models::{Message, ModelProvider, ModelRequest, ProviderError, StreamDeltaKind, Usage};
+use harness_models::{
+    Message, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, Usage,
+};
 use harness_policy::{ExecutionMode, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest};
 use harness_session::{
     CompactState, ConversationMessage as SessionConversationMessage, EventBus, EventPayload,
@@ -393,21 +395,23 @@ impl AgentRunner {
                 max_output_tokens: None,
                 temperature: None,
                 metadata: Default::default(),
+                reasoning: None,
             };
+            let descriptor = self.provider.descriptor();
             self.emit(
                 &session_id,
                 EventPayload::ModelRequested {
-                    provider: self.provider.name().to_owned(),
+                    provider: descriptor.provider.clone(),
                     model: self.model.clone(),
                     prompt_tokens: None,
                 },
                 &collector,
             )?;
-            let response = match self.provider.stream(&model_request, &mut |delta| {
+            let response = match self.provider.generate(&model_request, &mut |event| {
                 if cancellation.is_cancelled() {
                     return Err(ProviderError::StreamConsumer);
                 }
-                if let StreamDeltaKind::Text { text } = delta.delta {
+                if let ModelStreamEvent::TextDelta { text } = event {
                     self.event_bus.publish(&HarnessEvent::new(
                         session_id.clone(),
                         EventPayload::AssistantDelta { text },
@@ -428,7 +432,7 @@ impl AgentRunner {
             self.emit(
                 &session_id,
                 EventPayload::ModelResponse {
-                    provider: self.provider.name().to_owned(),
+                    provider: descriptor.provider,
                     model: response.model.clone(),
                     text: response.text(),
                     input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),

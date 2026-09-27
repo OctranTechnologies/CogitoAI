@@ -8,8 +8,8 @@ use harness_context::{ContextBuilder, WorkspaceMetadata};
 use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest, SessionId};
 use harness_git::{CheckpointStore, ShadowCheckpointStore};
 use harness_models::{
-    ContentBlock, FinishReason, ModelCapabilities, ModelProvider, ModelRequest, ModelResponse,
-    ProviderError, ScriptedMockProvider, StreamDelta, StreamDeltaKind, ToolCall, Usage,
+    ContentBlock, FinishReason, ModelCapabilities, ModelDescriptor, ModelProvider, ModelRequest,
+    ModelResponse, ModelStreamEvent, ProviderError, ScriptedMockProvider, ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_rpc::AgentRunnerFactory as _;
@@ -1197,17 +1197,18 @@ fn cancelling_a_run_works_while_an_approval_is_left_unanswered() {
 struct SlowProvider;
 
 impl ModelProvider for SlowProvider {
-    fn name(&self) -> &str {
-        "slow"
-    }
-
-    fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities {
-            streaming: true,
-            tool_calling: false,
-            vision: false,
-            reasoning: false,
-            context_window: Some(1024),
+    fn descriptor(&self) -> ModelDescriptor {
+        ModelDescriptor {
+            provider: "slow".to_owned(),
+            id: "slow".to_owned(),
+            display_name: "Slow".to_owned(),
+            capabilities: ModelCapabilities {
+                text_input: true,
+                streaming: true,
+                system_instructions: true,
+                context_window: Some(1024),
+                ..ModelCapabilities::default()
+            },
         }
     }
 
@@ -1218,16 +1219,11 @@ impl ModelProvider for SlowProvider {
     fn stream(
         &self,
         _request: &ModelRequest,
-        on_delta: &mut dyn FnMut(StreamDelta) -> Result<(), ProviderError>,
+        on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError> {
         for _ in 0..100 {
-            on_delta(StreamDelta {
-                sequence: 0,
-                delta: StreamDeltaKind::Text {
-                    text: "working".to_owned(),
-                },
-                finish_reason: None,
-                usage: None,
+            on_event(ModelStreamEvent::TextDelta {
+                text: "working".to_owned(),
             })?;
             thread::sleep(Duration::from_millis(10));
         }

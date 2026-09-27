@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use harness_models::{
-    ContentBlock, FinishReason, Message, MockProvider, ModelProvider, ModelRequest, OpenAiProvider,
-    ProviderError, Role, StreamDelta, StreamDeltaKind, ToolDefinition,
+    ContentBlock, DeterministicMockProvider, FinishReason, Message, MockProvider, MockScenario,
+    ModelProvider, ModelRequest, ModelStreamEvent, OpenAiProvider, ProviderError, Role, ToolCall,
+    ToolDefinition,
 };
 use serde_json::json;
 
@@ -27,31 +28,33 @@ fn mock_provider_returns_deterministic_text_and_usage() {
 fn mock_provider_streams_text_deltas_in_order() {
     let provider = MockProvider::new("test-model");
     let request = ModelRequest::new("test-model", vec![Message::user_text("stream this")]);
-    let mut deltas = Vec::new();
+    let mut events = Vec::new();
 
     let response = provider
-        .stream(&request, &mut |delta: StreamDelta| {
-            deltas.push(delta);
+        .stream(&request, &mut |event| {
+            events.push(event);
             Ok(())
         })
         .unwrap();
 
     assert_eq!(response.text(), "mock response: stream this");
-    assert_eq!(
-        deltas
+    assert!(matches!(
+        events.first(),
+        Some(ModelStreamEvent::ResponseStarted { .. })
+    ));
+    assert!(
+        events
             .iter()
-            .map(|delta| delta.sequence)
-            .collect::<Vec<_>>(),
-        vec![0, 1, 2, 3]
+            .filter(|event| matches!(event, ModelStreamEvent::TextDelta { .. }))
+            .count()
+            > 1
     );
-    assert!(deltas
-        .iter()
-        .all(|delta| matches!(delta.delta, StreamDeltaKind::Text { .. })));
-    assert_eq!(
-        deltas.last().unwrap().finish_reason,
-        Some(FinishReason::Stop)
-    );
-    assert_eq!(deltas.last().unwrap().usage, response.usage);
+    assert!(matches!(
+        events.last(),
+        Some(ModelStreamEvent::ResponseCompleted {
+            finish_reason: FinishReason::Stop
+        })
+    ));
 }
 
 #[test]
@@ -65,11 +68,11 @@ fn mock_provider_serializes_and_streams_tool_calls() {
         }],
         ..ModelRequest::new("test-model", vec![Message::user_text("read it")])
     };
-    let mut deltas = Vec::new();
+    let mut events = Vec::new();
 
     let response = provider
-        .stream(&request, &mut |delta| {
-            deltas.push(delta);
+        .stream(&request, &mut |event| {
+            events.push(event);
             Ok(())
         })
         .unwrap();
@@ -79,7 +82,15 @@ fn mock_provider_serializes_and_streams_tool_calls() {
         response.tool_calls[0].arguments,
         json!({ "input": "read it" })
     );
-    assert!(matches!(deltas[0].delta, StreamDeltaKind::ToolCall { .. }));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ModelStreamEvent::ToolCallStarted { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ModelStreamEvent::ToolCallArgumentsDelta { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ModelStreamEvent::ToolCallCompleted { .. })));
     let serialized = serde_json::to_value(&response.tool_calls[0]).unwrap();
     assert_eq!(serialized["name"], "read_file");
     assert!(serialized.get("api_key").is_none());
@@ -134,13 +145,212 @@ fn missing_real_provider_credentials_fail_without_exposing_a_key() {
 }
 
 #[test]
-fn provider_capabilities_cover_streaming_tools_vision_reasoning_and_context() {
-    let capabilities = MockProvider::new("test-model").capabilities();
+fn provider_descriptors_report_known_capabilities_without_claiming_unknown_ones() {
+    let capabilities = MockProvider::new("test-model").descriptor().capabilities;
 
+    assert!(capabilities.text_input);
     assert!(capabilities.streaming);
     assert!(capabilities.tool_calling);
-    assert!(capabilities.vision);
-    assert!(capabilities.reasoning);
+    assert!(!capabilities.image_input);
+    assert!(!capabilities.reasoning);
     assert_eq!(capabilities.context_window, Some(8_192));
+    let serialized = serde_json::to_value(capabilities).unwrap();
+    assert_eq!(serialized["vision"], false);
+    assert!(serialized.get("image_input").is_none());
     let _metadata: BTreeMap<String, String> = BTreeMap::new();
+}
+
+#[test]
+fn normalized_stream_event_names_are_stable_and_provider_neutral() {
+    let events = [
+        (
+            ModelStreamEvent::ResponseStarted {
+                id: None,
+                model: "fixture".to_owned(),
+            },
+            "response.started",
+        ),
+        (
+            ModelStreamEvent::TextDelta {
+                text: "hello".to_owned(),
+            },
+            "text.delta",
+        ),
+        (
+            ModelStreamEvent::ReasoningDelta {
+                text: "summary".to_owned(),
+            },
+            "reasoning.delta",
+        ),
+        (
+            ModelStreamEvent::ToolCallStarted {
+                index: 0,
+                id: None,
+                name: None,
+            },
+            "tool_call.started",
+        ),
+        (
+            ModelStreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                delta: "{}".to_owned(),
+            },
+            "tool_call.arguments.delta",
+        ),
+        (
+            ModelStreamEvent::ToolCallCompleted {
+                index: 0,
+                call: ToolCall {
+                    id: "call".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: json!({}),
+                },
+            },
+            "tool_call.completed",
+        ),
+        (
+            ModelStreamEvent::UsageUpdated {
+                usage: harness_models::Usage::default(),
+            },
+            "usage.updated",
+        ),
+        (
+            ModelStreamEvent::ResponseCompleted {
+                finish_reason: FinishReason::Stop,
+            },
+            "response.completed",
+        ),
+        (
+            ModelStreamEvent::ResponseFailed {
+                error: "failed".to_owned(),
+            },
+            "response.failed",
+        ),
+    ];
+    for (event, expected) in events {
+        assert_eq!(serde_json::to_value(event).unwrap()["type"], expected);
+    }
+}
+
+#[test]
+fn deterministic_text_only_model_streams_normalized_text() {
+    let provider = DeterministicMockProvider::text_only("text-fixture", "hello world");
+    let request = ModelRequest::new("text-fixture", vec![Message::user_text("prompt")]);
+    let mut events = Vec::new();
+    let response = provider
+        .generate(&request, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(response.text(), "hello world");
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>(),
+        "hello world"
+    );
+}
+
+#[test]
+fn deterministic_model_streams_one_tool_call_in_order() {
+    let call = ToolCall {
+        id: "call-1".to_owned(),
+        name: "read_file".to_owned(),
+        arguments: json!({ "path": "src/lib.rs" }),
+    };
+    let provider = DeterministicMockProvider::streaming_tool_call("tool-fixture", call.clone());
+    let request = ModelRequest::new("tool-fixture", vec![Message::user_text("read the crate")]);
+    let mut events = Vec::new();
+    let response = provider
+        .generate(&request, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(response.tool_calls, [call]);
+    let completed_index = events
+        .iter()
+        .position(|event| matches!(event, ModelStreamEvent::ToolCallCompleted { index: 0, .. }))
+        .unwrap();
+    let finished_index = events
+        .iter()
+        .position(|event| matches!(event, ModelStreamEvent::ResponseCompleted { .. }));
+    assert!(completed_index < finished_index.unwrap());
+}
+
+#[test]
+fn deterministic_model_streams_tool_lifecycle_and_parallel_calls() {
+    let call = |id: &str, name: &str| ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments: json!({ "id": id }),
+    };
+    let calls = vec![call("one", "read_file"), call("two", "search")];
+    let provider = DeterministicMockProvider::multiple_tool_calls("tools-fixture", calls.clone());
+    let request = ModelRequest::new("tools-fixture", vec![Message::user_text("inspect")]);
+    let mut events = Vec::new();
+    let response = provider
+        .generate(&request, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(response.tool_calls, calls);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelStreamEvent::ToolCallCompleted { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn deterministic_midstream_error_emits_failure_after_partial_content() {
+    let provider = DeterministicMockProvider::new(
+        "error-fixture",
+        MockScenario::ErrorMidStream {
+            partial_text: "partial".to_owned(),
+            error: "fixture failure".to_owned(),
+        },
+    );
+    let request = ModelRequest::new("error-fixture", vec![Message::user_text("prompt")]);
+    let mut events = Vec::new();
+    assert!(provider
+        .generate(&request, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .is_err());
+    assert!(matches!(events[1], ModelStreamEvent::TextDelta { .. }));
+    assert!(
+        matches!(events.last(), Some(ModelStreamEvent::ResponseFailed { error }) if error.contains("fixture failure"))
+    );
+}
+
+#[test]
+fn capability_validation_rejects_tools_for_text_only_model() {
+    let provider = DeterministicMockProvider::text_only("text-fixture", "hello");
+    let request = ModelRequest {
+        tools: vec![ToolDefinition {
+            name: "read_file".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: json!({ "type": "object" }),
+        }],
+        ..ModelRequest::new("text-fixture", vec![Message::user_text("prompt")])
+    };
+    assert!(matches!(
+        provider.generate(&request, &mut |_| Ok(())),
+        Err(ProviderError::UnsupportedCapability {
+            capability: "tool calling"
+        })
+    ));
 }

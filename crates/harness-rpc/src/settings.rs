@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use harness_core::discover_workspace;
-use harness_models::{ModelCapabilities, ModelConfig, ProviderKind};
+use harness_models::{provider_from_config, ModelCapabilities, ModelConfig, ProviderKind};
 use harness_policy::{ExecutionMode, OperationKind, PolicyDecision, PolicyEngine, PolicyRule};
 use serde::{Deserialize, Serialize};
 
@@ -468,22 +468,9 @@ pub fn credential_status(model: &ModelConfig, store: &dyn SecretStore) -> Creden
 
 /// Capabilities the runtime knows about for the selected provider.
 fn capabilities(model: &ModelConfig) -> ModelCapabilities {
-    match model.provider {
-        ProviderKind::Mock => ModelCapabilities {
-            streaming: true,
-            tool_calling: true,
-            vision: false,
-            reasoning: false,
-            context_window: model.context_window,
-        },
-        ProviderKind::OpenAi => ModelCapabilities {
-            streaming: true,
-            tool_calling: true,
-            vision: true,
-            reasoning: model.model.starts_with("o"),
-            context_window: model.context_window,
-        },
-    }
+    provider_from_config(model)
+        .map(|provider| provider.descriptor().capabilities)
+        .unwrap_or_default()
 }
 
 /// Assembles the Models screen.
@@ -631,11 +618,7 @@ pub fn runtime_view(
             .into_owned(),
         log_level: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned()),
         log_target: "runtime stdout".to_owned(),
-        provider_names: runtime
-            .provider_names()
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect(),
+        provider_names: runtime.provider_names(),
         credential_source: store.source().as_str().to_owned(),
     }
 }

@@ -225,10 +225,10 @@ impl Runtime {
         self.tools.execute(&context, request)
     }
 
-    pub fn provider_names(&self) -> Vec<&str> {
+    pub fn provider_names(&self) -> Vec<String> {
         self.providers
             .iter()
-            .map(|provider| provider.name())
+            .map(|provider| provider.descriptor().provider)
             .collect()
     }
 

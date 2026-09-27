@@ -85,6 +85,34 @@ implementation except through the runtime boundary.
 | `harness-rpc` | Runtime composition and the client-facing runtime boundary | UI code or direct UI access to privileged implementations |
 | `harness-cli` | Command-line parsing and client presentation | Direct filesystem, shell, Git, or provider implementations |
 
+## Model provider boundary
+
+`harness-models` owns the canonical model contract: descriptors, capability
+flags, requests, responses, tool definitions/calls/results, usage, finish
+reasons, reasoning configuration, provider errors, and normalized stream events.
+`ModelProvider::generate` checks a request against the descriptor's
+capabilities and emits the same event vocabulary whether an adapter streams or
+must synthesize events from a complete response. The agent loop handles only
+those normalized events and a completed response; it does not inspect provider
+names or wire payloads.
+
+Provider facades are responsible for selecting a private protocol adapter for
+the configured model. The private `ProtocolAdapter` boundary and shared HTTP
+JSON/SSE framing utilities allow one provider facade to route models to
+different protocols without leaking JSON payloads into runtime types. The
+existing OpenAI adapter uses Chat Completions. Deterministic mock adapters cover
+text, single and multiple tool calls, and a mid-stream failure. Anthropic,
+Gemini, OpenCode Zen, and OpenCode Go are not implemented yet; future Zen/Go
+catalog entries can choose Responses, Chat Completions, or Messages adapters
+individually.
+
+Capabilities describe what the selected model adapter can substantiate, not
+what a provider family might support in general. Unknown limits and features
+remain absent/false. Private chain-of-thought is not surfaced as
+`reasoning.delta`; adapters may emit that event only for content safe to expose,
+such as a provider-supplied summary. `harness-core` remains free of model and
+provider types.
+
 
 ## Runtime boundary
 
@@ -167,4 +195,3 @@ The expected internal graph is:
 - `harness-cli`: depends on `harness-agent` and the capability crates.
 - `cogitoai-desktop`: depends on `harness-rpc` only, which is what keeps the
   shell from reaching a privileged implementation directly.
-

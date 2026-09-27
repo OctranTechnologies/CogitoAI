@@ -13,8 +13,8 @@ use harness_core::{
 use harness_git::{CheckpointStore, GitClient, GitDiff, ShadowCheckpointStore};
 use harness_models::{
     provider_from_config, ContentBlock, FinishReason, Message, ModelConfig, ModelProvider,
-    ModelRequest, ModelResponse, ProviderError, ProviderKind, ScriptedMockProvider, StreamDelta,
-    ToolCall, Usage,
+    ModelRequest, ModelResponse, ModelStreamEvent, ProviderError, ProviderKind,
+    ScriptedMockProvider, ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{
@@ -765,19 +765,15 @@ fn ask(cli: &Cli, prompt: &str, stream: bool) -> Result<(), Box<dyn std::error::
     let config = model_config(cli)?;
     let provider = provider_from_config(&config)?;
     let request = ModelRequest::new(config.model.clone(), vec![Message::user_text(prompt)]);
-    let response = if stream {
-        provider.stream(&request, &mut |delta: StreamDelta| {
-            if let harness_models::StreamDeltaKind::Text { text } = &delta.delta {
-                if !cli.json {
-                    print!("{text}");
-                    let _ = io::stdout().flush();
-                }
+    let response = provider.generate(&request, &mut |event: ModelStreamEvent| {
+        if stream && !cli.json {
+            if let ModelStreamEvent::TextDelta { text } = event {
+                print!("{text}");
+                let _ = io::stdout().flush();
             }
-            Ok(())
-        })?
-    } else {
-        provider.complete(&request)?
-    };
+        }
+        Ok(())
+    })?;
     if cli.json {
         println!("{}", serde_json::to_string(&response)?);
     } else {
@@ -799,19 +795,20 @@ fn ask(cli: &Cli, prompt: &str, stream: bool) -> Result<(), Box<dyn std::error::
 fn model_info(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let config = model_config(cli)?;
     let provider = provider_from_config(&config)?;
+    let descriptor = provider.descriptor();
     let info = json!({
-        "provider": provider.name(),
-        "model": config.model,
-        "capabilities": provider.capabilities(),
+        "provider": descriptor.provider,
+        "model": descriptor.id,
+        "capabilities": descriptor.capabilities,
     });
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&info)?);
     } else {
-        println!("provider: {}", provider.name());
-        println!("model: {}", config.model);
+        println!("provider: {}", descriptor.provider);
+        println!("model: {}", descriptor.id);
         println!(
             "capabilities: {}",
-            serde_json::to_string_pretty(&provider.capabilities())?
+            serde_json::to_string_pretty(&descriptor.capabilities)?
         );
     }
     Ok(())
