@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use clap::{Parser, Subcommand};
 use harness_agent::{AgentLimits, AgentRunner, AgentTask, ApprovalHandler, CompactionConfig};
 use harness_context::{ContextBuilder, WorkspaceMetadata};
-use harness_core::{discover_workspace, init_logging, CheckpointId, HarnessConfig, SessionId};
+use harness_core::{
+    discover_workspace, init_logging, CheckpointId, HarnessConfig, SessionId, WorkingTreeState,
+};
 use harness_git::{CheckpointStore, GitClient, GitDiff, ShadowCheckpointStore};
 use harness_models::{
     provider_from_config, ContentBlock, FinishReason, Message, ModelConfig, ModelProvider,
@@ -222,6 +224,11 @@ fn interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_path = std::fs::canonicalize(effective_path(cli, Path::new(".")))?;
     let workspace = discover_workspace(&workspace_path)?;
     let model = model_config(cli)?;
+    let project_root = workspace
+        .repository_root
+        .clone()
+        .unwrap_or_else(|| workspace.current_directory.clone());
+    let policy = policy_for_workspace(&project_root)?;
     let mut notices = Vec::new();
     if workspace.repository_root.is_none() {
         notices.push(
@@ -241,6 +248,12 @@ fn interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         workspace: display_workspace_path(&workspace_path),
         notice: (!notices.is_empty()).then(|| notices.join("  |  ")),
+        execution_mode: execution_mode_name(policy.mode()).to_owned(),
+        branch: workspace.git.branch.clone(),
+        workspace_dirty: workspace
+            .git
+            .working_tree
+            .map(|state| matches!(state, WorkingTreeState::Dirty)),
     };
     let cli = cli.clone();
     let mut tui = Tui::new(startup)?;
@@ -262,6 +275,29 @@ fn display_workspace_path(path: &Path) -> String {
     }
     #[cfg(not(windows))]
     displayed
+}
+
+fn policy_for_workspace(
+    project_root: &Path,
+) -> Result<Arc<dyn Policy>, harness_policy::PolicyError> {
+    let config = project_root.join(".agent/config.toml");
+    if config.is_file() {
+        Ok(Arc::new(PolicyEngine::from_file(&config, project_root)?))
+    } else {
+        Ok(Arc::new(PolicyEngine::new(
+            ExecutionMode::Normal,
+            project_root,
+        )))
+    }
+}
+
+fn execution_mode_name(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::ReadOnly => "read-only",
+        ExecutionMode::Safe => "safe",
+        ExecutionMode::Normal => "normal",
+        ExecutionMode::Auto => "auto",
+    }
 }
 
 /// A line-oriented fallback for terminals that report `TERM=dumb`.
@@ -755,14 +791,8 @@ fn run_agent_with_ui(
         .repository_root
         .clone()
         .unwrap_or_else(|| description.current_directory.clone());
-    let policy: Arc<dyn Policy> = if project_root.join(".agent/config.toml").is_file() {
-        Arc::new(PolicyEngine::from_file(
-            &project_root.join(".agent/config.toml"),
-            &project_root,
-        )?)
-    } else {
-        Arc::new(PolicyEngine::new(ExecutionMode::Normal, &project_root))
-    };
+    let policy = policy_for_workspace(&project_root)?;
+    let execution_mode = execution_mode_name(policy.mode()).to_owned();
     let event_bus = EventBus::new();
     let sessions = Arc::new(JsonlSessionStore::with_event_bus(
         &cli.session_root,
@@ -779,6 +809,13 @@ fn run_agent_with_ui(
     let git_status = GitClient::open(&path)
         .ok()
         .and_then(|client| client.status().ok());
+    if let Some(tui) = &tui {
+        tui.workspace_context(
+            &execution_mode,
+            git_status.as_ref().and_then(|status| status.branch.clone()),
+            git_status.as_ref().map(|status| !status.is_clean),
+        );
+    }
     let workspace = WorkspaceMetadata {
         root: Some(project_root.clone()),
         branch: description.git.branch.clone(),
@@ -847,7 +884,20 @@ fn run_agent_with_ui(
     if let Some(checkpoints) = checkpoints {
         runner = runner.with_checkpoints(checkpoints);
     }
-    let outcome = runner.run(&agent_task, &cancellation)?;
+    let outcome = runner.run(&agent_task, &cancellation);
+    if let Some(tui) = &tui {
+        let final_git_status = GitClient::open(&project_root)
+            .ok()
+            .and_then(|client| client.status().ok());
+        tui.workspace_context(
+            &execution_mode,
+            final_git_status
+                .as_ref()
+                .and_then(|status| status.branch.clone()),
+            final_git_status.as_ref().map(|status| !status.is_clean),
+        );
+    }
+    let outcome = outcome?;
     print_completion(cli, &outcome, tui.as_ref());
     Ok(())
 }
@@ -1012,6 +1062,7 @@ impl EventOutput {
             return;
         }
         if let Some(tui) = &self.tui {
+            tui.runtime_event(&event.payload);
             if let Some(activity) = format_activity(event) {
                 tui.activity(activity);
             }

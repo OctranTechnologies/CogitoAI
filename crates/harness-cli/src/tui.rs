@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -9,6 +9,7 @@ use crossterm::terminal::{
     self, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use crossterm::{cursor::Show, style::ResetColor};
+use harness_session::EventPayload;
 use harness_tools::CancellationToken;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position};
@@ -44,10 +45,19 @@ pub struct StartupInfo {
     pub version: String,
     pub workspace: String,
     pub notice: Option<String>,
+    pub execution_mode: String,
+    pub branch: Option<String>,
+    pub workspace_dirty: Option<bool>,
 }
 
 enum UiMessage {
     Activity(String),
+    RuntimeEvent(EventPayload),
+    WorkspaceContext {
+        execution_mode: String,
+        branch: Option<String>,
+        workspace_dirty: Option<bool>,
+    },
     Approval {
         tool: String,
         response: SyncSender<bool>,
@@ -63,6 +73,23 @@ pub struct TuiSender {
 impl TuiSender {
     pub fn activity(&self, message: impl Into<String>) {
         let _ = self.sender.send(UiMessage::Activity(message.into()));
+    }
+
+    pub fn runtime_event(&self, event: &EventPayload) {
+        let _ = self.sender.send(UiMessage::RuntimeEvent(event.clone()));
+    }
+
+    pub fn workspace_context(
+        &self,
+        execution_mode: &str,
+        branch: Option<String>,
+        workspace_dirty: Option<bool>,
+    ) {
+        let _ = self.sender.send(UiMessage::WorkspaceContext {
+            execution_mode: execution_mode.to_owned(),
+            branch,
+            workspace_dirty,
+        });
     }
 
     pub fn request_approval(&self, tool: &str) -> bool {
@@ -94,6 +121,15 @@ enum InputAction {
 
 struct AppState {
     startup: StartupInfo,
+    execution_mode: String,
+    branch: Option<String>,
+    workspace_dirty: Option<bool>,
+    token_usage: Option<(u64, u64)>,
+    token_usage_complete: bool,
+    run_started: Option<Instant>,
+    last_run_duration: Option<Duration>,
+    current_action: Option<String>,
+    active_process: Option<String>,
     activity: VecDeque<String>,
     input: String,
     cursor: usize,
@@ -112,6 +148,15 @@ struct AppState {
 impl AppState {
     fn new(startup: StartupInfo, colors: bool) -> Self {
         let mut state = Self {
+            execution_mode: startup.execution_mode.clone(),
+            branch: startup.branch.clone(),
+            workspace_dirty: startup.workspace_dirty,
+            token_usage: None,
+            token_usage_complete: true,
+            run_started: None,
+            last_run_duration: None,
+            current_action: None,
+            active_process: None,
             startup,
             activity: VecDeque::new(),
             input: String::new(),
@@ -140,6 +185,115 @@ impl AppState {
         self.activity.push_back(message);
     }
 
+    fn apply_runtime_event(&mut self, event: EventPayload) {
+        match event {
+            EventPayload::ModelRequested { .. } => {
+                self.current_action = Some("Thinking".to_owned());
+            }
+            EventPayload::ModelResponse {
+                provider,
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                if provider.to_ascii_lowercase().contains("mock") {
+                    self.token_usage = None;
+                    self.token_usage_complete = false;
+                } else {
+                    self.record_token_usage(input_tokens, output_tokens);
+                }
+                self.current_action = Some("Reviewing response".to_owned());
+            }
+            EventPayload::ToolRequested { tool, arguments } => {
+                let action = match tool.as_str() {
+                    "read_file" => "Reading file",
+                    "list_directory" => "Reading directory",
+                    "glob" => "Searching files",
+                    "grep" => "Searching symbol",
+                    "write_file" | "apply_patch" => "Editing file",
+                    "shell" => "Running command",
+                    _ => "Using tool",
+                };
+                let target = arguments
+                    .get("path")
+                    .or_else(|| arguments.get("pattern"))
+                    .or_else(|| arguments.get("query"))
+                    .or_else(|| arguments.get("command"));
+                self.current_action = Some(target.map_or_else(
+                    || format!("{action} · {tool}"),
+                    |target| format!("{action} · {}", compact(target, 72)),
+                ));
+            }
+            EventPayload::ToolStarted { tool } if self.current_action.is_none() => {
+                self.current_action = Some(format!("Running {tool}"));
+            }
+            EventPayload::ToolStarted { .. } => {}
+            EventPayload::ProcessStarted { command, .. } => {
+                self.active_process = Some(compact(&command, 72));
+                self.current_action = Some("Running command".to_owned());
+            }
+            EventPayload::ProcessExited { .. } => {
+                self.active_process = None;
+                self.current_action = Some("Checking command result".to_owned());
+            }
+            EventPayload::ToolCompleted { .. } => {
+                self.current_action = Some("Thinking".to_owned());
+            }
+            EventPayload::ToolFailed { .. } => {
+                self.current_action = Some("Recovering from tool error".to_owned());
+            }
+            EventPayload::VerificationStarted { .. } => {
+                self.current_action = Some("Running checks".to_owned());
+            }
+            EventPayload::VerificationResult {
+                category, passed, ..
+            } => {
+                let check = if category.to_ascii_lowercase().contains("test") {
+                    "Tests"
+                } else {
+                    "Checks"
+                };
+                self.current_action = Some(format!(
+                    "{check} {}",
+                    if passed { "passed" } else { "failed" }
+                ));
+            }
+            EventPayload::FileChanged { .. } => {
+                self.workspace_dirty = Some(true);
+                self.current_action = Some("Updating workspace".to_owned());
+            }
+            EventPayload::SessionResumed { .. } => {
+                self.current_action = Some("Resuming session".to_owned());
+            }
+            EventPayload::SessionCompleted { .. } => {
+                self.active_process = None;
+                self.current_action = Some("Task completed".to_owned());
+            }
+            EventPayload::SessionFailed { .. } => {
+                self.active_process = None;
+                self.current_action = Some("Task failed".to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    fn record_token_usage(&mut self, input: Option<u32>, output: Option<u32>) {
+        if !self.token_usage_complete {
+            return;
+        }
+        match (input, output) {
+            (Some(input), Some(output)) => {
+                let total = self.token_usage.get_or_insert((0, 0));
+                total.0 += u64::from(input);
+                total.1 += u64::from(output);
+            }
+            _ => {
+                self.token_usage = None;
+                self.token_usage_complete = false;
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -154,6 +308,7 @@ impl AppState {
                 if let Some(cancellation) = &self.cancellation {
                     cancellation.cancel();
                 }
+                self.current_action = Some("Cancelling".to_owned());
                 self.status =
                     "Cancellation requested  |  Waiting for the current operation to stop"
                         .to_owned();
@@ -184,11 +339,13 @@ impl AppState {
                     KeyCode::Char('y' | 'Y') => {
                         let _ = response.send(true);
                         self.status = format!("Approved · {tool}");
+                        self.current_action = Some("Continuing".to_owned());
                         self.push_activity(format!("Approval granted · {tool}"));
                     }
                     KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                         let _ = response.send(false);
                         self.status = format!("Denied · {tool}");
+                        self.current_action = Some("Continuing".to_owned());
                         self.push_activity(format!("Approval denied · {tool}"));
                     }
                     _ => self.pending_approval = Some((tool, response)),
@@ -473,6 +630,12 @@ impl Tui {
         }
         self.state.running = true;
         self.state.cancellation = Some(cancellation);
+        self.state.run_started = Some(Instant::now());
+        self.state.last_run_duration = None;
+        self.state.token_usage = None;
+        self.state.token_usage_complete = true;
+        self.state.current_action = Some("Starting agent".to_owned());
+        self.state.active_process = None;
         self.state.status = "Running  |  Ctrl+C cancels the current task".to_owned();
         self.state
             .push_activity(format!("Task started · {}", compact(label, 120)));
@@ -492,6 +655,7 @@ impl Tui {
     pub fn cancel_run(&mut self) {
         if let Some(cancellation) = &self.state.cancellation {
             cancellation.cancel();
+            self.state.current_action = Some("Cancelling".to_owned());
             self.state.status = "Cancellation requested".to_owned();
             self.dirty = true;
         }
@@ -551,8 +715,13 @@ impl Tui {
     where
         F: FnMut(String, &mut Self) -> Result<(), String>,
     {
+        let mut next_runtime_refresh = Instant::now() + Duration::from_secs(1);
         loop {
             self.drain_messages();
+            if self.state.running && Instant::now() >= next_runtime_refresh {
+                self.dirty = true;
+                next_runtime_refresh = Instant::now() + Duration::from_secs(1);
+            }
             if self.dirty && !self.suspended {
                 self.draw()?;
             }
@@ -598,8 +767,19 @@ impl Tui {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
                 UiMessage::Activity(message) => self.state.push_activity(message),
+                UiMessage::RuntimeEvent(event) => self.state.apply_runtime_event(event),
+                UiMessage::WorkspaceContext {
+                    execution_mode,
+                    branch,
+                    workspace_dirty,
+                } => {
+                    self.state.execution_mode = execution_mode;
+                    self.state.branch = branch;
+                    self.state.workspace_dirty = workspace_dirty;
+                }
                 UiMessage::Approval { tool, response } => {
                     self.state.pending_approval = Some((tool.clone(), response));
+                    self.state.current_action = Some("Waiting for approval".to_owned());
                     self.state.status =
                         format!("Approval request · {tool}  |  press Y to approve, N to deny");
                     self.state
@@ -608,6 +788,11 @@ impl Tui {
                 UiMessage::RunFinished(result) => {
                     self.state.running = false;
                     self.state.cancellation = None;
+                    if let Some(started) = self.state.run_started.take() {
+                        self.state.last_run_duration = Some(started.elapsed());
+                    }
+                    self.state.current_action = None;
+                    self.state.active_process = None;
                     if let Some((tool, response)) = self.state.pending_approval.take() {
                         let _ = response.send(false);
                         self.state
@@ -667,13 +852,18 @@ fn restore_terminal(terminal: &mut BackendTerminal) {
 fn draw_ui(frame: &mut Frame<'_>, state: &AppState, colors: bool) {
     let area = frame.area();
     let input_rows = state.input.lines().count().clamp(1, 5) as u16;
-    let input_height = (input_rows + 2).min(area.height.saturating_sub(2).max(2));
+    let footer_height = 3.min(area.height);
+    let header_height = 4.min(area.height.saturating_sub(footer_height + 4)).max(1);
+    let input_space = area
+        .height
+        .saturating_sub(header_height + footer_height + 1)
+        .max(1);
+    let input_height = (input_rows + 2).min(7).min(input_space);
     let constraints = [
-        Constraint::Length(4),
-        Constraint::Min(3),
-        Constraint::Length(1),
+        Constraint::Length(header_height),
+        Constraint::Min(1),
         Constraint::Length(input_height),
-        Constraint::Length(1),
+        Constraint::Length(footer_height),
     ];
     let areas = Layout::vertical(constraints).split(area);
 
@@ -752,26 +942,16 @@ fn draw_ui(frame: &mut Frame<'_>, state: &AppState, colors: bool) {
         .collect::<Vec<_>>();
     frame.render_widget(List::new(items).block(activity_block), areas[1]);
 
-    let status_style = if colors {
-        Style::default().fg(accent)
-    } else {
-        Style::default()
-    };
-    frame.render_widget(
-        Paragraph::new(format!(" {}", sanitize(&state.status))).style(status_style),
-        areas[2],
-    );
-
     let input_block = Block::default()
         .title(" INPUT  Enter runs  |  Alt+Enter adds a line ")
         .borders(Borders::TOP)
         .border_style(Style::default().fg(muted));
-    let input_inner = input_block.inner(areas[3]);
+    let input_inner = input_block.inner(areas[2]);
     let prompt = "> ";
     let input = Paragraph::new(format!("{prompt}{}", state.input))
         .wrap(Wrap { trim: false })
         .block(input_block);
-    frame.render_widget(input, areas[3]);
+    frame.render_widget(input, areas[2]);
     let (cursor_row, cursor_col) = cursor_position(&state.input, state.cursor);
     let cursor_x = input_inner
         .x
@@ -782,15 +962,220 @@ fn draw_ui(frame: &mut Frame<'_>, state: &AppState, colors: bool) {
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
 
-    let footer = if state.running {
-        " Ctrl+C cancels  |  PageUp/PageDown scroll activity  |  approvals: Y / N"
+    let footer_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(muted));
+    let footer_inner = footer_block.inner(areas[3]);
+    let detail_style = if colors && state.pending_approval.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else if colors && state.running {
+        Style::default().fg(accent)
     } else {
-        " Ctrl+C / Ctrl+D exit  |  Up/Down history  |  Tab completes commands  |  /help"
+        Style::default().fg(muted)
     };
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(muted)),
-        areas[4],
-    );
+    let status = Paragraph::new(vec![
+        status_line(state, footer_inner.width, colors),
+        Line::from(Span::styled(
+            format!(
+                " {}",
+                truncate_status(
+                    &status_detail(state),
+                    footer_inner.width.saturating_sub(1) as usize
+                )
+            ),
+            detail_style,
+        )),
+    ])
+    .block(footer_block);
+    frame.render_widget(status, areas[3]);
+}
+
+fn status_line(state: &AppState, width: u16, colors: bool) -> Line<'static> {
+    let available = usize::from(width.saturating_sub(2));
+    let compact_mode = if available < 26 {
+        match state.execution_mode.as_str() {
+            "read-only" => "ro",
+            "normal" => "norm",
+            mode => mode,
+        }
+    } else {
+        &state.execution_mode
+    };
+    let mode = compact_mode.to_owned();
+    let runtime = state
+        .run_started
+        .map(|started| started.elapsed())
+        .or(state.last_run_duration)
+        .map(format_runtime);
+
+    let mut middle: Vec<(String, Color)> = Vec::new();
+    let tokens = state.token_usage.map(|(input, output)| {
+        (
+            format!("tok {}", format_token_count(input.saturating_add(output))),
+            Color::Cyan,
+        )
+    });
+    let branch = workspace_marker(state).map(|branch| (branch, Color::DarkGray));
+    let minimum_model_width = if available >= 32 { 10 } else { 1 };
+    for candidate in [tokens, branch].into_iter().flatten() {
+        let mut candidate_middle = middle.clone();
+        candidate_middle.push(candidate.clone());
+        let required = status_fixed_width(&mode, &candidate_middle, runtime.as_deref());
+        if required.saturating_add(minimum_model_width) <= available {
+            middle.push(candidate);
+        }
+    }
+
+    let fixed_width = status_fixed_width(&mode, &middle, runtime.as_deref());
+    let model_width = available.saturating_sub(fixed_width);
+    let model = truncate_status(&compact(&state.startup.model, 240), model_width);
+    let has_middle = !middle.is_empty();
+    let total_width = fixed_width + model.chars().count();
+    let extra = available.saturating_sub(total_width);
+    let (left_gap, right_gap) = if has_middle && runtime.is_some() {
+        (2 + extra / 2, 2 + extra - extra / 2)
+    } else if has_middle {
+        (2, 0)
+    } else if runtime.is_some() {
+        (2 + extra, 0)
+    } else {
+        (0, 0)
+    };
+
+    let accent = if colors { Color::Cyan } else { Color::Reset };
+    let mode_color = if colors {
+        match state.execution_mode.as_str() {
+            "read-only" => Color::Blue,
+            "safe" => Color::Yellow,
+            "normal" => Color::Green,
+            "auto" => Color::Magenta,
+            _ => Color::Reset,
+        }
+    } else {
+        Color::Reset
+    };
+    let muted = if colors {
+        Color::DarkGray
+    } else {
+        Color::Reset
+    };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(model, Style::default().fg(accent)),
+        Span::styled(" │ ", Style::default().fg(muted)),
+        Span::styled(mode, Style::default().fg(mode_color)),
+    ];
+    if has_middle {
+        spans.push(Span::raw(" ".repeat(left_gap)));
+        for (index, (text, color)) in middle.into_iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" · ", Style::default().fg(muted)));
+            }
+            spans.push(Span::styled(text, Style::default().fg(color)));
+        }
+    }
+    if let Some(runtime) = runtime {
+        spans.push(Span::raw(" ".repeat(if has_middle {
+            right_gap
+        } else {
+            left_gap
+        })));
+        spans.push(Span::styled(runtime, Style::default().fg(muted)));
+    }
+    Line::from(spans)
+}
+
+fn status_fixed_width(mode: &str, middle: &[(String, Color)], runtime: Option<&str>) -> usize {
+    let middle_width = middle
+        .iter()
+        .map(|(text, _)| text.chars().count())
+        .sum::<usize>()
+        + middle.len().saturating_sub(1) * 3;
+    mode.chars().count()
+        + 3
+        + middle_width
+        + runtime.map_or(0, |text| text.chars().count())
+        + if middle.is_empty() {
+            usize::from(runtime.is_some()) * 2
+        } else {
+            2 + usize::from(runtime.is_some()) * 2
+        }
+}
+
+fn workspace_marker(state: &AppState) -> Option<String> {
+    let branch = state.branch.as_deref().map(|branch| compact(branch, 28));
+    match (branch, state.workspace_dirty) {
+        (Some(branch), Some(true)) => Some(format!("{branch}*")),
+        (Some(branch), _) => Some(branch),
+        (None, Some(true)) => Some("dirty".to_owned()),
+        (None, Some(false)) => Some("clean".to_owned()),
+        (None, None) => None,
+    }
+}
+
+fn format_runtime(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3_600 {
+        format!(
+            "run {}:{:02}:{:02}",
+            seconds / 3_600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    } else {
+        format!("run {}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 10_000 {
+        format!("{}k", tokens / 1_000)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn truncate_status(value: &str, max_chars: usize) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() <= max_chars {
+        value.to_owned()
+    } else if max_chars == 0 {
+        String::new()
+    } else if max_chars == 1 {
+        "…".to_owned()
+    } else {
+        format!(
+            "{}…",
+            characters[..max_chars - 1].iter().collect::<String>()
+        )
+    }
+}
+
+fn status_detail(state: &AppState) -> String {
+    if let Some((tool, _)) = &state.pending_approval {
+        return format!("Approval: {tool} · Y approve · N deny · Ctrl+C cancel");
+    }
+    if state.running {
+        let action = if let Some(process) = &state.active_process {
+            format!("Process · {process}")
+        } else {
+            state
+                .current_action
+                .as_deref()
+                .unwrap_or("Agent working")
+                .to_owned()
+        };
+        return format!("{action} · Ctrl+C cancel · PgUp/PgDn scroll");
+    }
+    if state.status.starts_with("Task failed") {
+        state.status.clone()
+    } else {
+        "Enter run · ↑/↓ history · /help · Ctrl+C exit".to_owned()
+    }
 }
 
 fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
@@ -846,6 +1231,9 @@ mod tests {
             notice: Some(
                 "Workspace is not a Git repository; checkpoints are unavailable".to_owned(),
             ),
+            execution_mode: "normal".to_owned(),
+            branch: Some("main".to_owned()),
+            workspace_dirty: Some(false),
         }
     }
 
@@ -948,5 +1336,139 @@ mod tests {
             terminal.backend().buffer().area,
             ratatui::layout::Rect::new(0, 0, 36, 12)
         );
+    }
+
+    fn status_text(state: &AppState, width: u16) -> String {
+        status_line(state, width, false)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn status_fixture() -> AppState {
+        let mut state = AppState::new(startup(), false);
+        state.startup.provider = "OpenAI".to_owned();
+        state.startup.model = "anthropic/claude-sonnet-4.5-super-long-model-name".to_owned();
+        state.execution_mode = "normal".to_owned();
+        state.branch = Some("main".to_owned());
+        state.workspace_dirty = Some(true);
+        state.token_usage = Some((12_345, 678));
+        state.last_run_duration = Some(Duration::from_secs(65));
+        state
+    }
+
+    #[test]
+    fn status_line_fits_requested_widths_and_shortens_long_model_names() {
+        let state = status_fixture();
+        let snapshots = [
+            (
+                60,
+                " anthropic/claude-sonn… │ normal  tok 13k · main*  run 1:05",
+            ),
+            (
+                80,
+                " anthropic/claude-sonnet-4.5-super-long-mo… │ normal  tok 13k · main*  run 1:05",
+            ),
+            (
+                120,
+                " anthropic/claude-sonnet-4.5-super-long-model-name │ normal                  tok 13k · main*                   run 1:05",
+            ),
+            (
+                180,
+                " anthropic/claude-sonnet-4.5-super-long-model-name │ normal                                                tok 13k · main*                                                 run 1:05",
+            ),
+        ];
+        for (width, expected) in snapshots {
+            let rendered = status_text(&state, width);
+            assert_eq!(rendered, expected, "{width} column snapshot");
+            assert!(
+                rendered.chars().count() < usize::from(width),
+                "status overflowed {width} columns: {rendered:?}"
+            );
+            assert!(rendered.contains("normal"), "{rendered:?}");
+            assert!(rendered.contains("tok 13k"), "{rendered:?}");
+            assert!(rendered.contains("main*"), "{rendered:?}");
+            assert!(rendered.contains("run 1:05"), "{rendered:?}");
+        }
+        assert!(status_text(&state, 60).contains("…"));
+        assert!(status_text(&state, 180).contains(&state.startup.model));
+    }
+
+    #[test]
+    fn unavailable_token_context_and_cost_metrics_are_hidden() {
+        let mut state = status_fixture();
+        state.token_usage = None;
+        let rendered = status_text(&state, 120);
+
+        assert!(!rendered.contains("tok"));
+        assert!(!rendered.contains("ctx"));
+        assert!(!rendered.contains('$'));
+
+        state.record_token_usage(Some(42), None);
+        state.record_token_usage(Some(10), Some(5));
+        assert!(state.token_usage.is_none());
+        assert!(!status_text(&state, 120).contains("tok"));
+
+        let mut mock_state = AppState::new(startup(), false);
+        mock_state.apply_runtime_event(EventPayload::ModelResponse {
+            provider: "scripted-mock".to_owned(),
+            model: "mock".to_owned(),
+            text: String::new(),
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+        });
+        assert!(mock_state.token_usage.is_none());
+        assert!(!status_text(&mock_state, 120).contains("tok"));
+    }
+
+    #[test]
+    fn execution_modes_have_distinct_restrained_colors() {
+        for (mode, color) in [
+            ("read-only", Color::Blue),
+            ("safe", Color::Yellow),
+            ("normal", Color::Green),
+            ("auto", Color::Magenta),
+        ] {
+            let mut state = status_fixture();
+            state.execution_mode = mode.to_owned();
+            let line = status_line(&state, 120, true);
+            let mode_span = line
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == mode)
+                .unwrap();
+            assert_eq!(mode_span.style.fg, Some(color));
+        }
+    }
+
+    #[test]
+    fn resize_during_a_run_preserves_status_action_and_input() {
+        let mut state = status_fixture();
+        state.running = true;
+        state.run_started = Some(Instant::now());
+        state.active_process = Some("cargo test".to_owned());
+        state.current_action = Some("Running command".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, &state, false))
+            .unwrap();
+
+        terminal.backend_mut().resize(60, 12);
+        terminal
+            .draw(|frame| draw_ui(frame, &state, false))
+            .unwrap();
+        let resized = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(resized.contains("normal"));
+        assert!(resized.contains("Process · cargo test"));
+        assert!(resized.contains("Ctrl+C cancel"));
+        assert!(resized.contains("> "));
     }
 }

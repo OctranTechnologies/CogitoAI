@@ -295,7 +295,12 @@ model commands. `/run <task>` starts work and `/resume <session-id> [task]`
 continues a saved session. Approval prompts accept `Y` or `N`. The activity feed
 shows concise tool and verification events; commands such as `/inspect` temporarily
 restore the normal terminal so their complete output remains available in scrollback.
-The latest activity is printed again when you leave the interface.
+The latest activity is printed again when you leave the interface. A compact
+status line at the bottom shows the model, active execution mode, repository branch
+and worktree state, reported token totals when a provider supplies reliable usage,
+and elapsed time for the current run. Its second line shows an approval, current
+action, or shortcuts. Context percentage, price, and reasoning effort are omitted
+when the runtime cannot determine them.
 
 `Alt+Enter` (or `Ctrl+J`) inserts a line break; Enter submits. Up/Down navigate
 command history for single-line input, and Tab completes slash commands. PageUp and
