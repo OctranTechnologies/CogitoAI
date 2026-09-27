@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -22,8 +22,11 @@ use harness_session::{
 use harness_tools::{CancellationToken, LocalProcessRunner, ToolRegistry};
 use harness_verification::{CommandVerifier, VerificationPlan};
 use serde_json::{json, Value};
+use tui::{StartupInfo, Tui, TuiSender};
 
-#[derive(Debug, Parser)]
+mod tui;
+
+#[derive(Clone, Debug, Parser)]
 #[command(name = "harness", about = "CogitoAI coding-agent harness")]
 struct Cli {
     #[arg(long, default_value = ".")]
@@ -46,7 +49,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 enum Command {
     #[command(name = ".", about = "Inspect the current workspace")]
     Workspace {
@@ -108,9 +111,10 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Tui,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 enum SessionCommand {
     List {
         #[arg(long, default_value_t = 20)]
@@ -182,6 +186,7 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             run_agent(cli, task.clone(), effective_path(cli, path), None)
         }
         Some(Command::Session { command }) => session_command(cli, command),
+        Some(Command::Tui) => interactive(cli),
         None => {
             if cli.json {
                 println!("{}", json!({"type": "workspace", "path": cli.workspace}));
@@ -199,6 +204,270 @@ fn effective_path(cli: &Cli, path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+fn interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.json {
+        return Err(
+            "the interactive TUI cannot be combined with --json; use --json with a command".into(),
+        );
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err("the interactive TUI needs a terminal on stdin and stdout; use `harness run` for scripts and pipes".into());
+    }
+    if std::env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb")) {
+        return plain_interactive(cli);
+    }
+
+    let workspace_path = std::fs::canonicalize(effective_path(cli, Path::new(".")))?;
+    let workspace = discover_workspace(&workspace_path)?;
+    let model = model_config(cli)?;
+    let mut notices = Vec::new();
+    if workspace.repository_root.is_none() {
+        notices.push(
+            "Notice: this workspace is not a Git repository; checkpoints are unavailable"
+                .to_owned(),
+        );
+    }
+    if model.provider != ProviderKind::Mock && std::env::var_os(&model.api_key_env).is_none() {
+        notices.push(format!(
+            "Notice: set {} to connect to the configured provider",
+            model.api_key_env
+        ));
+    }
+    let startup = StartupInfo {
+        model: model.model,
+        provider: format!("{:?}", model.provider),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        workspace: display_workspace_path(&workspace_path),
+        notice: (!notices.is_empty()).then(|| notices.join("  |  ")),
+    };
+    let cli = cli.clone();
+    let mut tui = Tui::new(startup)?;
+    tui.run(move |line, tui| dispatch_interactive(&cli, line, tui))?;
+    Ok(())
+}
+
+fn display_workspace_path(path: &Path) -> String {
+    let displayed = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(unc_path) = displayed.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc_path}");
+        }
+        displayed
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&displayed)
+            .to_owned()
+    }
+    #[cfg(not(windows))]
+    displayed
+}
+
+/// A line-oriented fallback for terminals that report `TERM=dumb`.
+fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = std::fs::canonicalize(effective_path(cli, Path::new(".")))?;
+    let model = model_config(cli)?;
+    println!(
+        "[<>] COGITOAI harness v{} (plain terminal mode)\nModel: {}  |  Provider: {:?}\nWorkspace: {}",
+        env!("CARGO_PKG_VERSION"),
+        model.model,
+        model.provider,
+        display_workspace_path(&workspace)
+    );
+    if model.provider != ProviderKind::Mock && std::env::var_os(&model.api_key_env).is_none() {
+        println!(
+            "Notice: set {} to connect to the configured provider",
+            model.api_key_env
+        );
+    }
+    println!("Enter a task, /help, or /exit. Ctrl+D exits.");
+    loop {
+        print!("harness> ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if matches!(line, "/exit" | "/quit") {
+            break;
+        }
+        if line == "/help" {
+            println!("Type a task to run it. /inspect and /sessions show workspace data; /exit leaves the prompt.");
+            continue;
+        }
+        if line == "/inspect" {
+            inspect(cli, &effective_path(cli, Path::new(".")))?;
+            continue;
+        }
+        if line == "/sessions" {
+            sessions(cli, 20)?;
+            continue;
+        }
+        if let Some(task) = line.strip_prefix("/run ") {
+            run_agent(
+                cli,
+                task.to_owned(),
+                effective_path(cli, Path::new(".")),
+                None,
+            )?;
+            break;
+        }
+        run_agent(
+            cli,
+            line.to_owned(),
+            effective_path(cli, Path::new(".")),
+            None,
+        )?;
+        // The line-oriented fallback has no persistent event loop for signal
+        // registration. Exit after a run so its one-shot Ctrl+C handler is not
+        // installed a second time in the same process.
+        break;
+    }
+    Ok(())
+}
+
+fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), String> {
+    if !line.starts_with('/') {
+        return start_interactive_run(cli, line, effective_path(cli, Path::new(".")), None, tui);
+    }
+    let (command, arguments) = line.split_once(char::is_whitespace).unwrap_or((&line, ""));
+    let arguments = arguments.trim();
+    match command {
+        "/help" => {
+            tui.add_activity("Commands: /run <task>, /resume <id> [task], /inspect [path], /sessions, /status [id], /diff [file], /undo [id], /config, /model, /clear, /cancel, /exit".to_owned());
+            Ok(())
+        }
+        "/run" => {
+            if arguments.is_empty() {
+                Err("usage: /run <task>".to_owned())
+            } else {
+                start_interactive_run(
+                    cli,
+                    arguments.to_owned(),
+                    effective_path(cli, Path::new(".")),
+                    None,
+                    tui,
+                )
+            }
+        }
+        "/resume" => {
+            let mut fields = arguments.splitn(2, char::is_whitespace);
+            let id = fields.next().unwrap_or_default();
+            if id.is_empty() {
+                return Err("usage: /resume <session-id> [task]".to_owned());
+            }
+            let session_id = SessionId::new(id.to_owned()).map_err(|error| error.to_string())?;
+            let store =
+                JsonlSessionStore::new(&cli.session_root).map_err(|error| error.to_string())?;
+            let existing = store.load(&session_id).map_err(|error| error.to_string())?;
+            let task = fields
+                .next()
+                .map(str::trim)
+                .filter(|task| !task.is_empty())
+                .unwrap_or(
+                    "Continue from the compacted session state and finish the remaining work.",
+                )
+                .to_owned();
+            start_interactive_run(cli, task, existing.workspace_root, Some(session_id), tui)
+        }
+        "/clear" => {
+            tui.clear_activity();
+            Ok(())
+        }
+        "/cancel" => {
+            tui.cancel_run();
+            Ok(())
+        }
+        "/exit" | "/quit" => {
+            tui.request_exit();
+            Ok(())
+        }
+        "/inspect" => {
+            let path = if arguments.is_empty() {
+                effective_path(cli, Path::new("."))
+            } else {
+                PathBuf::from(arguments.trim_matches('"'))
+            };
+            run_visible_command(tui, || inspect(cli, &path))
+        }
+        "/sessions" => {
+            let limit = if arguments.is_empty() {
+                20
+            } else {
+                arguments
+                    .parse::<usize>()
+                    .map_err(|error| error.to_string())?
+            };
+            run_visible_command(tui, || sessions(cli, limit))
+        }
+        "/status" => run_visible_command(tui, || {
+            status(cli, (!arguments.is_empty()).then_some(arguments), None)
+        }),
+        "/diff" => {
+            let file = (!arguments.is_empty()).then(|| PathBuf::from(arguments.trim_matches('"')));
+            run_visible_command(tui, || diff(cli, file.as_deref(), None))
+        }
+        "/undo" => run_visible_command(tui, || {
+            undo(cli, (!arguments.is_empty()).then_some(arguments), None)
+        }),
+        "/config" => run_visible_command(tui, || config_command(cli, None)),
+        "/model" => run_visible_command(tui, || model_info(cli)),
+        _ => Err(format!(
+            "unknown command {command}; type /help for available commands"
+        )),
+    }
+}
+
+fn run_visible_command(
+    tui: &mut Tui,
+    command: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), String> {
+    tui.suspend().map_err(|error| error.to_string())?;
+    let result = command();
+    let resume_result = tui.resume().map_err(|error| error.to_string());
+    result.map_err(|error| error.to_string())?;
+    resume_result?;
+    tui.add_activity("Command finished; full output is in the terminal scrollback".to_owned());
+    Ok(())
+}
+
+fn start_interactive_run(
+    cli: &Cli,
+    task: String,
+    workspace: PathBuf,
+    resume_session: Option<SessionId>,
+    tui: &mut Tui,
+) -> Result<(), String> {
+    let cancellation = CancellationToken::new();
+    if !tui.start_run(&task, cancellation.clone()) {
+        return Err("a task is already running".to_owned());
+    }
+    let sender = tui.sender();
+    let failed_sender = sender.clone();
+    let cli = cli.clone();
+    let spawn = std::thread::Builder::new()
+        .name("harness-agent-tui".to_owned())
+        .spawn(move || {
+            let result = run_agent_with_ui(
+                &cli,
+                task,
+                workspace,
+                resume_session,
+                Some(sender.clone()),
+                Some(cancellation),
+            )
+            .map_err(|error| error.to_string());
+            sender.run_finished(result);
+        });
+    if let Err(error) = spawn {
+        failed_sender.run_finished(Err(error.to_string()));
+    }
+    Ok(())
 }
 
 fn inspect(cli: &Cli, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -467,6 +736,17 @@ fn run_agent(
     path: PathBuf,
     resume_session: Option<SessionId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_agent_with_ui(cli, task, path, resume_session, None, None)
+}
+
+fn run_agent_with_ui(
+    cli: &Cli,
+    task: String,
+    path: PathBuf,
+    resume_session: Option<SessionId>,
+    tui: Option<TuiSender>,
+    cancellation: Option<CancellationToken>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(&path)?;
     let description = discover_workspace(&path)?;
     let model_config = model_config(cli)?;
@@ -533,11 +813,13 @@ fn run_agent(
         resume_session,
         ..AgentTask::default()
     };
-    let event_output = Arc::new(EventOutput::new(cli.json));
+    let event_output = Arc::new(EventOutput::new(cli.json, tui.clone()));
     let _subscription = event_output.subscribe(&event_bus);
-    let cancellation = CancellationToken::new();
-    let handler_token = cancellation.clone();
-    ctrlc::set_handler(move || handler_token.cancel())?;
+    let cancellation = cancellation.unwrap_or_default();
+    if tui.is_none() {
+        let handler_token = cancellation.clone();
+        ctrlc::set_handler(move || handler_token.cancel())?;
+    }
     let runner = AgentRunner::new(
         provider,
         model_config.model,
@@ -548,6 +830,7 @@ fn run_agent(
         AgentLimits::default(),
         Arc::new(CliApproval {
             auto_approve: cli.yes,
+            tui: tui.clone(),
         }),
     )
     .with_event_bus(event_bus)
@@ -565,7 +848,7 @@ fn run_agent(
         runner = runner.with_checkpoints(checkpoints);
     }
     let outcome = runner.run(&agent_task, &cancellation)?;
-    print_completion(cli, &outcome);
+    print_completion(cli, &outcome, tui.as_ref());
     Ok(())
 }
 
@@ -678,8 +961,13 @@ fn text_response(text: &str) -> ModelResponse {
     }
 }
 
-fn print_completion(cli: &Cli, outcome: &harness_agent::AgentOutcome) {
-    if !cli.json {
+fn print_completion(cli: &Cli, outcome: &harness_agent::AgentOutcome, tui: Option<&TuiSender>) {
+    if let Some(tui) = tui {
+        tui.activity(format!(
+            "Session {} finished · turns={} · tools={} · tokens={}",
+            outcome.session_id, outcome.turns, outcome.tool_calls, outcome.model_tokens
+        ));
+    } else if !cli.json {
         println!(
             "completed session {} (turns={}, tool_calls={}, model_tokens={})",
             outcome.session_id, outcome.turns, outcome.tool_calls, outcome.model_tokens
@@ -689,13 +977,15 @@ fn print_completion(cli: &Cli, outcome: &harness_agent::AgentOutcome) {
 
 struct EventOutput {
     json: bool,
+    tui: Option<TuiSender>,
     seen: Mutex<HashSet<EventId>>,
 }
 
 impl EventOutput {
-    fn new(json: bool) -> Self {
+    fn new(json: bool, tui: Option<TuiSender>) -> Self {
         Self {
             json,
+            tui,
             seen: Mutex::new(HashSet::new()),
         }
     }
@@ -719,6 +1009,12 @@ impl EventOutput {
                 "{}",
                 serde_json::to_string(event).expect("event serialization failed")
             );
+            return;
+        }
+        if let Some(tui) = &self.tui {
+            if let Some(activity) = format_activity(event) {
+                tui.activity(activity);
+            }
             return;
         }
         match &event.payload {
@@ -764,8 +1060,136 @@ impl EventOutput {
     }
 }
 
+fn format_activity(event: &HarnessEvent) -> Option<String> {
+    match &event.payload {
+        EventPayload::UserMessage { text } => Some(format!("Task · {}", concise(text, 120))),
+        EventPayload::ModelRequested {
+            provider, model, ..
+        } => Some(format!("Thinking · {provider}/{model}")),
+        EventPayload::ToolRequested { tool, arguments } => {
+            let target = arguments
+                .get("path")
+                .or_else(|| arguments.get("pattern"))
+                .or_else(|| arguments.get("query"))
+                .or_else(|| arguments.get("command"));
+            let description = match tool.as_str() {
+                "read_file" => "Reading file",
+                "list_directory" => "Reading directory",
+                "glob" => "Searching files",
+                "grep" => "Searching symbol",
+                "write_file" | "apply_patch" => "Editing file",
+                "shell" => "Running command",
+                _ => "Using tool",
+            };
+            Some(match target {
+                Some(target) => format!("{description} · {}", concise(target, 100)),
+                None => format!("{description} · {tool}"),
+            })
+        }
+        EventPayload::ToolApproved { tool, .. } => Some(format!("Approval granted · {tool}")),
+        EventPayload::ToolDenied { tool, reason } => Some(format!(
+            "Approval denied · {tool} · {}",
+            concise(reason, 80)
+        )),
+        EventPayload::ToolFailed { tool, error } => {
+            Some(format!("Tool failed · {tool} · {}", concise(error, 100)))
+        }
+        EventPayload::ProcessStarted { command, .. } => {
+            Some(format!("Running command · {}", concise(command, 120)))
+        }
+        EventPayload::ProcessExited {
+            exit_code,
+            timed_out,
+            cancelled,
+        } => {
+            if *cancelled {
+                Some("Command cancelled".to_owned())
+            } else if *timed_out {
+                Some("Command timed out".to_owned())
+            } else {
+                Some(format!(
+                    "Command exited · {}",
+                    exit_code.map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+                ))
+            }
+        }
+        EventPayload::FileChanged { path, change } => Some(format!(
+            "{} · {}",
+            match change {
+                harness_session::FileChange::Added => "Added file",
+                harness_session::FileChange::Modified => "Edited file",
+                harness_session::FileChange::Deleted => "Deleted file",
+            },
+            path.display()
+        )),
+        EventPayload::VerificationStarted { commands } => {
+            Some(format!("Running checks · {} command(s)", commands.len()))
+        }
+        EventPayload::VerificationResult {
+            command,
+            category,
+            passed,
+            ..
+        } => {
+            let kind = if category.to_ascii_lowercase().contains("test") {
+                "Test"
+            } else {
+                "Check"
+            };
+            Some(format!(
+                "{kind} {} · {}",
+                if *passed { "passed" } else { "failed" },
+                concise(command, 110)
+            ))
+        }
+        EventPayload::AssistantMessage { text } => Some(format!("Agent · {}", concise(text, 160))),
+        EventPayload::ContextCompacted { removed_items, .. } => {
+            Some(format!("Compacted context · removed {removed_items} items"))
+        }
+        EventPayload::SessionResumed { .. } => Some("Resumed session".to_owned()),
+        EventPayload::SessionCompleted { reason } => Some(format!(
+            "Task completed{}",
+            reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(" · {}", concise(reason, 100)))
+        )),
+        EventPayload::SessionFailed { error } => {
+            Some(format!("Task failed · {}", concise(error, 140)))
+        }
+        _ => None,
+    }
+}
+
+fn concise(value: &str, limit: usize) -> String {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let characters = normalized.chars().collect::<Vec<_>>();
+    if characters.len() <= limit {
+        normalized
+    } else {
+        format!(
+            "{}...",
+            characters[..limit.saturating_sub(3)]
+                .iter()
+                .collect::<String>()
+        )
+    }
+}
+
 struct CliApproval {
     auto_approve: bool,
+    tui: Option<TuiSender>,
 }
 
 impl ApprovalHandler for CliApproval {
@@ -775,6 +1199,9 @@ impl ApprovalHandler for CliApproval {
     ) -> Result<bool, harness_agent::AgentError> {
         if self.auto_approve {
             return Ok(true);
+        }
+        if let Some(tui) = &self.tui {
+            return Ok(tui.request_approval(&request.name));
         }
         eprint!("Approve tool {}? [y/N] ", request.name);
         let mut answer = String::new();

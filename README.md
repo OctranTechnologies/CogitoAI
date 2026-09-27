@@ -281,6 +281,34 @@ commands.
 `--yes` auto-approves policy prompts. Use it only in a disposable workspace or in
 CI.
 
+### Interactive terminal
+
+Start the full-screen terminal interface in a terminal:
+
+```bash
+cargo run -p harness-cli -- tui
+```
+
+The header shows the harness version, configured model and provider, and workspace.
+Type a task and press Enter, or use `/help` for session, inspection, recovery, and
+model commands. `/run <task>` starts work and `/resume <session-id> [task]`
+continues a saved session. Approval prompts accept `Y` or `N`. The activity feed
+shows concise tool and verification events; commands such as `/inspect` temporarily
+restore the normal terminal so their complete output remains available in scrollback.
+The latest activity is printed again when you leave the interface.
+
+`Alt+Enter` (or `Ctrl+J`) inserts a line break; Enter submits. Up/Down navigate
+command history for single-line input, and Tab completes slash commands. PageUp and
+PageDown scroll the activity feed. While work is running, `Ctrl+C` cancels it. At
+an idle prompt, `Ctrl+C` clears a draft and exits when the prompt is empty; `Ctrl+D`
+exits from an empty prompt. `Esc` clears the current draft.
+
+On terminals reporting `TERM=dumb`, the CLI uses a line-oriented fallback. It exits
+after running a task so Ctrl+C cancellation remains reliable. The full-screen UI
+requires terminal stdin and stdout; for pipes, scripts, and automation, keep using
+the existing commands such as `harness run` and `--json`. The interactive UI cannot
+be combined with `--json`.
+
 ## Running the desktop application
 
 The desktop is a client: it does not start or own the runtime, so run the

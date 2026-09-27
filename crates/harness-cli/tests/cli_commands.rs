@@ -25,6 +25,65 @@ fn assert_success(output: &Output) {
 }
 
 #[test]
+fn tui_refuses_pipes_without_writing_terminal_control_sequences() {
+    let temporary = tempdir().unwrap();
+    let output = cli(temporary.path(), &["tui"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("needs a terminal"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains('\u{1b}'));
+}
+
+#[test]
+fn json_tui_refusal_is_reported_as_a_json_error() {
+    let temporary = tempdir().unwrap();
+    let output = cli(temporary.path(), &["--json", "tui"]);
+
+    assert!(!output.status.success());
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("--json errors stay machine-readable");
+    assert_eq!(error["type"], "error");
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be combined"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains('\u{1b}'));
+}
+
+#[test]
+fn piped_plain_run_keeps_the_existing_human_readable_output() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let run = cli(
+        root,
+        &[
+            "--yes",
+            "run",
+            "create a mock output",
+            &root.to_string_lossy(),
+        ],
+    );
+
+    assert_success(&run);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("[tool] started list_directory"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("completed session"), "stdout: {stdout}");
+    assert!(!stdout.contains('\u{1b}'));
+}
+
+#[test]
+fn no_subcommand_keeps_the_legacy_workspace_summary() {
+    let temporary = tempdir().unwrap();
+    let output = cli(temporary.path(), &[]);
+
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CogitoAI harness workspace:"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains('\u{1b}'));
+}
+
+#[test]
 fn documents_and_runs_the_mock_cli_workflow() {
     let temporary = tempdir().unwrap();
     let root = temporary.path();
