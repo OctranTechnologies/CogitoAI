@@ -218,6 +218,43 @@ fn persists_reloads_resumes_and_reconstructs_a_mock_session() {
 }
 
 #[test]
+fn recent_session_titles_use_the_first_task_and_stay_bounded() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = JsonlSessionStore::new(temporary.path().join("sessions")).unwrap();
+    let session = store.create(&workspace).unwrap();
+    append(
+        &store,
+        &session,
+        EventPayload::UserMessage {
+            text: "  Fix\n the   mobile navigation  ".to_owned(),
+        },
+    );
+    let summaries = store.recent(10).unwrap();
+    assert_eq!(
+        summaries[0].title.as_deref(),
+        Some("Fix the mobile navigation")
+    );
+
+    let long_session = store.create(&workspace).unwrap();
+    append(
+        &store,
+        &long_session,
+        EventPayload::UserMessage {
+            text: "x".repeat(80),
+        },
+    );
+    let summary = store
+        .recent(10)
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.id == long_session.id)
+        .unwrap();
+    assert_eq!(summary.title.unwrap(), format!("{}…", "x".repeat(64)));
+}
+
+#[test]
 fn repeated_compaction_preserves_history_and_latest_state() {
     let temporary = tempdir().unwrap();
     let workspace = temporary.path().join("workspace");

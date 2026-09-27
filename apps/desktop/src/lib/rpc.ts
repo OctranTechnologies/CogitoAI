@@ -49,6 +49,8 @@ export interface WorkspaceSummary {
 export interface SessionSummary {
   id: string;
   workspace_root: string;
+  /** Deterministic title derived from the first user task. */
+  title?: string | null;
   status: "Active" | "Completed" | "Failed";
   created_at: number;
   last_updated_at: number;

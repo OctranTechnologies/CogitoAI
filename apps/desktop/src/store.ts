@@ -53,6 +53,7 @@ import {
   type SettingsSnapshot,
   type UpdateModelRequest,
 } from "./lib/settings";
+import { makeSessionTitle, sortSessionsByRecent } from "./lib/sidebar-model";
 
 export type { ChatMessage, RunPhase, TimelineEntry, ToolActivity, VerificationActivity } from "./lib/events";
 export type { ChangeSummary, CheckpointEntry, FileChange, FileView } from "./lib/changes";
@@ -126,7 +127,8 @@ export interface DesktopStore {
   disconnect: () => Promise<void>;
   setWorkspacePath: (path: string) => void;
   setComposer: (value: string) => void;
-  selectSession: (sessionId: string) => void;
+  selectSession: (sessionId: string) => Promise<void>;
+  refreshSessions: () => Promise<void>;
   createSession: () => Promise<void>;
   resumeSession: (sessionId?: string) => Promise<void>;
   sendMessage: (text: string) => Promise<void>;
@@ -304,7 +306,7 @@ export const useDesktopStore = create<DesktopStore>()(
           set({ clientId });
           expectResult(await requestRuntime(clientId, "rpc.initialize"));
           const workspace = await requestRuntime<WorkspaceSummary>(clientId, "workspace.open", { path: workspacePath });
-          const sessions = await requestRuntime<SessionSummary[]>(clientId, "session.list", { limit: 30 });
+          const sessions = await requestRuntime<SessionSummary[]>(clientId, "session.list", { limit: 200 });
           const workspaceResult = expectResult(workspace);
           const sessionResult = expectResult(sessions);
           set({ workspace: workspaceResult, sessions: sessionResult, status: "connected", isLoadingWorkspace: false });
@@ -332,7 +334,22 @@ export const useDesktopStore = create<DesktopStore>()(
 
       setWorkspacePath: (workspacePath) => set({ workspacePath }),
       setComposer: (composer) => set({ composer }),
-      selectSession: (activeSessionId) => set({ activeSessionId, ...emptyRunState() }),
+      selectSession: async (sessionId) => {
+        if (get().activeSessionId === sessionId && get().events.length > 0) return;
+        await get().resumeSession(sessionId);
+      },
+      refreshSessions: async () => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        try {
+          const sessions = expectResult(
+            await requestRuntime<SessionSummary[]>(clientId, "session.list", { limit: 200 }),
+          );
+          set({ sessions: sortSessionsByRecent(sessions) });
+        } catch (error) {
+          set({ lastError: errorMessage(error) });
+        }
+      },
       setRuntimeError: (message) =>
         set({ status: "error", lastError: message, clientId: null, activeRunId: null, runPhase: "failed" }),
       markDisconnected: () => set({ status: "disconnected", clientId: null, activeRunId: null }),
@@ -353,6 +370,7 @@ export const useDesktopStore = create<DesktopStore>()(
               {
                 id: result.session.id,
                 workspace_root: workspacePath,
+                title: null,
                 status: "Active",
                 created_at: Date.now(),
                 last_updated_at: Date.now(),
@@ -391,6 +409,7 @@ export const useDesktopStore = create<DesktopStore>()(
             isLoadingSession: false,
             workspacePath: report.session.workspace_root,
           });
+          await get().refreshSessions();
         } catch (error) {
           set({ isLoadingSession: false, lastError: errorMessage(error) });
         }
@@ -408,7 +427,22 @@ export const useDesktopStore = create<DesktopStore>()(
           text: text.trim(),
           createdAt: Date.now(),
         };
-        set((state) => ({ messages: [...state.messages, userMessage], composer: "", runPhase: "pending" }));
+        const title = makeSessionTitle(text);
+        set((state) => ({
+          messages: [...state.messages, userMessage],
+          composer: "",
+          runPhase: "pending",
+          sessions: sortSessionsByRecent(state.sessions.map((session) =>
+            session.id === sessionId
+              ? {
+                  ...session,
+                  title: session.title || title,
+                  last_updated_at: Date.now(),
+                  event_count: session.event_count + 1,
+                }
+              : session,
+          )),
+        }));
         try {
           const response = await requestRuntime<{ run_id: string }>(clientId, "agent.send", {
             task: makeTask(workspacePath, text, sessionId),
@@ -736,6 +770,7 @@ export const useDesktopStore = create<DesktopStore>()(
         }
         if (method === "agent.completed") {
           set({ activeRunId: null, runPhase: "completed", lastError: null });
+          void get().refreshSessions();
           return;
         }
         if (method === "terminal.output") {
@@ -769,6 +804,7 @@ export const useDesktopStore = create<DesktopStore>()(
           const messageText =
             error && typeof error === "object" && "message" in error ? String(error.message) : "agent run failed";
           set({ activeRunId: null, runPhase: code === "cancelled" ? "cancelled" : "failed", lastError: messageText });
+          void get().refreshSessions();
         }
       },
     }),

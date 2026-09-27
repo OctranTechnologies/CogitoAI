@@ -81,6 +81,9 @@ impl Session {
 pub struct SessionSummary {
     pub id: SessionId,
     pub workspace_root: PathBuf,
+    /// Stable display title derived from the first user task, when present.
+    #[serde(default)]
+    pub title: Option<String>,
     pub status: SessionStatus,
     pub created_at: Timestamp,
     pub last_updated_at: Timestamp,
@@ -284,6 +287,7 @@ impl SessionStore for JsonlSessionStore {
             sessions.push(SessionSummary {
                 id: session.id,
                 workspace_root: session.workspace_root,
+                title: session_title(&session.events),
                 status: state.status,
                 created_at: session.created_at,
                 last_updated_at: session.last_updated_at,
@@ -300,6 +304,27 @@ impl SessionStore for JsonlSessionStore {
         sessions.truncate(limit);
         Ok(sessions)
     }
+}
+
+/// Uses the first task as a predictable session title without another model
+/// call or mutable title state. Keep this intentionally simple for v0.
+fn session_title(events: &[HarnessEvent]) -> Option<String> {
+    const MAX_CHARS: usize = 64;
+    let text = events.iter().find_map(|event| match &event.payload {
+        EventPayload::UserMessage { text } => Some(text.as_str()),
+        _ => None,
+    })?;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut chars = normalized.chars();
+    let title = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    Some(if chars.next().is_some() {
+        format!("{}…", title.trim_end())
+    } else {
+        title
+    })
 }
 
 fn write_event(file: &mut fs::File, event: &HarnessEvent) -> Result<(), Error> {

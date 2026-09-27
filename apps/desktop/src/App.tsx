@@ -26,7 +26,7 @@ import {
 
 import { SettingsDialog } from "./components/settings-dialog";
 import { AppRail, type RailTarget } from "./components/app-rail";
-import { ProjectSidebar, type ProjectEntry } from "./components/project-sidebar";
+import { ProjectSidebar } from "./components/project-sidebar";
 import { ActivityView, HistoryView, ProjectsView } from "./components/workspace-views";
 import { LandingView } from "./components/landing-view";
 
@@ -34,6 +34,7 @@ import { SessionWorkspace } from "./components/session-workspace";
 import type { InspectorTab } from "./components/inspector";
 import type { SettingsScreen } from "./lib/settings";
 import { readStoredRailTarget, storeRailTarget } from "./lib/shell-prefs";
+import { groupSessionsByWorkspace, sortSessionsByRecent, type SidebarProject } from "./lib/sidebar-model";
 import {
   Button,
   CommandMenu,
@@ -91,7 +92,6 @@ function App() {
     connect,
     setWorkspacePath,
     setComposer,
-    selectSession,
     createSession,
     resumeSession,
     sendMessage,
@@ -181,27 +181,13 @@ function App() {
     }
   }
 
-  function onSelectProject(path: string) {
-    if (!path) return;
-    setWorkspacePath(path);
-  }
-
   // Projects come from the sessions the runtime reports, so the list reflects
   // real workspaces rather than invented entries.
-  const projects = useMemo<ProjectEntry[]>(() => {
-    const counts = new Map<string, number>();
-    for (const session of sessions) {
-      counts.set(session.workspace_root, (counts.get(session.workspace_root) ?? 0) + 1);
-    }
-    const roots = new Set<string>(counts.keys());
-    if (workspacePath) roots.add(workspacePath);
-    return [...roots].map((path) => ({
-      path,
-      label: path.split(/[\\/]/).filter(Boolean).pop() ?? path,
-      sessionCount: counts.get(path) ?? 0,
-      active: path === workspacePath,
-    }));
-  }, [sessions, workspacePath]);
+  const recentSessions = useMemo(() => sortSessionsByRecent(sessions), [sessions]);
+  const projects = useMemo<SidebarProject[]>(
+    () => groupSessionsByWorkspace(recentSessions, workspacePath, workspace),
+    [recentSessions, workspacePath, workspace],
+  );
 
 
   /**
@@ -315,16 +301,14 @@ function App() {
       />
       <ProjectSidebar
         productName="CogitoAI"
-        sessions={sessions}
+        sessions={recentSessions}
         activeSessionId={activeSessionId}
         workspacePath={workspacePath}
         status={status}
         projects={projects}
-        onSelectSession={selectSession}
+        onSelectSession={(id) => void resumeSession(id)}
         onNewSession={() => void createSession()}
-        onSelectProject={onSelectProject}
         disabled={!connected || running || isLoadingSession}
-        onSearch={() => setShowCommands(true)}
       />
       <main className="flex min-w-0 flex-1 flex-col">
         <WorkspaceTopBar
@@ -412,7 +396,7 @@ function App() {
           <HistoryView
             timeline={timeline}
             sessions={sessions}
-            onSelectSession={selectSession}
+            onSelectSession={(id) => void resumeSession(id)}
             activeSessionId={activeSessionId}
           />
         ) : railTarget === "activity" ? (

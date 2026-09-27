@@ -3,6 +3,7 @@ import { cx } from "./cx";
 
 export interface TooltipProps extends PropsWithChildren {
   label: string;
+  className?: string;
   /** Where the bubble sits relative to the trigger. */
   placement?: "top" | "bottom" | "left" | "right";
   disabled?: boolean;
@@ -23,7 +24,7 @@ const PLACEMENT: Record<NonNullable<TooltipProps["placement"]>, string> = {
  * adding accessibility wiring. While open, `aria-describedby` points at the
  * bubble so a screen reader announces the same text.
  */
-export function Tooltip({ label, children, placement = "top", disabled }: TooltipProps) {
+export function Tooltip({ label, children, placement = "top", disabled, className }: TooltipProps) {
   const [open, setOpen] = useState(false);
   const id = useId();
 
@@ -31,7 +32,7 @@ export function Tooltip({ label, children, placement = "top", disabled }: Toolti
 
   return (
     <span
-      className="relative inline-flex"
+      className={cx("relative inline-flex", className)}
       onMouseEnter={() => setOpen(true)}
       onMouseLeave={() => setOpen(false)}
       onFocus={() => setOpen(true)}
