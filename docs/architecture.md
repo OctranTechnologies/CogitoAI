@@ -127,9 +127,17 @@ never enter core, events, session data, or the frontend. Each agent turn sends i
 fresh assembled context followed by the latest canonical assistant/tool batch,
 so native function-result protocols can continue while older observations remain
 subject to context compaction and budget limits. Deterministic mock adapters
-cover text, single and multiple tool calls, and a mid-stream failure. OpenCode Zen
-and Go are not implemented yet; future catalog entries can choose Responses,
-Chat Completions, or Messages adapters individually.
+cover text, single and multiple tool calls, and a mid-stream failure. OpenCode
+Zen and Go are gateway facades, not new agent-loop branches. Each one joins its
+authenticated `/models` listing with OpenCode's maintained model metadata
+catalog, caches the result locally for 30 minutes, and routes using the model's
+declared AI SDK protocol (`@ai-sdk/openai`, `@ai-sdk/openai-compatible`, or
+`@ai-sdk/anthropic`). Responses and Messages delegate to the existing adapters;
+the shared compatible Chat Completions adapter handles streaming deltas,
+parallel calls, tool-result continuation, usage, errors, and cancellation.
+Models without one of those protocol declarations are not advertised. Both
+services use the same `OPENCODE_API_KEY`; Go additionally requires the account's
+Go subscription. An explicit `refresh_models` call bypasses the cache.
 
 Capabilities describe what the selected model adapter can substantiate, not
 what a provider family might support in general. Unknown limits and features

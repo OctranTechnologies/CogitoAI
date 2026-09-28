@@ -66,6 +66,8 @@ A provider implements the normalized `ModelProvider` trait in
 ```rust
 pub trait ModelProvider: Send + Sync {
     fn descriptor(&self) -> ModelDescriptor;
+    fn discover_models(&self) -> Result<Vec<ModelDescriptor>, ProviderError>;
+    fn refresh_models(&self) -> Result<Vec<ModelDescriptor>, ProviderError>;
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError>;
     fn stream(
         &self,
@@ -80,8 +82,8 @@ To add one:
 1. Implement the trait in `harness-models`. Translate the vendor's wire format
    into canonical responses and normalized events. Keep vendor types private to
    the adapter and report failures as `ProviderError` variants.
-2. Add a variant to `ProviderKind`. It is `#[serde(rename_all = "lowercase")]`, so
-   the variant name is the configuration value.
+2. Add a variant to `ProviderKind` with an explicit Serde name if its public
+   configuration ID uses punctuation such as `opencode-zen`.
 3. Register the constructor in `provider_from_config`, which both clients call.
 4. Add provider defaults to `ModelConfig` when needed. Keep only the API-key
    environment variable name in configuration, never the secret value.
@@ -91,11 +93,17 @@ To add one:
    cancellation rather than requiring a live endpoint.
 
 `ScriptedMockProvider` is the reference implementation for deterministic tests.
-`OpenAIProvider`, `AnthropicProvider`, and `GeminiProvider` are the real HTTP
-adapter references. They share the normalized model contract and keep Responses,
-Messages, and native Generate Content wire protocols private to their transports.
+`OpenAIProvider`, `AnthropicProvider`, `GeminiProvider`, and `OpenCodeProvider`
+are the real HTTP adapter references. They share the normalized model contract
+and keep Responses, Messages, Generate Content, and Chat Completions wire
+protocols private to their transports. OpenCode's Zen and Go catalog entries
+choose a protocol through maintained metadata; the gateway filters unsupported
+protocol declarations rather than guessing from model names.
 Gemini model discovery is paginated and cached for 15 minutes; call
 `GeminiProvider::refresh_models()` to bypass the cache.
+OpenCode model discovery joins the authenticated account listing with the
+maintained metadata catalog, caches for 30 minutes, and also exposes
+`OpenCodeProvider::refresh_models()`.
 
 ## Adding a tool
 

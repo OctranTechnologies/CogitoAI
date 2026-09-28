@@ -142,9 +142,10 @@ mock that executes a fixed, scripted workflow through the real agent loop, polic
 engine, checkpoint store, and verification commands, so you can exercise the whole
 system offline.
 
-To use OpenAI, Anthropic, or Google Gemini, create an API key with the provider
-and set it in the environment of the process that starts Harness. Never put the
-key in project configuration, a session file, or a command-line argument.
+To use OpenAI, Anthropic, Google Gemini, OpenCode Zen, or OpenCode Go, create an
+API key with the provider and set it in the environment of the process that
+starts Harness. Never put the key in project configuration, a session file, or a
+command-line argument.
 
 ```bash
 # PowerShell
@@ -199,6 +200,32 @@ export COGITO_MODEL="gemini-3.8-flash"
 cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
+OpenCode Zen and Go share the `OPENCODE_API_KEY` credential. Zen uses your Zen
+account; Go requires a Go subscription on that account. The available model
+catalog is fetched from the selected service and joined with OpenCode's model
+metadata. Pick a model using the returned `opencode-zen/<model-id>` or
+`opencode-go/<model-id>` name. The provider routes each model to its catalogued
+Responses, Chat Completions, or Messages transport.
+
+```powershell
+$env:OPENCODE_API_KEY = "<your-key>"
+$env:COGITO_MODEL_PROVIDER = "opencode-zen"
+$env:COGITO_MODEL = "opencode-zen/gpt-5.6-sol"
+cargo run -p harness-cli -- run "Summarize the repository"
+```
+
+```bash
+export OPENCODE_API_KEY="<your-key>"
+export COGITO_MODEL_PROVIDER="opencode-go"
+export COGITO_MODEL="opencode-go/glm-5.3"
+cargo run -p harness-cli -- run "Summarize the repository"
+```
+
+The default API roots are `https://opencode.ai/zen/v1` for Zen and
+`https://opencode.ai/zen/go/v1` for Go. Override `COGITO_MODEL_BASE_URL` only
+when using a compatible gateway. Both catalogs are cached in memory for 30
+minutes; `OpenCodeProvider::refresh_models()` bypasses the cache.
+
 For the desktop, the key must be present in the runtime process environment.
 In one terminal, configure the provider and start the local runtime:
 
@@ -218,16 +245,26 @@ $env:COGITO_MODEL = "gemini-3.8-flash"
 cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
 ```
 
+For OpenCode Zen or Go, set the shared key and the corresponding provider and
+namespaced model before starting the runtime:
+
+```powershell
+$env:OPENCODE_API_KEY = "<your-key>"
+$env:COGITO_MODEL_PROVIDER = "opencode-zen" # use opencode-go for a Go subscription
+$env:COGITO_MODEL = "opencode-zen/gpt-5.6-sol" # choose an ID from the model picker
+cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+```
+
 Then start the desktop in another terminal using the [desktop development
 instructions](apps/desktop/README.md#development). API keys are never sent to
 the desktop client.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `COGITO_MODEL_PROVIDER` | `mock`, `openai`, `anthropic`, or `gemini` | `mock` |
+| `COGITO_MODEL_PROVIDER` | `mock`, `openai`, `anthropic`, `gemini`, `opencode-zen`, or `opencode-go` | `mock` |
 | `COGITO_MODEL` | Model name passed to the provider | provider default |
-| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`, by provider |
-| `COGITO_MODEL_BASE_URL` | Provider API root; OpenAI uses Responses, Anthropic uses Messages, Gemini uses Generate Content; discovery uses `/models` | Provider API root |
+| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | Provider-specific; both OpenCode services use `OPENCODE_API_KEY` |
+| `COGITO_MODEL_BASE_URL` | Provider API root; OpenCode defaults differ for Zen and Go, discovery uses `/models` | Provider API root |
 | `COGITO_MOCK_REPAIR` | Mock-only test hook; see [Testing the repair loop](#testing-the-repair-loop) | unset |
 | `RUST_LOG` | Runtime log level for the RPC runtime | `info` |
 
@@ -258,6 +295,14 @@ the official `2023-06-01` API version header. Its adaptive versus manual
 thinking parameters and supported effort levels are selected from model
 capability metadata; signed thinking blocks needed for tool continuation remain
 inside the provider adapter.
+
+OpenCode Zen and Go use the account's authenticated `/models` endpoint for
+available IDs and the OpenCode-maintained Models.dev catalog for protocol and
+capability metadata. The gateway routes each model to the shared Responses or
+Messages adapters, or to its OpenAI-compatible Chat Completions transport. It
+does not infer protocols from model names, and models without one of these
+catalogued protocols are omitted. Both user-facing providers use the same
+`OPENCODE_API_KEY`; Go access depends on the account's Go subscription.
 
 ## Current v0 capabilities
 

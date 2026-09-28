@@ -282,6 +282,7 @@ fn available_models(provider: &ProviderKind) -> Vec<String> {
             "gemini-3.1-pro-preview".to_owned(),
             "gemini-2.5-flash".to_owned(),
         ],
+        ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => Vec::new(),
     }
 }
 
@@ -291,6 +292,10 @@ fn parse_provider(value: &str) -> Result<ProviderKind, SettingsError> {
         "openai" | "open_ai" | "open-ai" => Ok(ProviderKind::OpenAi),
         "anthropic" => Ok(ProviderKind::Anthropic),
         "gemini" | "google" | "google_gemini" => Ok(ProviderKind::Gemini),
+        "opencode-zen" | "opencode_zen" | "opencodezen" | "opencode" => {
+            Ok(ProviderKind::OpenCodeZen)
+        }
+        "opencode-go" | "opencode_go" | "opencodego" => Ok(ProviderKind::OpenCodeGo),
         other => Err(SettingsError::UnknownProvider(other.to_owned())),
     }
 }
@@ -301,6 +306,8 @@ fn provider_label(provider: &ProviderKind) -> &'static str {
         ProviderKind::OpenAi => "OpenAI",
         ProviderKind::Anthropic => "Anthropic",
         ProviderKind::Gemini => "Google Gemini",
+        ProviderKind::OpenCodeZen => "OpenCode Zen",
+        ProviderKind::OpenCodeGo => "OpenCode Go",
     }
 }
 
@@ -490,6 +497,22 @@ fn capabilities(model: &ModelConfig) -> ModelCapabilities {
 /// Assembles the Models screen.
 pub fn model_view(model: &ModelConfig, store: &dyn SecretStore) -> ModelSettingsView {
     let credential = credential_status(model, store);
+    let mut available_models = available_models(&model.provider);
+    if credential.available
+        && matches!(
+            model.provider,
+            ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo
+        )
+    {
+        if let Ok(provider) = provider_from_config(model) {
+            if let Ok(discovered) = provider.discover_models() {
+                available_models = discovered
+                    .into_iter()
+                    .map(|descriptor| descriptor.id)
+                    .collect();
+            }
+        }
+    }
     ModelSettingsView {
         provider: provider_label(&model.provider).to_owned(),
         model: model.model.clone(),
@@ -499,11 +522,13 @@ pub fn model_view(model: &ModelConfig, store: &dyn SecretStore) -> ModelSettings
         // The mock provider needs no credential, so it is always "configured".
         configured: match model.provider {
             ProviderKind::Mock => true,
-            ProviderKind::OpenAi | ProviderKind::Anthropic | ProviderKind::Gemini => {
-                credential.available
-            }
+            ProviderKind::OpenAi
+            | ProviderKind::Anthropic
+            | ProviderKind::Gemini
+            | ProviderKind::OpenCodeZen
+            | ProviderKind::OpenCodeGo => credential.available,
         },
-        available_models: available_models(&model.provider),
+        available_models,
         credential,
     }
 }
@@ -768,6 +793,27 @@ pub fn test_model_connection(model: &ModelConfig, store: &dyn SecretStore) -> Co
                 ok: true,
                 skipped: false,
                 message: format!("Ready. The runtime can read {}.", credential.env_var),
+            }
+        }
+        ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => {
+            if !credential.available {
+                return ConnectionTestResult {
+                    ok: false,
+                    skipped: true,
+                    message: format!(
+                        "No credential found. Set {} in the runtime environment.",
+                        credential.env_var
+                    ),
+                };
+            }
+            ConnectionTestResult {
+                ok: true,
+                skipped: false,
+                message: format!(
+                    "{} is ready. The runtime can read {}.",
+                    provider_label(&model.provider),
+                    credential.env_var
+                ),
             }
         }
     }

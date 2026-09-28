@@ -2,6 +2,7 @@ mod anthropic;
 mod gemini;
 mod mock;
 mod openai;
+mod opencode;
 mod protocol;
 mod transport;
 
@@ -15,6 +16,7 @@ pub use anthropic::{AnthropicMessagesTransport, AnthropicProvider};
 pub use gemini::{GeminiNativeTransport, GeminiProvider};
 pub use mock::{DeterministicMockProvider, MockProvider, MockScenario, ScriptedMockProvider};
 pub use openai::{OpenAIProvider, OpenAIResponsesTransport, OpenAiProvider};
+pub use opencode::{OpenCodeProduct, OpenCodeProvider};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -376,6 +378,19 @@ pub enum ProviderError {
 
 pub trait ModelProvider: Send + Sync {
     fn descriptor(&self) -> ModelDescriptor;
+
+    /// Returns model descriptors if this provider exposes runtime discovery.
+    /// Providers without a discovery endpoint return an empty list.
+    fn discover_models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+        Ok(Vec::new())
+    }
+
+    /// Refreshes a provider's cached model catalog. The default delegates to
+    /// discovery; cache-aware adapters can bypass their normal freshness TTL.
+    fn refresh_models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+        self.discover_models()
+    }
+
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError>;
     fn stream(
         &self,
@@ -498,6 +513,10 @@ pub enum ProviderKind {
     OpenAi,
     Anthropic,
     Gemini,
+    #[serde(rename = "opencode-zen", alias = "opencode_zen", alias = "opencodezen")]
+    OpenCodeZen,
+    #[serde(rename = "opencode-go", alias = "opencode_go", alias = "opencodego")]
+    OpenCodeGo,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -546,6 +565,20 @@ impl ModelConfig {
                 model: "gemini-3.8-flash".to_owned(),
                 api_key_env: "GEMINI_API_KEY".to_owned(),
                 base_url: "https://generativelanguage.googleapis.com/v1beta".to_owned(),
+                context_window: None,
+            },
+            ProviderKind::OpenCodeZen => Self {
+                provider,
+                model: "opencode-zen/gpt-5.6-sol".to_owned(),
+                api_key_env: "OPENCODE_API_KEY".to_owned(),
+                base_url: "https://opencode.ai/zen/v1".to_owned(),
+                context_window: None,
+            },
+            ProviderKind::OpenCodeGo => Self {
+                provider,
+                model: "opencode-go/glm-5.3".to_owned(),
+                api_key_env: "OPENCODE_API_KEY".to_owned(),
+                base_url: "https://opencode.ai/zen/go/v1".to_owned(),
                 context_window: None,
             },
         }
@@ -643,6 +676,9 @@ pub fn provider_from_config(config: &ModelConfig) -> Result<Box<dyn ModelProvide
         ProviderKind::OpenAi => Ok(Box::new(OpenAiProvider::from_config(config)?)),
         ProviderKind::Anthropic => Ok(Box::new(AnthropicProvider::from_config(config)?)),
         ProviderKind::Gemini => Ok(Box::new(GeminiProvider::from_config(config)?)),
+        ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => {
+            Ok(Box::new(OpenCodeProvider::from_config(config)?))
+        }
     }
 }
 
