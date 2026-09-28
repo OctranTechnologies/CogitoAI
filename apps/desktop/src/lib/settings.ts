@@ -23,6 +23,7 @@ export interface ModelCapabilities {
 
 export interface ModelSettings {
   provider: string;
+  provider_id: string;
   model: string;
   base_url: string;
   api_key_env: string;
@@ -30,6 +31,11 @@ export interface ModelSettings {
   credential: CredentialStatus;
   available_models: string[];
   configured: boolean;
+}
+
+export interface CatalogRefreshReport {
+  providers: { provider_id: string; model_count: number; error: string | null }[];
+  available_model_count: number;
 }
 
 export interface RuleSummary {

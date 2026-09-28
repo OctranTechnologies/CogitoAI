@@ -4,6 +4,7 @@ mod mock;
 mod openai;
 mod opencode;
 mod protocol;
+mod registry;
 mod transport;
 
 use std::collections::BTreeMap;
@@ -17,6 +18,11 @@ pub use gemini::{GeminiNativeTransport, GeminiProvider};
 pub use mock::{DeterministicMockProvider, MockProvider, MockScenario, ScriptedMockProvider};
 pub use openai::{OpenAIProvider, OpenAIResponsesTransport, OpenAiProvider};
 pub use opencode::{OpenCodeProduct, OpenCodeProvider};
+pub use registry::{
+    CapabilityKnowledge, CapabilityRequirement, CatalogRefreshReport, CatalogRefreshResult,
+    ModelCapability, ModelCapabilityKnowledgeMap, ModelMetadata, ModelMetadataSource, ModelPricing,
+    ModelRegistry, ModelRegistryError, ModelRegistryFilter,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -197,6 +203,22 @@ pub struct ModelDescriptor {
     pub id: String,
     pub display_name: String,
     pub capabilities: ModelCapabilities,
+    /// Provenance and certainty for model metadata. Provider adapters leave
+    /// this unknown; the registry fills it when catalog results are cached.
+    #[serde(default)]
+    pub metadata: ModelMetadata,
+}
+
+impl ModelDescriptor {
+    /// Stable, provider-qualified identity. Provider model IDs can overlap.
+    pub fn canonical_id(&self) -> String {
+        let model_id = self
+            .id
+            .strip_prefix(&self.provider)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(&self.id);
+        format!("{}/{}", self.provider, model_id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

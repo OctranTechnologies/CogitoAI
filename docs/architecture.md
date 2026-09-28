@@ -139,6 +139,18 @@ Models without one of those protocol declarations are not advertised. Both
 services use the same `OPENCODE_API_KEY`; Go additionally requires the account's
 Go subscription. An explicit `refresh_models` call bypasses the cache.
 
+`ModelRegistry` combines provider catalogs using the canonical identity
+`provider_id/model_id`, so duplicate native IDs remain distinct. Its cache is
+workspace-local at `.cogito/model-catalog.json`, expires after 24 hours, and
+retains expired successful data for offline startup and failed refreshes.
+Catalog provenance is reported as discovered, cached, or manually configured;
+capability knowledge is tri-state, and missing provider metadata stays unknown.
+The registry retains each provider's configured default and never rejects a
+manually configured ID because it is absent or stale in a catalog. Runtime RPC
+methods `models.list` and `models.refresh` keep provider HTTP requests out of
+desktop clients; the CLI uses the same registry through `/models` and
+`/models refresh [provider-id]`.
+
 Capabilities describe what the selected model adapter can substantiate, not
 what a provider family might support in general. Unknown limits and features
 remain absent/false. Private chain-of-thought is not surfaced as

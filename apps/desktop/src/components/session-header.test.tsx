@@ -18,6 +18,7 @@ describe("session header layout", () => {
         runPhase: "running",
         models: {
           provider: "anthropic",
+          provider_id: "anthropic",
           model: "claude-sonnet-long-context-model",
           base_url: "https://api.anthropic.com/v1",
           api_key_env: "ANTHROPIC_API_KEY",

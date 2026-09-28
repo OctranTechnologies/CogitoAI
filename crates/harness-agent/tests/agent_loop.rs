@@ -144,6 +144,7 @@ impl ModelProvider for RecordingProvider {
                 context_window: Some(4096),
                 ..ModelCapabilities::default()
             },
+            metadata: Default::default(),
         }
     }
 

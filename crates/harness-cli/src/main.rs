@@ -13,8 +13,8 @@ use harness_core::{
 use harness_git::{CheckpointStore, GitClient, GitDiff, ShadowCheckpointStore};
 use harness_models::{
     provider_from_config, ContentBlock, FinishReason, Message, ModelConfig, ModelProvider,
-    ModelRequest, ModelResponse, ModelStreamEvent, ProviderError, ProviderKind,
-    ScriptedMockProvider, ToolCall, Usage,
+    ModelRegistry, ModelRegistryFilter, ModelRequest, ModelResponse, ModelStreamEvent,
+    ProviderError, ProviderKind, ScriptedMockProvider, ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{
@@ -40,6 +40,7 @@ enum InteractiveCommand {
     Undo,
     Config,
     Model,
+    Models,
     Mode,
     Clear,
     Cancel,
@@ -124,6 +125,13 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandDefinition] = &[
         usage: "/model",
         description: "Show the configured model and capabilities",
         command: InteractiveCommand::Model,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/models",
+        usage: "/models [refresh [provider-id]]",
+        description: "List cached models or refresh provider catalogs",
+        command: InteractiveCommand::Models,
         plain_supported: true,
     },
     InteractiveCommandDefinition {
@@ -555,6 +563,7 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 InteractiveCommand::Config => config_command(cli, None)?,
                 InteractiveCommand::Model => model_info(cli)?,
+                InteractiveCommand::Models => models_command(cli, arguments)?,
                 InteractiveCommand::Mode => {
                     if !arguments.is_empty() {
                         eprintln!("usage: /mode (shows the workspace-configured mode)");
@@ -678,6 +687,7 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
         }),
         InteractiveCommand::Config => run_visible_command(tui, || config_command(cli, None)),
         InteractiveCommand::Model => run_visible_command(tui, || model_info(cli)),
+        InteractiveCommand::Models => run_visible_command(tui, || models_command(cli, arguments)),
         InteractiveCommand::Mode => {
             if !arguments.is_empty() {
                 return Err("usage: /mode (shows the workspace-configured mode)".to_owned());
@@ -811,6 +821,102 @@ fn model_info(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             "capabilities: {}",
             serde_json::to_string_pretty(&descriptor.capabilities)?
         );
+    }
+    Ok(())
+}
+
+fn models_command(cli: &Cli, arguments: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut fields = arguments.split_whitespace();
+    let action = fields.next();
+    let provider_id = match action {
+        None => None,
+        Some("refresh") => fields.next().filter(|provider| *provider != "all"),
+        Some(other) => {
+            return Err(
+                format!("usage: /models [refresh [provider-id]] (unexpected `{other}`)").into(),
+            );
+        }
+    };
+    if action == Some("refresh") && fields.next().is_some() {
+        return Err("usage: /models [refresh [provider-id]]".into());
+    }
+    let config = model_config(cli)?;
+    let workspace = effective_path(cli, Path::new("."));
+    let registry =
+        ModelRegistry::with_builtins(&config, Some(workspace.join(".cogito/model-catalog.json")));
+    let refresh = if action == Some("refresh") {
+        Some(match provider_id {
+            Some(provider_id) => registry.refresh_provider_report(provider_id),
+            None => registry.refresh_all(),
+        })
+    } else {
+        None
+    };
+    let models = registry.models(&ModelRegistryFilter::default());
+    let defaults = registry.defaults();
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({ "models": models, "defaults": defaults, "refresh": refresh }),
+            )?
+        );
+        return Ok(());
+    }
+    if let Some(report) = &refresh {
+        for result in &report.providers {
+            if let Some(error) = &result.error {
+                println!("{}: refresh failed: {error}", result.provider_id);
+            } else {
+                println!(
+                    "{}: refreshed {} models",
+                    result.provider_id, result.model_count
+                );
+            }
+        }
+    }
+    if models.is_empty() {
+        println!("No cached models. Use /models refresh to query configured providers.");
+    } else {
+        for model in models {
+            let is_default = defaults
+                .get(&model.provider)
+                .is_some_and(|id| id == &model.id);
+            let state = if model.metadata.stale {
+                " · stale cache"
+            } else {
+                ""
+            };
+            let source = match model.metadata.source {
+                harness_models::ModelMetadataSource::Discovered => "discovered",
+                harness_models::ModelMetadataSource::Cached => "cached",
+                harness_models::ModelMetadataSource::ManuallyConfigured => "manual",
+                harness_models::ModelMetadataSource::Unknown => "unknown",
+            };
+            let capabilities = [
+                ("vision", model.metadata.capabilities.vision),
+                ("tools", model.metadata.capabilities.tool_calling),
+                ("reasoning", model.metadata.capabilities.reasoning),
+            ]
+            .into_iter()
+            .filter_map(|(name, support)| {
+                (support == harness_models::CapabilityKnowledge::Supported).then_some(name)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+            println!(
+                "{}{}  [{}{}]{}",
+                if is_default { "* " } else { "  " },
+                model.canonical_id(),
+                source,
+                if capabilities.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {capabilities}")
+                },
+                state
+            );
+        }
     }
     Ok(())
 }
@@ -1610,6 +1716,10 @@ mod interactive_command_tests {
             parse_interactive_command("/quit"),
             Some((InteractiveCommand::Exit, "")),
         );
+        assert_eq!(
+            parse_interactive_command("/models refresh opencode-go"),
+            Some((InteractiveCommand::Models, "refresh opencode-go")),
+        );
         assert_eq!(parse_interactive_command("/not-a-command"), None);
         assert_eq!(parse_interactive_command("ordinary task"), None);
     }
@@ -1618,7 +1728,7 @@ mod interactive_command_tests {
     fn help_uses_the_command_catalog_and_limits_plain_mode_to_supported_commands() {
         let full_help = interactive_help(false);
         for command in [
-            "/help", "/model", "/mode", "/diff", "/undo", "/resume", "/clear", "/exit",
+            "/help", "/model", "/models", "/mode", "/diff", "/undo", "/resume", "/clear", "/exit",
         ] {
             assert!(
                 full_help.contains(command),

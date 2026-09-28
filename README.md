@@ -304,6 +304,22 @@ does not infer protocols from model names, and models without one of these
 catalogued protocols are omitted. Both user-facing providers use the same
 `OPENCODE_API_KEY`; Go access depends on the account's Go subscription.
 
+The runtime combines provider catalogs in a unified model registry. Model
+identity is provider-qualified (for example, `openai/gpt-4.1-mini` and
+`opencode-go/glm-5.3`), so identical model IDs from different providers do not
+collide. Successful metadata is cached in `.cogito/model-catalog.json` for 24
+hours; the last successful catalog remains available offline after expiration
+or a failed refresh. Capability metadata distinguishes supported, unsupported,
+and unknown; facts absent from provider metadata remain unknown. No pricing is
+shown unless a provider supplies trustworthy pricing metadata. Configured model
+IDs remain valid when missing from or stale in the catalog.
+
+In the interactive CLI, `/models` lists cached and manually configured models,
+`/models refresh` refreshes every provider, and `/models refresh openai` refreshes
+one provider. The desktop Models screen refreshes the selected provider through
+the runtime. Desktop clients use the `models.list` and `models.refresh` RPC
+methods; provider API requests and credentials stay in the runtime process.
+
 ## Current v0 capabilities
 
 Everything in this list is implemented and covered by tests.
@@ -434,8 +450,10 @@ action, or shortcuts. Context percentage, price, and reasoning effort are omitte
 when the runtime cannot determine them.
 
 The interactive slash commands are `/help`, `/run`, `/resume`, `/inspect`,
-`/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/mode`, `/clear`,
-`/cancel`, and `/exit`. `/mode` reports the execution mode loaded from the
+`/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/models`, `/mode`,
+`/clear`, `/cancel`, and `/exit`. `/models` shows the cached model registry;
+`/models refresh [provider-id]` refreshes all catalogs or one provider. `/mode`
+reports the execution mode loaded from the
 workspace policy; change that setting in `.agent/config.toml` and restart the CLI.
 Tab completes commands. The `TERM=dumb` line-oriented fallback lists only the
 commands it supports while preserving ordinary terminal output.

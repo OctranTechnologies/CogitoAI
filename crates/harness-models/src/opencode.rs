@@ -447,6 +447,7 @@ impl ModelProvider for OpenCodeProvider {
                     text_input: true,
                     ..ModelCapabilities::default()
                 },
+                metadata: Default::default(),
             })
     }
 
@@ -617,6 +618,7 @@ fn parse_catalog(
                 .unwrap_or(id)
                 .to_owned(),
             capabilities: model_capabilities(model),
+            metadata: Default::default(),
         };
         by_id.insert(
             id.clone(),

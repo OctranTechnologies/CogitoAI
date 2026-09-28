@@ -49,6 +49,7 @@ import {
 } from "./lib/terminal";
 import {
   isSettingsSnapshot,
+  type CatalogRefreshReport,
   type ConnectionTestResult,
   type SettingsSnapshot,
   type UpdateModelRequest,
@@ -148,6 +149,7 @@ export interface DesktopStore {
   resizeTerminal: (cols: number, rows: number) => Promise<void>;
   closeTerminal: () => Promise<void>;
   refreshSettings: () => Promise<void>;
+  refreshModelCatalog: (providerId: string) => Promise<boolean>;
   updateModel: (request: UpdateModelRequest) => Promise<boolean>;
   updatePermissionMode: (mode: string) => Promise<boolean>;
   testModelConnection: () => Promise<void>;
@@ -660,6 +662,34 @@ export const useDesktopStore = create<DesktopStore>()(
           set({ settings: payload, isLoadingSettings: false, settingsError: null });
         } catch (error) {
           set({ isLoadingSettings: false, settingsError: errorMessage(error) });
+        }
+      },
+
+      refreshModelCatalog: async (providerId) => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return false;
+        set({ settingsError: null });
+        try {
+          const report = expectResult(
+            await requestRuntime<CatalogRefreshReport>(clientId, "models.refresh", {
+              provider_id: providerId,
+            }),
+          );
+          const payload = expectResult(await requestRuntime(clientId, "settings.inspect", {}));
+          if (!isSettingsSnapshot(payload)) {
+            throw new RpcTransportError("runtime returned malformed settings", "malformed_event");
+          }
+          const failures = report.providers.filter((provider) => provider.error !== null);
+          set({
+            settings: payload,
+            settingsError: failures.length
+              ? failures.map((provider) => `${provider.provider_id}: ${provider.error}`).join("; ")
+              : null,
+          });
+          return true;
+        } catch (error) {
+          set({ settingsError: errorMessage(error) });
+          return false;
         }
       },
 

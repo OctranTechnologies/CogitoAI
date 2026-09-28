@@ -54,6 +54,8 @@ pub const METHODS: &[&str] = &[
     "settings.update_model",
     "settings.update_permissions",
     "settings.test_model",
+    "models.list",
+    "models.refresh",
     "config.update",
     "session.create",
     "session.list",

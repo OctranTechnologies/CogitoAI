@@ -309,6 +309,7 @@ impl AnthropicMessagesTransport {
                         .unwrap_or(id)
                         .to_owned(),
                     capabilities,
+                    metadata: Default::default(),
                 })
             }));
             let has_more = value.get("has_more").and_then(Value::as_bool) == Some(true);
@@ -340,6 +341,7 @@ impl ModelProvider for AnthropicProvider {
             id: self.model.clone(),
             display_name: self.model.clone(),
             capabilities: configured_capabilities(&self.model),
+            metadata: Default::default(),
         }
     }
 

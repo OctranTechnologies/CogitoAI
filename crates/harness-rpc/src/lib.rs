@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use harness_agent::{AgentOutcome, AgentRunner, AgentTask};
 use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
 use harness_git::{Checkpoint, CheckpointInfo, CheckpointStore, GitError, RestoreReport};
-use harness_models::{ModelConfig, ModelProvider};
+use harness_models::{ModelConfig, ModelProvider, ModelRegistry};
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{
     HarnessEvent, Session, SessionLoadReport, SessionState, SessionStore, SessionSummary,
@@ -60,6 +60,9 @@ pub struct Runtime {
     /// Model selection, owned by the runtime so the desktop can read and change
     /// it without reaching into provider internals.
     model: RwLock<ModelConfig>,
+    /// Provider-neutral catalog used by RPC and CLI clients. Discovery stays
+    /// in the runtime process, and its last successful result is workspace cached.
+    model_registry: Arc<ModelRegistry>,
 }
 
 /// Builds an [`AgentRunner`] for a selected model and execution mode.
@@ -81,6 +84,8 @@ impl Runtime {
         checkpoints: Arc<dyn CheckpointStore>,
         verifiers: Vec<Arc<dyn Verifier>>,
     ) -> Self {
+        let model = ModelConfig::from_env();
+        let model_registry = Arc::new(ModelRegistry::with_builtins(&model, None));
         Self {
             agent,
             providers,
@@ -95,7 +100,8 @@ impl Runtime {
             // Retargeted by `with_workspace_root`; the placeholder root is
             // replaced before any terminal can be opened.
             ptys: Arc::new(Mutex::new(PtyManager::new("."))),
-            model: RwLock::new(ModelConfig::from_env()),
+            model: RwLock::new(model),
+            model_registry,
         }
     }
 
@@ -153,6 +159,7 @@ impl Runtime {
             });
         };
         let runner = factory.build(&model, mode)?;
+        let _ = self.model_registry.register_configured_model(&model);
         *self.model.write().expect("model lock poisoned") = model;
         *self.policy.write().expect("policy lock poisoned") = Arc::new(PolicyEngine::new(
             mode,
@@ -169,8 +176,16 @@ impl Runtime {
         // Terminals are confined to the open workspace, so the manager is
         // recreated against the final root.
         *self.ptys.lock().expect("PTY manager lock poisoned") = PtyManager::new(&workspace_root);
+        self.model_registry
+            .set_cache_path(workspace_root.join(".cogito/model-catalog.json"));
         self.workspace_root = Some(workspace_root);
         self
+    }
+
+    /// Shared model catalog. Clients request list/refresh through RPC; they
+    /// never call provider endpoints themselves.
+    pub fn model_registry(&self) -> Arc<ModelRegistry> {
+        Arc::clone(&self.model_registry)
     }
 
     /// Human-operated terminal sessions for the open workspace.

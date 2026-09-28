@@ -231,12 +231,14 @@ function LabelledInput({
 function ModelsScreen() {
   const settings = useDesktopStore((state) => state.settings)!;
   const updateModel = useDesktopStore((state) => state.updateModel);
+  const refreshModelCatalog = useDesktopStore((state) => state.refreshModelCatalog);
   const testModelConnection = useDesktopStore((state) => state.testModelConnection);
   const modelTest = useDesktopStore((state) => state.modelTest);
   const [model, setModel] = useState(settings.models.model);
   const [baseUrl, setBaseUrl] = useState(settings.models.base_url);
   const [apiKeyEnv, setApiKeyEnv] = useState(settings.models.api_key_env);
   const [saved, setSaved] = useState(false);
+  const [refreshingCatalog, setRefreshingCatalog] = useState(false);
 
   // Re-seed the form when the runtime reports a different selection.
   useEffect(() => {
@@ -253,6 +255,12 @@ function ModelsScreen() {
     if (!changed) return;
     const ok = await updateModel({ model, base_url: baseUrl, api_key_env: apiKeyEnv });
     setSaved(ok);
+  }
+
+  async function refreshCatalog() {
+    setRefreshingCatalog(true);
+    await refreshModelCatalog(settings.models.provider_id);
+    setRefreshingCatalog(false);
   }
 
   const testTone: Tone = modelTest?.ok ? "success" : modelTest?.skipped ? "warning" : "error";
@@ -291,9 +299,19 @@ function ModelsScreen() {
           }}
           ariaLabel="Model name"
         />
-        {settings.models.available_models.length > 0 ? (
+        <div className="space-y-2">
           <div className="grid grid-cols-[10rem_1fr] items-start gap-3">
-            <span className="text-xs text-faint">Known models</span>
+            <div className="flex items-start justify-between gap-2">
+              <span className="text-xs text-faint">Known models</span>
+              <Button
+                size="sm"
+                disabled={refreshingCatalog}
+                onClick={() => void refreshCatalog()}
+                icon={<RefreshCw className={cx("size-icon-sm", refreshingCatalog && "animate-spin")} />}
+              >
+                Refresh
+              </Button>
+            </div>
             <div className="flex flex-wrap gap-1">
               {settings.models.available_models.map((name) => (
                 <button
@@ -315,7 +333,12 @@ function ModelsScreen() {
               ))}
             </div>
           </div>
-        ) : null}
+          {settings.models.available_models.length === 0 ? (
+            <p className="ml-[10.75rem] text-2xs text-faint">
+              No catalog entries yet. Refresh to discover models; custom model IDs remain accepted.
+            </p>
+          ) : null}
+        </div>
         <LabelledInput
           label="Base URL"
           value={baseUrl}

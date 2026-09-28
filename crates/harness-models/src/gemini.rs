@@ -430,6 +430,7 @@ impl GeminiNativeTransport {
                         prompt_caching: false,
                         structured_output: true,
                     },
+                    metadata: Default::default(),
                 };
                 metadata.insert(id.to_owned(), ModelMetadata { thinking });
                 models.push(descriptor);
@@ -494,6 +495,7 @@ impl ModelProvider for GeminiProvider {
                 id: self.model.clone(),
                 display_name: self.model.clone(),
                 capabilities: configured_capabilities(&self.model),
+                metadata: Default::default(),
             })
     }
 

@@ -12,6 +12,7 @@ use crate::settings::SecretStore;
 use harness_agent::{AgentError, AgentTask, ApprovalHandler};
 use harness_core::{discover_workspace, CheckpointId, RunId, SessionId};
 use harness_git::{is_runtime_state_path, GitClient, GitError};
+use harness_models::ModelRegistryFilter;
 use harness_pty::{PtyError, PtyRequest, SessionOrigin, TerminalEvent};
 use harness_session::{EventId, EventSubscriber, EventSubscription, HarnessEvent};
 use harness_tools::{CancellationToken, ToolRequest};
@@ -657,6 +658,8 @@ fn dispatch(
             settings_update_permissions(state, runtime, &request.params)
         }
         "settings.test_model" => settings_test_model(state, runtime),
+        "models.list" => models_list(runtime, &request.params),
+        "models.refresh" => models_refresh(runtime, &request.params),
         "session.create" => session_create(runtime, &request.params),
         "session.list" => session_list(runtime, &request.params),
         "session.inspect" => session_inspect(runtime, &request.params),
@@ -1138,6 +1141,29 @@ fn settings_test_model(state: &ServerState, runtime: &Runtime) -> Result<Value, 
     let model = runtime.model();
     let result = crate::settings::test_model_connection(&model, state.secret_store().as_ref());
     Ok(serde_json::to_value(result)?)
+}
+
+fn models_list(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    let filter = if params.is_null() {
+        ModelRegistryFilter::default()
+    } else {
+        serde_json::from_value(params.clone())?
+    };
+    let registry = runtime.model_registry();
+    Ok(json!({
+        "models": registry.models(&filter),
+        "defaults": registry.defaults(),
+    }))
+}
+
+fn models_refresh(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    let provider_id = params.get("provider_id").and_then(Value::as_str);
+    let registry = runtime.model_registry();
+    let report = match provider_id.filter(|provider_id| !provider_id.is_empty()) {
+        Some(provider_id) => registry.refresh_provider_report(provider_id),
+        None => registry.refresh_all(),
+    };
+    serde_json::to_value(report).map_err(Into::into)
 }
 
 fn session_id(params: &Value) -> Result<SessionId, RpcServerError> {

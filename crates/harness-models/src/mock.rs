@@ -83,6 +83,7 @@ impl ModelProvider for MockProvider {
                 context_window: self.context_window,
                 ..ModelCapabilities::default()
             },
+            metadata: Default::default(),
         }
     }
 
@@ -148,6 +149,7 @@ impl ModelProvider for ScriptedMockProvider {
             id: self.model.clone(),
             display_name: self.model.clone(),
             capabilities: mock_capabilities(Some(8_192), true),
+            metadata: Default::default(),
         }
     }
 
@@ -257,6 +259,7 @@ impl ModelProvider for DeterministicMockProvider {
             id: self.model.clone(),
             display_name: self.model.clone(),
             capabilities: mock_capabilities(None, supports_tools),
+            metadata: Default::default(),
         }
     }
 

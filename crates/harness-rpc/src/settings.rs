@@ -22,7 +22,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use harness_core::discover_workspace;
-use harness_models::{provider_from_config, ModelCapabilities, ModelConfig, ProviderKind};
+use harness_models::{
+    provider_from_config, ModelCapabilities, ModelConfig, ModelRegistry, ModelRegistryFilter,
+    ProviderKind,
+};
 use harness_policy::{ExecutionMode, OperationKind, PolicyDecision, PolicyEngine, PolicyRule};
 use serde::{Deserialize, Serialize};
 
@@ -125,12 +128,13 @@ pub fn redact_secrets(text: &str, secrets: &[String]) -> String {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelSettingsView {
     pub provider: String,
+    pub provider_id: String,
     pub model: String,
     pub base_url: String,
     pub api_key_env: String,
     pub capabilities: ModelCapabilities,
     pub credential: CredentialStatus,
-    /// Models this provider is known to support.
+    /// Catalogued or manually configured model IDs for this provider.
     pub available_models: Vec<String>,
     pub configured: bool,
 }
@@ -259,31 +263,6 @@ pub enum SettingsError {
     Unavailable(String),
     #[error("{0}")]
     Internal(String),
-}
-
-/// Known models per provider, used for the picker without contacting a network.
-fn available_models(provider: &ProviderKind) -> Vec<String> {
-    match provider {
-        ProviderKind::Mock => vec!["mock".to_owned()],
-        ProviderKind::OpenAi => vec![
-            "gpt-4o".to_owned(),
-            "gpt-4o-mini".to_owned(),
-            "gpt-4.1".to_owned(),
-            "gpt-4.1-mini".to_owned(),
-            "o3-mini".to_owned(),
-        ],
-        ProviderKind::Anthropic => vec![
-            "claude-sonnet-4-6".to_owned(),
-            "claude-opus-4-6".to_owned(),
-            "claude-haiku-4-5".to_owned(),
-        ],
-        ProviderKind::Gemini => vec![
-            "gemini-3.8-flash".to_owned(),
-            "gemini-3.1-pro-preview".to_owned(),
-            "gemini-2.5-flash".to_owned(),
-        ],
-        ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => Vec::new(),
-    }
 }
 
 fn parse_provider(value: &str) -> Result<ProviderKind, SettingsError> {
@@ -496,25 +475,33 @@ fn capabilities(model: &ModelConfig) -> ModelCapabilities {
 
 /// Assembles the Models screen.
 pub fn model_view(model: &ModelConfig, store: &dyn SecretStore) -> ModelSettingsView {
+    model_view_with_registry(model, store, None)
+}
+
+fn model_view_with_registry(
+    model: &ModelConfig,
+    store: &dyn SecretStore,
+    registry: Option<&ModelRegistry>,
+) -> ModelSettingsView {
     let credential = credential_status(model, store);
-    let mut available_models = available_models(&model.provider);
-    if credential.available
-        && matches!(
-            model.provider,
-            ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo
-        )
-    {
-        if let Ok(provider) = provider_from_config(model) {
-            if let Ok(discovered) = provider.discover_models() {
-                available_models = discovered
-                    .into_iter()
-                    .map(|descriptor| descriptor.id)
-                    .collect();
-            }
-        }
-    }
+    let provider_id = provider_from_config(model)
+        .map(|provider| provider.descriptor().provider)
+        .unwrap_or_default();
+    let available_models = registry
+        .map(|registry| {
+            registry
+                .models(&ModelRegistryFilter {
+                    provider_id: Some(provider_id.clone()),
+                    requirements: Vec::new(),
+                })
+                .into_iter()
+                .map(|descriptor| descriptor.id)
+                .collect()
+        })
+        .unwrap_or_default();
     ModelSettingsView {
         provider: provider_label(&model.provider).to_owned(),
+        provider_id,
         model: model.model.clone(),
         base_url: model.base_url.clone(),
         api_key_env: model.api_key_env.clone(),
@@ -676,7 +663,7 @@ pub fn snapshot(
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     Ok(SettingsSnapshot {
-        models: model_view(&model, store),
+        models: model_view_with_registry(&model, store, Some(&runtime.model_registry())),
         permissions: permission_view(runtime),
         project: project_view(&workspace)?,
         verification: verification_view(&workspace)?,

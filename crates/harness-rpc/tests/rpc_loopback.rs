@@ -606,6 +606,8 @@ fn exposes_typed_settings_and_never_returns_a_credential() {
         "settings.update_model",
         "settings.update_permissions",
         "settings.test_model",
+        "models.list",
+        "models.refresh",
     ] {
         assert!(
             methods.iter().any(|name| name == method),
@@ -702,6 +704,20 @@ fn exposes_typed_settings_and_never_returns_a_credential() {
     assert!(!rendered(&snapshot).contains(TEST_SECRET));
     assert!(!rendered(&after.result.unwrap()).contains(TEST_SECRET));
     assert!(!rendered(&still.result.unwrap()).contains(TEST_SECRET));
+
+    let catalog = client.request("models.list", json!({})).unwrap();
+    assert_ok(&catalog);
+    let catalog = catalog.result.unwrap();
+    assert!(catalog["models"].as_array().is_some());
+    assert_eq!(catalog["defaults"]["mock"], "mock-alt");
+    let refreshed = client
+        .request("models.refresh", json!({"provider_id": "mock"}))
+        .unwrap();
+    assert_ok(&refreshed);
+    assert_eq!(
+        refreshed.result.unwrap()["providers"][0]["provider_id"],
+        "mock"
+    );
 
     drop(client);
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1209,6 +1225,7 @@ impl ModelProvider for SlowProvider {
                 context_window: Some(1024),
                 ..ModelCapabilities::default()
             },
+            metadata: Default::default(),
         }
     }
 

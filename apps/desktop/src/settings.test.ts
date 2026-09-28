@@ -34,6 +34,7 @@ function notification(method: string, params: Record<string, unknown>): ServerMe
 const SNAPSHOT: SettingsSnapshot = {
   models: {
     provider: "OpenAI",
+    provider_id: "openai",
     model: "gpt-4o",
     base_url: "https://api.openai.com/v1",
     api_key_env: "OPENAI_API_KEY",
@@ -164,6 +165,12 @@ describe("settings", () => {
       if (method === "git.diff") return response({ unstaged: "", staged: "" });
       if (method === "checkpoint.list") return response([]);
       if (method === "settings.inspect") return response(SNAPSHOT);
+      if (method === "models.refresh") {
+        return response({
+          providers: [{ provider_id: "openai", model_count: 2, error: null }],
+          available_model_count: 2,
+        });
+      }
       if (method === "settings.update_model") {
         return response({
           ...SNAPSHOT,
@@ -221,6 +228,19 @@ describe("settings", () => {
       model: "gpt-4o-mini",
     });
     expect(useDesktopStore.getState().settings!.models.model).toBe("gpt-4o-mini");
+  });
+
+  it("refreshes a provider catalog through the runtime RPC", async () => {
+    await useDesktopStore.getState().connect("127.0.0.1:4545", "/repo");
+
+    const ok = await useDesktopStore.getState().refreshModelCatalog("openai");
+
+    expect(ok).toBe(true);
+    expect(requestRuntime).toHaveBeenCalledWith("client-1", "models.refresh", {
+      provider_id: "openai",
+    });
+    expect(requestRuntime).toHaveBeenCalledWith("client-1", "settings.inspect", {});
+    expect(useDesktopStore.getState().settingsError).toBeNull();
   });
 
   it("surfaces a rejected model change without altering the snapshot", async () => {

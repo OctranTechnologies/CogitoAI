@@ -13,6 +13,7 @@ afterEach(cleanup);
 
 const MODELS: ModelSettings = {
   provider: "openai",
+  provider_id: "openai",
   model: "gpt-4o",
   base_url: "https://api.openai.com/v1",
   api_key_env: "OPENAI_API_KEY",

@@ -543,6 +543,7 @@ fn a_provider_that_fails_mid_run_closes_the_session_and_leaves_no_orphan() {
                     context_window: None,
                     ..ModelCapabilities::default()
                 },
+                metadata: Default::default(),
             }
         }
         fn complete(&self, _request: &ModelRequest) -> Result<ModelResponse, ProviderError> {

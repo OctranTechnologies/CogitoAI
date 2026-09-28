@@ -237,6 +237,7 @@ impl OpenAIResponsesTransport {
                 id: id.to_owned(),
                 display_name: id.to_owned(),
                 capabilities,
+                metadata: Default::default(),
             })
             .collect::<Vec<_>>();
         descriptors.sort_by(|left, right| left.id.cmp(&right.id));
@@ -252,6 +253,7 @@ impl ModelProvider for OpenAIProvider {
             id: self.model.clone(),
             display_name: self.model.clone(),
             capabilities: configured_capabilities(&self.model),
+            metadata: Default::default(),
         }
     }
 

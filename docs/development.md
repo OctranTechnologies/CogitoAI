@@ -105,6 +105,16 @@ OpenCode model discovery joins the authenticated account listing with the
 maintained metadata catalog, caches for 30 minutes, and also exposes
 `OpenCodeProvider::refresh_models()`.
 
+The shared `ModelRegistry` aggregates these adapters by provider-qualified
+identity, stores successful catalogs in `.cogito/model-catalog.json`, and keeps
+stale catalogs available when discovery fails or the runtime starts offline.
+Register additional `ModelProvider` instances with `ModelRegistry::register_provider`
+to add future catalog sources without changing RPC or CLI aggregation. Catalog
+capability filters match only explicitly supported features; unknown metadata
+does not satisfy a required capability. Runtime clients use `models.list` and
+`models.refresh`; the interactive CLI exposes `/models` and
+`/models refresh [provider-id]`.
+
 ## Adding a tool
 
 A tool is anything implementing `Tool` in `crates/harness-tools/src/lib.rs`:
