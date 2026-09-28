@@ -1,4 +1,5 @@
 mod anthropic;
+mod gemini;
 mod mock;
 mod openai;
 mod protocol;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use anthropic::{AnthropicMessagesTransport, AnthropicProvider};
+pub use gemini::{GeminiNativeTransport, GeminiProvider};
 pub use mock::{DeterministicMockProvider, MockProvider, MockScenario, ScriptedMockProvider};
 pub use openai::{OpenAIProvider, OpenAIResponsesTransport, OpenAiProvider};
 
@@ -495,6 +497,7 @@ pub enum ProviderKind {
     Mock,
     OpenAi,
     Anthropic,
+    Gemini,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -536,6 +539,13 @@ impl ModelConfig {
                 model: "claude-sonnet-4-6".to_owned(),
                 api_key_env: "ANTHROPIC_API_KEY".to_owned(),
                 base_url: "https://api.anthropic.com/v1".to_owned(),
+                context_window: None,
+            },
+            ProviderKind::Gemini => Self {
+                provider,
+                model: "gemini-3.8-flash".to_owned(),
+                api_key_env: "GEMINI_API_KEY".to_owned(),
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_owned(),
                 context_window: None,
             },
         }
@@ -632,6 +642,7 @@ pub fn provider_from_config(config: &ModelConfig) -> Result<Box<dyn ModelProvide
         ProviderKind::Mock => Ok(Box::new(MockProvider::new(config.model.clone()))),
         ProviderKind::OpenAi => Ok(Box::new(OpenAiProvider::from_config(config)?)),
         ProviderKind::Anthropic => Ok(Box::new(AnthropicProvider::from_config(config)?)),
+        ProviderKind::Gemini => Ok(Box::new(GeminiProvider::from_config(config)?)),
     }
 }
 

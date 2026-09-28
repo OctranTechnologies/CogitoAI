@@ -7,7 +7,7 @@ use harness_context::{ContextBuilder, ContextInput, ToolContextResult, Workspace
 use harness_core::{Error, SessionId};
 use harness_git::CheckpointStore;
 use harness_models::{
-    Message, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, Usage,
+    Message, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, Role, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest};
 use harness_session::{
@@ -347,6 +347,11 @@ impl AgentRunner {
         let mut turns = 0;
         let mut tool_calls = 0;
         let mut model_tokens = 0;
+        // Keep the latest canonical call/result batch for native model
+        // protocols that require explicit tool-result messages. The rebuilt
+        // context carries older observations without retaining an unbounded
+        // raw tool transcript. Provider-private signatures stay in adapters.
+        let mut model_history = Vec::<Message>::new();
         loop {
             self.check_limits(
                 started_at,
@@ -379,9 +384,13 @@ impl AgentRunner {
                     }
                 };
             }
+            let context_message = Message::user_text(assembly.prompt);
+            let mut model_messages = Vec::with_capacity(model_history.len() + 1);
+            model_messages.push(context_message);
+            model_messages.extend(model_history.iter().cloned());
             let model_request = ModelRequest {
                 model: self.model.clone(),
-                messages: vec![Message::user_text(assembly.prompt)],
+                messages: model_messages,
                 tools: self
                     .tools
                     .specs()
@@ -492,6 +501,15 @@ impl AgentRunner {
                     model_tokens,
                 });
             }
+            let mut next_model_history = Vec::with_capacity(response.tool_calls.len() + 1);
+            next_model_history.push(Message {
+                role: Role::Assistant,
+                content: response.content.clone(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: response.tool_calls.clone(),
+                is_error: false,
+            });
             for tool_call in response.tool_calls {
                 if cancellation.is_cancelled() {
                     return self.fail(session_id, collector, AgentError::Cancelled);
@@ -529,6 +547,11 @@ impl AgentRunner {
                             .map_err(|error| AgentError::Core(error.to_string()))?;
                     }
                 }
+                next_model_history.push(Message::tool_result(harness_models::ToolResult {
+                    tool_call_id: tool_call.id,
+                    content: result.output.clone(),
+                    is_error: false,
+                }));
                 context_input.tool_results.push(ToolContextResult {
                     name: tool_call.name,
                     result,
@@ -544,6 +567,7 @@ impl AgentRunner {
                     &collector,
                 )?;
             }
+            model_history = next_model_history;
         }
     }
 

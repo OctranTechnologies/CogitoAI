@@ -109,15 +109,27 @@ failures before stream consumption, and check cancellation while waiting for SSE
 data. API keys are held only in memory and are not included in adapter errors or
 events. Anthropic thinking signatures required for tool continuation are held in
 private in-memory adapter state and replayed without entering canonical events or
-session records. Both providers filter their official `GET /models` results
+session records. OpenAI and Anthropic filter their official `GET /models` results
 through local capability metadata because the listing endpoints do not report
 tool or coding-agent suitability; explicitly configured model IDs remain usable
 even when they are not in that metadata. Anthropic thinking style and effort
 controls are selected from model-specific local metadata rather than inferred
-from the provider name alone. Deterministic mock adapters cover text, single and
-multiple tool calls, and a mid-stream failure. Gemini, OpenCode Zen, and
-OpenCode Go are not implemented yet; future Zen/Go catalog entries can choose
-Responses, Chat Completions, or Messages adapters individually.
+from the provider name alone. Gemini uses `GeminiNativeTransport` with the native
+Generate Content API, paginated `models.list`, streaming responses, and native
+function declaration/result messages. Discovery results are cached per transport
+for 15 minutes and `refresh_models` forces a reload. Model IDs remain explicitly
+configurable if discovery is unavailable. Optional model-list fields fall back to
+known model-family capabilities, while model-specific thinking levels and budgets
+are validated against Gemini's documented support ranges. Gemini thought
+signatures are held in private adapter memory and restored to the canonical
+assistant/tool transcript only when constructing the next native request. They
+never enter core, events, session data, or the frontend. Each agent turn sends its
+fresh assembled context followed by the latest canonical assistant/tool batch,
+so native function-result protocols can continue while older observations remain
+subject to context compaction and budget limits. Deterministic mock adapters
+cover text, single and multiple tool calls, and a mid-stream failure. OpenCode Zen
+and Go are not implemented yet; future catalog entries can choose Responses,
+Chat Completions, or Messages adapters individually.
 
 Capabilities describe what the selected model adapter can substantiate, not
 what a provider family might support in general. Unknown limits and features

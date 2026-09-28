@@ -277,6 +277,11 @@ fn available_models(provider: &ProviderKind) -> Vec<String> {
             "claude-opus-4-6".to_owned(),
             "claude-haiku-4-5".to_owned(),
         ],
+        ProviderKind::Gemini => vec![
+            "gemini-3.8-flash".to_owned(),
+            "gemini-3.1-pro-preview".to_owned(),
+            "gemini-2.5-flash".to_owned(),
+        ],
     }
 }
 
@@ -285,6 +290,7 @@ fn parse_provider(value: &str) -> Result<ProviderKind, SettingsError> {
         "mock" => Ok(ProviderKind::Mock),
         "openai" | "open_ai" | "open-ai" => Ok(ProviderKind::OpenAi),
         "anthropic" => Ok(ProviderKind::Anthropic),
+        "gemini" | "google" | "google_gemini" => Ok(ProviderKind::Gemini),
         other => Err(SettingsError::UnknownProvider(other.to_owned())),
     }
 }
@@ -294,6 +300,7 @@ fn provider_label(provider: &ProviderKind) -> &'static str {
         ProviderKind::Mock => "Mock (offline)",
         ProviderKind::OpenAi => "OpenAI",
         ProviderKind::Anthropic => "Anthropic",
+        ProviderKind::Gemini => "Google Gemini",
     }
 }
 
@@ -492,7 +499,9 @@ pub fn model_view(model: &ModelConfig, store: &dyn SecretStore) -> ModelSettings
         // The mock provider needs no credential, so it is always "configured".
         configured: match model.provider {
             ProviderKind::Mock => true,
-            ProviderKind::OpenAi | ProviderKind::Anthropic => credential.available,
+            ProviderKind::OpenAi | ProviderKind::Anthropic | ProviderKind::Gemini => {
+                credential.available
+            }
         },
         available_models: available_models(&model.provider),
         credential,
@@ -728,6 +737,23 @@ pub fn test_model_connection(model: &ModelConfig, store: &dyn SecretStore) -> Co
             }
         }
         ProviderKind::Anthropic => {
+            if !credential.available {
+                return ConnectionTestResult {
+                    ok: false,
+                    skipped: true,
+                    message: format!(
+                        "No credential found. Set {} in the runtime environment.",
+                        credential.env_var
+                    ),
+                };
+            }
+            ConnectionTestResult {
+                ok: true,
+                skipped: false,
+                message: format!("Ready. The runtime can read {}.", credential.env_var),
+            }
+        }
+        ProviderKind::Gemini => {
             if !credential.available {
                 return ConnectionTestResult {
                     ok: false,

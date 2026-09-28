@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use harness_models::{
-    AnthropicProvider, ContentBlock, DeterministicMockProvider, FinishReason, Message,
-    MockProvider, MockScenario, ModelConfig, ModelProvider, ModelRequest, ModelStreamEvent,
-    OpenAiProvider, ProviderError, ProviderKind, Role, ToolCall, ToolDefinition,
+    AnthropicProvider, ContentBlock, DeterministicMockProvider, FinishReason, GeminiProvider,
+    Message, MockProvider, MockScenario, ModelConfig, ModelProvider, ModelRequest,
+    ModelStreamEvent, OpenAiProvider, ProviderError, ProviderKind, Role, ToolCall, ToolDefinition,
 };
 use serde_json::json;
 
@@ -192,6 +192,52 @@ fn anthropic_model_metadata_and_provider_defaults_are_model_aware() {
     assert_eq!(customized.model, "claude-custom-model-id");
     assert_eq!(customized.base_url, "https://gateway.example/v1");
     assert_eq!(customized.api_key_env, "CUSTOM_ANTHROPIC_KEY");
+}
+
+#[test]
+fn gemini_metadata_defaults_and_explicit_model_ids_are_supported() {
+    let known = GeminiProvider::with_api_key(
+        "https://generativelanguage.googleapis.com/v1beta",
+        "gemini-3.8-flash",
+        "GEMINI_API_KEY",
+        "test-key",
+    );
+    let descriptor = known.descriptor();
+    assert_eq!(descriptor.provider, "gemini");
+    assert!(descriptor.capabilities.streaming);
+    assert!(descriptor.capabilities.tool_calling);
+    assert!(descriptor.capabilities.parallel_tool_calls);
+    assert!(descriptor.capabilities.reasoning);
+    assert!(descriptor.capabilities.configurable_reasoning_effort);
+    assert!(descriptor.capabilities.image_input);
+    assert!(descriptor.capabilities.system_instructions);
+
+    let unknown = GeminiProvider::with_api_key(
+        "https://generativelanguage.googleapis.com/v1beta",
+        "private-gemini-model-id",
+        "GEMINI_API_KEY",
+        "test-key",
+    );
+    assert!(unknown.descriptor().capabilities.tool_calling);
+    assert!(!unknown.descriptor().capabilities.reasoning);
+    assert!(!unknown.descriptor().capabilities.image_input);
+    assert_eq!(unknown.descriptor().capabilities.context_window, None);
+
+    let defaults = ModelConfig::for_provider(ProviderKind::Gemini);
+    assert_eq!(defaults.model, "gemini-3.8-flash");
+    assert_eq!(defaults.api_key_env, "GEMINI_API_KEY");
+    assert_eq!(
+        defaults.base_url,
+        "https://generativelanguage.googleapis.com/v1beta"
+    );
+    assert_eq!(defaults.context_window, None);
+    let mut config = ModelConfig::default();
+    config.select_provider(ProviderKind::Gemini);
+    assert_eq!(config, defaults);
+    assert_eq!(
+        serde_json::from_value::<ProviderKind>(json!("gemini")).unwrap(),
+        ProviderKind::Gemini
+    );
 }
 
 #[test]

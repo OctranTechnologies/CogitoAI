@@ -91,9 +91,11 @@ To add one:
    cancellation rather than requiring a live endpoint.
 
 `ScriptedMockProvider` is the reference implementation for deterministic tests.
-`OpenAIProvider` and `AnthropicProvider` are the real HTTP adapter references;
-both share the normalized model contract but keep Responses and Messages wire
-protocols private to their respective transports.
+`OpenAIProvider`, `AnthropicProvider`, and `GeminiProvider` are the real HTTP
+adapter references. They share the normalized model contract and keep Responses,
+Messages, and native Generate Content wire protocols private to their transports.
+Gemini model discovery is paginated and cached for 15 minutes; call
+`GeminiProvider::refresh_models()` to bypass the cache.
 
 ## Adding a tool
 

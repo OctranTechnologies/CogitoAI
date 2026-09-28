@@ -256,6 +256,24 @@ fn anthropic_connection_status_uses_presence_only() {
 }
 
 #[test]
+fn gemini_settings_use_environment_credential_without_exposing_it() {
+    let store = FakeSecretStore {
+        env_var: "GEMINI_API_KEY".to_owned(),
+        secret: Some("gemini-secret-not-for-rpc".to_owned()),
+    };
+    let model = ModelConfig::for_provider(ProviderKind::Gemini);
+    let view = settings::model_view(&model, &store);
+    let connection = settings::test_model_connection(&model, &store);
+
+    assert_eq!(view.provider, "Google Gemini");
+    assert_eq!(view.api_key_env, "GEMINI_API_KEY");
+    assert!(view.credential.available);
+    assert!(connection.ok);
+    let serialized = to_string(&(view, connection)).unwrap();
+    assert!(!serialized.contains("gemini-secret-not-for-rpc"));
+}
+
+#[test]
 fn typed_requests_reject_unknown_enums_before_anything_is_applied() {
     // Deserialization is the first gate: a client sending an unknown provider or
     // mode never reaches the runtime's apply path.

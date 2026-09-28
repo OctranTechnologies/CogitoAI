@@ -9,8 +9,8 @@ use harness_agent::{
 };
 use harness_context::{ContextBudget, ContextBuilder, WorkspaceMetadata};
 use harness_models::{
-    AnthropicProvider, ContentBlock, ModelCapabilities, ModelDescriptor, ModelProvider,
-    ModelRequest, ModelResponse, ModelStreamEvent, OpenAIProvider, ProviderError,
+    AnthropicProvider, ContentBlock, GeminiProvider, ModelCapabilities, ModelDescriptor,
+    ModelProvider, ModelRequest, ModelResponse, ModelStreamEvent, OpenAIProvider, ProviderError,
     ScriptedMockProvider, ToolCall, Usage,
 };
 use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
@@ -625,10 +625,15 @@ fn openai_mock_tool_use_round_trip_executes_and_returns_tool_observation() {
         .contains("agent-test-key"));
     let requests = requests.lock().expect("OpenAI requests lock");
     assert_eq!(requests.len(), 2);
-    let follow_up = &requests[1]["body"]["input"][0]["content"];
-    assert!(follow_up
+    let follow_up = requests[1]["body"]["input"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(follow_up["type"], "function_call_output");
+    assert!(follow_up["output"]
         .as_str()
-        .expect("follow-up prompt is text")
+        .expect("tool output is text")
         .contains("agent-visible-file-content"));
     assert_eq!(requests[0]["body"]["tools"][0]["name"], "read_file");
 }
@@ -773,11 +778,142 @@ fn anthropic_messages_tool_use_runs_through_policy_and_workspace_tool() {
         .contains("anthropic-version: 2023-06-01"));
     assert_eq!(requests[0]["body"]["tools"][0]["name"], "read_file");
     assert_eq!(requests[0]["body"]["stream"], true);
-    let follow_up = &requests[1]["body"]["messages"][0]["content"][0]["text"];
-    assert!(follow_up
+    let follow_up = requests[1]["body"]["messages"].as_array().unwrap();
+    assert_eq!(follow_up.len(), 3);
+    assert_eq!(follow_up[2]["role"], "user");
+    assert_eq!(follow_up[2]["content"][0]["type"], "tool_result");
+    assert!(follow_up[2]["content"][0]["content"]
         .as_str()
-        .expect("follow-up is rebuilt as a text prompt")
+        .unwrap()
         .contains("anthropic-agent-visible-content"));
+}
+
+#[test]
+fn gemini_native_flow_reads_patches_and_returns_tool_results_to_the_model() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    std::fs::write(workspace.join("readme.txt"), "before\n").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Gemini server");
+    let address = listener.local_addr().expect("mock Gemini address");
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        for turn in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept Generate Content request");
+            let captured = read_http_request_for_response(&mut stream);
+            server_requests
+                .lock()
+                .expect("Gemini requests lock")
+                .push(captured);
+            let event = match turn {
+                0 => serde_json::json!({
+                    "responseId": "gemini-read-response",
+                    "candidates": [{ "content": { "parts": [
+                        { "functionCall": { "id": "gemini-read-call", "name": "read_file", "args": { "path": "readme.txt" } }, "thoughtSignature": "private-read-signature" }
+                    ] }, "finishReason": "STOP" }],
+                    "usageMetadata": { "promptTokenCount": 30, "candidatesTokenCount": 8, "totalTokenCount": 38 }
+                }),
+                1 => serde_json::json!({
+                    "responseId": "gemini-patch-response",
+                    "candidates": [{ "content": { "parts": [
+                        { "functionCall": { "id": "gemini-patch-call", "name": "apply_patch", "args": { "path": "readme.txt", "old_text": "before\n", "new_text": "after\n" } }, "thoughtSignature": "private-patch-signature" }
+                    ] }, "finishReason": "STOP" }],
+                    "usageMetadata": { "promptTokenCount": 44, "candidatesTokenCount": 10, "totalTokenCount": 54 }
+                }),
+                _ => serde_json::json!({
+                    "responseId": "gemini-final-response",
+                    "candidates": [{ "content": { "parts": [{ "text": "Updated readme.txt from before to after." }] }, "finishReason": "STOP" }],
+                    "usageMetadata": { "promptTokenCount": 58, "candidatesTokenCount": 9, "totalTokenCount": 67 }
+                }),
+            };
+            respond_with_sse(&mut stream, &[event]);
+        }
+    });
+
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let session_store: Arc<dyn SessionStore> = sessions.clone();
+    let provider = Arc::new(GeminiProvider::with_api_key(
+        format!("http://{address}/v1beta"),
+        "gemini-3.8-flash",
+        "MOCK_GEMINI_KEY",
+        "gemini-agent-test-secret",
+    ));
+    let runner = AgentRunner::new(
+        provider,
+        "gemini-3.8-flash",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(AllowAllPolicy),
+        session_store,
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    );
+
+    let outcome = runner
+        .run(
+            &AgentTask {
+                workspace_root: workspace.to_path_buf(),
+                user_task: "Read readme.txt, change before to after, and report the result"
+                    .to_owned(),
+                ..AgentTask::default()
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    server.join().expect("mock Gemini server");
+
+    assert_eq!(outcome.turns, 3);
+    assert_eq!(outcome.tool_calls, 2);
+    assert_eq!(
+        outcome.final_message,
+        "Updated readme.txt from before to after."
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("readme.txt")).unwrap(),
+        "after\n"
+    );
+    let session = sessions.load(&outcome.session_id).unwrap();
+    let session_json = serde_json::to_string(&session.events).unwrap();
+    assert!(!session_json.contains("gemini-agent-test-secret"));
+    assert!(!session_json.contains("private-read-signature"));
+    assert!(!session_json.contains("private-patch-signature"));
+
+    let requests = requests.lock().expect("Gemini requests lock");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0]["headers"]
+        .as_str()
+        .unwrap()
+        .to_ascii_lowercase()
+        .contains("x-goog-api-key: gemini-agent-test-secret"));
+    let second_contents = requests[1]["body"]["contents"].as_array().unwrap();
+    assert_eq!(second_contents[1]["role"], "model");
+    assert_eq!(
+        second_contents[1]["parts"][0]["thoughtSignature"],
+        "private-read-signature"
+    );
+    assert_eq!(second_contents[2]["role"], "function");
+    assert_eq!(
+        second_contents[2]["parts"][0]["functionResponse"]["name"],
+        "read_file"
+    );
+    let third_contents = requests[2]["body"]["contents"].as_array().unwrap();
+    assert_eq!(third_contents.len(), 3);
+    assert_eq!(third_contents[1]["role"], "model");
+    assert_eq!(
+        third_contents[1]["parts"][0]["thoughtSignature"],
+        "private-patch-signature"
+    );
+    assert_eq!(third_contents[2]["role"], "function");
+    assert_eq!(
+        third_contents[2]["parts"][0]["functionResponse"]["name"],
+        "apply_patch"
+    );
+    assert!(
+        !third_contents[2]["parts"][0]["functionResponse"]["response"]["result"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn read_http_request_for_response(stream: &mut TcpStream) -> serde_json::Value {

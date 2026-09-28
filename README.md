@@ -142,9 +142,9 @@ mock that executes a fixed, scripted workflow through the real agent loop, polic
 engine, checkpoint store, and verification commands, so you can exercise the whole
 system offline.
 
-To use OpenAI or Anthropic, create an API key with the provider and set it in the
-environment of the process that starts Harness. Never put the key in project
-configuration, a session file, or a command-line argument.
+To use OpenAI, Anthropic, or Google Gemini, create an API key with the provider
+and set it in the environment of the process that starts Harness. Never put the
+key in project configuration, a session file, or a command-line argument.
 
 ```bash
 # PowerShell
@@ -180,6 +180,25 @@ export COGITO_MODEL="claude-sonnet-4-6"
 cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
+To use Google Gemini, create a key in [Google AI Studio](https://aistudio.google.com/app/apikey),
+set `GEMINI_API_KEY`, and choose a model ID available to your account. Harness
+uses Gemini's native Generate Content API, including its streaming and function
+calling formats:
+
+```powershell
+$env:GEMINI_API_KEY = "<your-key>"
+$env:COGITO_MODEL_PROVIDER = "gemini"
+$env:COGITO_MODEL = "gemini-3.8-flash"
+cargo run -p harness-cli -- run "Summarize the repository"
+```
+
+```bash
+export GEMINI_API_KEY="<your-key>"
+export COGITO_MODEL_PROVIDER="gemini"
+export COGITO_MODEL="gemini-3.8-flash"
+cargo run -p harness-cli -- run "Summarize the repository"
+```
+
 For the desktop, the key must be present in the runtime process environment.
 In one terminal, configure the provider and start the local runtime:
 
@@ -190,16 +209,25 @@ $env:COGITO_MODEL = "claude-sonnet-4-6"
 cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
 ```
 
+For Gemini, set its runtime environment and start the same local RPC process:
+
+```powershell
+$env:GEMINI_API_KEY = "<your-key>"
+$env:COGITO_MODEL_PROVIDER = "gemini"
+$env:COGITO_MODEL = "gemini-3.8-flash"
+cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+```
+
 Then start the desktop in another terminal using the [desktop development
 instructions](apps/desktop/README.md#development). API keys are never sent to
 the desktop client.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `COGITO_MODEL_PROVIDER` | `mock`, `openai`, or `anthropic` | `mock` |
+| `COGITO_MODEL_PROVIDER` | `mock`, `openai`, `anthropic`, or `gemini` | `mock` |
 | `COGITO_MODEL` | Model name passed to the provider | provider default |
-| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, by provider |
-| `COGITO_MODEL_BASE_URL` | Provider API root; OpenAI uses `/responses` and `/models`, Anthropic uses `/messages` and `/models` | Provider API root |
+| `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`, by provider |
+| `COGITO_MODEL_BASE_URL` | Provider API root; OpenAI uses Responses, Anthropic uses Messages, Gemini uses Generate Content; discovery uses `/models` | Provider API root |
 | `COGITO_MOCK_REPAIR` | Mock-only test hook; see [Testing the repair loop](#testing-the-repair-loop) | unset |
 | `RUST_LOG` | Runtime log level for the RPC runtime | `info` |
 
@@ -210,10 +238,20 @@ disk and implements no home-grown encryption.
 
 The OpenAI adapter uses the Responses API for streaming and function calls. The
 Anthropic adapter uses the Messages API, native tool-use/result blocks, and its
-SSE event stream. `COGITO_MODEL` is sent as configured, including model IDs that
-are not in the local discovery catalog. Both providers filter their official
-model-list endpoints through local capability metadata because those endpoints
-do not describe coding suitability or all runtime features. A custom
+SSE event stream. The Gemini adapter uses the native Generate Content API,
+function declarations and responses, and SSE streaming. Its paginated
+`models.list` discovery results are cached for 15 minutes; the provider exposes
+`refresh_models()` to bypass that cache. Listing results are filtered to models
+that support `generateContent`, and explicit model IDs remain usable if discovery
+is unavailable or incomplete. Model-specific thinking-level and token-budget
+rules are validated before sending requests. Gemini thought signatures required
+for function-call continuation remain private to the provider adapter and never
+enter canonical events or session records. `COGITO_MODEL` is sent as configured,
+including model IDs that are not in the local discovery catalog. OpenAI and
+Anthropic discovery use local capability metadata because their listing
+endpoints do not describe coding suitability or all runtime features. Gemini
+discovery includes models that report `generateContent`; the adapter derives
+only known capabilities where the listing omits them. A custom
 `COGITO_MODEL_BASE_URL` must implement the selected provider's API shape; model
 discovery additionally requires its `/models` listing endpoint. Anthropic uses
 the official `2023-06-01` API version header. Its adaptive versus manual
