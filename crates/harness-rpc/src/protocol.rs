@@ -1,15 +1,35 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 
 pub const RPC_PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct RpcRequest {
     pub version: u32,
     pub id: Option<String>,
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+impl fmt::Debug for RpcRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("RpcRequest");
+        debug
+            .field("version", &self.version)
+            .field("id", &self.id)
+            .field("method", &self.method);
+        if matches!(
+            self.method.as_str(),
+            "credentials.validate" | "credentials.connect"
+        ) {
+            debug.field("params", &"[redacted]");
+        } else {
+            debug.field("params", &self.params);
+        }
+        debug.finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -54,6 +74,10 @@ pub const METHODS: &[&str] = &[
     "settings.update_model",
     "settings.update_permissions",
     "settings.test_model",
+    "credentials.list",
+    "credentials.validate",
+    "credentials.connect",
+    "credentials.disconnect",
     "models.list",
     "models.refresh",
     "config.update",
@@ -83,3 +107,26 @@ pub const METHODS: &[&str] = &[
     "terminal.resize",
     "terminal.close",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_request_debug_output_redacts_the_entire_params_object() {
+        let secret = "api-key-that-must-not-appear";
+        let request = RpcRequest {
+            version: RPC_PROTOCOL_VERSION,
+            id: Some("1".to_owned()),
+            method: "credentials.connect".to_owned(),
+            params: serde_json::json!({
+                "provider_id": "openai",
+                "api_key": secret,
+            }),
+        };
+
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[redacted]"));
+    }
+}

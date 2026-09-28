@@ -1,4 +1,5 @@
 mod anthropic;
+mod credentials;
 mod gemini;
 mod mock;
 mod openai;
@@ -14,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use anthropic::{AnthropicMessagesTransport, AnthropicProvider};
+pub use credentials::{
+    CredentialError, CredentialSecret, CredentialSource, CredentialStatus, CredentialStore,
+    EnvironmentCredentialStore, KeychainBackend, SystemCredentialStore,
+};
 pub use gemini::{GeminiNativeTransport, GeminiProvider};
 pub use mock::{DeterministicMockProvider, MockProvider, MockScenario, ScriptedMockProvider};
 pub use openai::{OpenAIProvider, OpenAIResponsesTransport, OpenAiProvider};
@@ -701,6 +706,108 @@ pub fn provider_from_config(config: &ModelConfig) -> Result<Box<dyn ModelProvide
         ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => {
             Ok(Box::new(OpenCodeProvider::from_config(config)?))
         }
+    }
+}
+
+/// Creates a provider using a credential resolved by the runtime's credential
+/// store. If the system credential store cannot be reached, provider creation
+/// falls back to its environment-backed constructor so config inspection still
+/// works and request failures remain normalized by the adapter.
+pub fn provider_from_config_with_store(
+    config: &ModelConfig,
+    store: &dyn CredentialStore,
+) -> Result<Box<dyn ModelProvider>, ProviderError> {
+    if config.provider == ProviderKind::Mock {
+        return provider_from_config(config);
+    }
+    let credential = store
+        .get(provider_id(config.provider), &config.api_key_env)
+        .ok()
+        .flatten();
+    if let Some(credential) = credential {
+        provider_from_config_with_api_key(config, credential.expose_secret())
+    } else {
+        provider_from_config(config)
+    }
+}
+
+/// Creates a provider using one explicitly supplied credential. The value is
+/// kept in the provider adapter's private in-memory transport only.
+pub fn provider_from_config_with_api_key(
+    config: &ModelConfig,
+    api_key: &str,
+) -> Result<Box<dyn ModelProvider>, ProviderError> {
+    config
+        .validate()
+        .map_err(|reason| ProviderError::Configuration { reason })?;
+    harness_core::register_sensitive_value(api_key);
+    match config.provider {
+        ProviderKind::Mock => provider_from_config(config),
+        ProviderKind::OpenAi => Ok(Box::new(OpenAiProvider::with_api_key(
+            config.base_url.clone(),
+            config.model.clone(),
+            config.api_key_env.clone(),
+            api_key,
+        ))),
+        ProviderKind::Anthropic => Ok(Box::new(AnthropicProvider::with_api_key(
+            config.base_url.clone(),
+            config.model.clone(),
+            config.api_key_env.clone(),
+            api_key,
+        ))),
+        ProviderKind::Gemini => Ok(Box::new(GeminiProvider::with_api_key(
+            config.base_url.clone(),
+            config.model.clone(),
+            config.api_key_env.clone(),
+            api_key,
+        ))),
+        ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => {
+            let product = if config.provider == ProviderKind::OpenCodeZen {
+                OpenCodeProduct::Zen
+            } else {
+                OpenCodeProduct::Go
+            };
+            Ok(Box::new(OpenCodeProvider::with_api_key(
+                product,
+                config.base_url.clone(),
+                config.model.clone(),
+                config.api_key_env.clone(),
+                api_key,
+            )))
+        }
+    }
+}
+
+/// Checks an entered key with a minimal provider catalog request. Catalog
+/// contents never escape; this returns only success or a normalized error.
+pub fn validate_provider_credential(
+    config: &ModelConfig,
+    api_key: &str,
+) -> Result<(), ProviderError> {
+    config
+        .validate()
+        .map_err(|reason| ProviderError::Configuration { reason })?;
+    harness_core::register_sensitive_value(api_key);
+    let provider = provider_from_config_with_api_key(config, api_key)?;
+    match config.provider {
+        ProviderKind::Mock => Ok(()),
+        ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => {
+            provider.refresh_models().map(|_| ())
+        }
+        ProviderKind::OpenAi | ProviderKind::Anthropic | ProviderKind::Gemini => {
+            provider.discover_models().map(|_| ())
+        }
+    }
+}
+
+fn provider_id(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Mock => "mock",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCodeZen => "opencode-zen",
+        ProviderKind::OpenCodeGo => "opencode-go",
     }
 }
 

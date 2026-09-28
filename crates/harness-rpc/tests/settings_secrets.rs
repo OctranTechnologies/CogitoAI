@@ -1,4 +1,4 @@
-use harness_models::{ModelConfig, ProviderKind};
+use harness_models::{CredentialError, CredentialSecret, ModelConfig, ProviderKind};
 use harness_policy::ExecutionMode;
 use harness_rpc::settings::{
     self, ConnectionTestResult, CredentialSource, CredentialStatus, EnvironmentSecretStore,
@@ -13,18 +13,49 @@ struct FakeSecretStore {
 }
 
 impl SecretStore for FakeSecretStore {
-    fn is_available(&self, env_var: &str) -> bool {
-        env_var == self.env_var && self.secret.is_some()
-    }
-
-    fn get(&self, env_var: &str) -> Option<String> {
-        (env_var == self.env_var)
+    fn get(
+        &self,
+        _provider_id: &str,
+        env_var: &str,
+    ) -> Result<Option<CredentialSecret>, CredentialError> {
+        Ok((env_var == self.env_var)
             .then(|| self.secret.clone())
             .flatten()
+            .map(CredentialSecret::new))
     }
 
-    fn source(&self) -> CredentialSource {
-        CredentialSource::Environment
+    fn status(
+        &self,
+        _provider_id: &str,
+        env_var: &str,
+    ) -> Result<CredentialStatus, CredentialError> {
+        let available = env_var == self.env_var && self.secret.is_some();
+        Ok(CredentialStatus {
+            available,
+            source: if available {
+                CredentialSource::Environment
+            } else {
+                CredentialSource::None
+            },
+            env_var: env_var.to_owned(),
+        })
+    }
+
+    fn store(
+        &self,
+        _provider_id: &str,
+        _env_var: &str,
+        _secret: &str,
+    ) -> Result<CredentialStatus, CredentialError> {
+        Err(CredentialError::StoreUnavailable)
+    }
+
+    fn disconnect(
+        &self,
+        provider_id: &str,
+        env_var: &str,
+    ) -> Result<CredentialStatus, CredentialError> {
+        self.status(provider_id, env_var)
     }
 }
 
@@ -324,7 +355,8 @@ fn credential_status_is_stable_for_a_missing_variable() {
     let status: CredentialStatus = settings::credential_status(&model, &store);
 
     assert!(!status.available);
-    assert!(status.summary().starts_with("not set"));
+    assert!(status.summary().starts_with("not connected"));
+    assert!(status.summary().contains("COGITO_TEST_KEY"));
 }
 
 #[test]

@@ -37,6 +37,7 @@ ctrlc = "3.4"
 ureq = { version = "2.12", features = ["json"] }
 ratatui = "0.28.1"
 crossterm = "0.28.1"
+zeroize = "1.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

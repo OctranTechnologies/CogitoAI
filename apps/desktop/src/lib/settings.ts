@@ -8,9 +8,15 @@
 
 export interface CredentialStatus {
   available: boolean;
-  source: "environment";
+  source: "environment" | "keychain" | "none" | "unavailable";
   /** Name of the environment variable holding the credential. */
   env_var: string;
+}
+
+export interface ProviderCredentialStatus {
+  provider_id: string;
+  provider: string;
+  credential: CredentialStatus;
 }
 
 export interface ModelCapabilities {
@@ -92,6 +98,7 @@ export interface RuntimeSettings {
   log_target: string;
   provider_names: string[];
   credential_source: string;
+  credentials: ProviderCredentialStatus[];
 }
 
 export interface SettingsSnapshot {
@@ -117,6 +124,11 @@ export interface ConnectionTestResult {
   ok: boolean;
   message: string;
   skipped: boolean;
+}
+
+export interface CredentialActionResult {
+  provider: ProviderCredentialStatus;
+  providers: ProviderCredentialStatus[];
 }
 
 export type SettingsScreen = "models" | "runtime" | "permissions" | "project" | "verification";
@@ -153,9 +165,19 @@ export function isSettingsSnapshot(value: unknown): value is SettingsSnapshot {
  * variable name alone.
  */
 export function describeCredential(credential: CredentialStatus): string {
-  return credential.available
-    ? `Configured from ${credential.env_var}`
-    : `Not set — set ${credential.env_var} in the runtime environment`;
+  if (!credential.available && credential.source !== "unavailable") {
+    return `Not connected · set ${credential.env_var} or connect below`;
+  }
+  switch (credential.source) {
+    case "environment":
+      return `Connected from ${credential.env_var} · managed by the environment`;
+    case "keychain":
+      return "Connected · stored in the OS credential store";
+    case "unavailable":
+      return "OS credential store unavailable";
+    default:
+      return `Not connected · set ${credential.env_var} or connect below`;
+  }
 }
 
 export function describeCapabilities(capabilities: ModelCapabilities): string {

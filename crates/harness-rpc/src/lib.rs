@@ -13,10 +13,11 @@ pub use protocol::{
 };
 pub use server::{ApprovalBroker, RpcApprovalHandler, RpcServer, RpcServerError};
 pub use settings::{
-    ConnectionTestResult, CredentialSource, CredentialStatus, EnvironmentSecretStore,
-    ModelSettingsView, PermissionSettingsView, ProjectSettingsView, RuntimeSettingsView,
-    SecretStore, SettingsError, SettingsSnapshot, UpdateModelRequest, UpdatePermissionsRequest,
-    VerificationSettingsView,
+    ConnectionTestResult, CredentialSecret, CredentialSource, CredentialStatus,
+    EnvironmentSecretStore, ModelSettingsView, PermissionSettingsView, ProjectSettingsView,
+    ProviderCredentialRequest, ProviderCredentialView, ProviderDisconnectRequest,
+    RuntimeSettingsView, SecretStore, SettingsError, SettingsSnapshot, UpdateModelRequest,
+    UpdatePermissionsRequest, VerificationSettingsView,
 };
 
 use std::path::PathBuf;
@@ -25,7 +26,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use harness_agent::{AgentOutcome, AgentRunner, AgentTask};
 use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
 use harness_git::{Checkpoint, CheckpointInfo, CheckpointStore, GitError, RestoreReport};
-use harness_models::{ModelConfig, ModelProvider, ModelRegistry};
+use harness_models::{
+    CredentialStore, ModelConfig, ModelProvider, ModelRegistry, SystemCredentialStore,
+};
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{
     HarnessEvent, Session, SessionLoadReport, SessionState, SessionStore, SessionSummary,
@@ -63,6 +66,9 @@ pub struct Runtime {
     /// Provider-neutral catalog used by RPC and CLI clients. Discovery stays
     /// in the runtime process, and its last successful result is workspace cached.
     model_registry: Arc<ModelRegistry>,
+    /// Privileged environment/keychain access. Secret values are never passed
+    /// to the frontend or session store.
+    credential_store: Arc<dyn CredentialStore>,
 }
 
 /// Builds an [`AgentRunner`] for a selected model and execution mode.
@@ -85,7 +91,12 @@ impl Runtime {
         verifiers: Vec<Arc<dyn Verifier>>,
     ) -> Self {
         let model = ModelConfig::from_env();
-        let model_registry = Arc::new(ModelRegistry::with_builtins(&model, None));
+        let credential_store: Arc<dyn CredentialStore> = Arc::new(SystemCredentialStore::new());
+        let model_registry = Arc::new(ModelRegistry::with_builtins_and_credentials(
+            &model,
+            None,
+            credential_store.as_ref(),
+        ));
         Self {
             agent,
             providers,
@@ -102,6 +113,7 @@ impl Runtime {
             ptys: Arc::new(Mutex::new(PtyManager::new("."))),
             model: RwLock::new(model),
             model_registry,
+            credential_store,
         }
     }
 
@@ -186,6 +198,44 @@ impl Runtime {
     /// never call provider endpoints themselves.
     pub fn model_registry(&self) -> Arc<ModelRegistry> {
         Arc::clone(&self.model_registry)
+    }
+
+    pub fn with_credential_store(mut self, store: Arc<dyn CredentialStore>) -> Self {
+        let model = self.model();
+        let cache_path = self
+            .workspace_root
+            .as_ref()
+            .map(|root| root.join(".cogito/model-catalog.json"));
+        self.model_registry = Arc::new(ModelRegistry::with_builtins_and_credentials(
+            &model,
+            cache_path,
+            store.as_ref(),
+        ));
+        self.credential_store = store;
+        self
+    }
+
+    pub fn credential_store(&self) -> Arc<dyn CredentialStore> {
+        Arc::clone(&self.credential_store)
+    }
+
+    /// Rebuilds the active runner after credential storage changes so provider
+    /// adapters pick up the newly connected or disconnected key.
+    pub fn refresh_agent_runner(&self) -> Result<(), Error> {
+        let factory = self
+            .runner_factory
+            .read()
+            .expect("runner factory lock poisoned")
+            .clone();
+        let Some(factory) = factory else {
+            return Ok(());
+        };
+        let runner = factory.build(&self.model(), self.execution_mode())?;
+        *self
+            .agent_runner
+            .write()
+            .expect("agent runner lock poisoned") = Some(runner);
+        Ok(())
     }
 
     /// Human-operated terminal sessions for the open workspace.

@@ -50,7 +50,9 @@ import {
 import {
   isSettingsSnapshot,
   type CatalogRefreshReport,
+  type CredentialActionResult,
   type ConnectionTestResult,
+  type ProviderCredentialStatus,
   type SettingsSnapshot,
   type UpdateModelRequest,
 } from "./lib/settings";
@@ -153,6 +155,9 @@ export interface DesktopStore {
   updateModel: (request: UpdateModelRequest) => Promise<boolean>;
   updatePermissionMode: (mode: string) => Promise<boolean>;
   testModelConnection: () => Promise<void>;
+  refreshCredentialStatuses: () => Promise<void>;
+  connectProvider: (providerId: string, apiKey: string) => Promise<boolean>;
+  disconnectProvider: (providerId: string) => Promise<boolean>;
   clearSettingsError: () => void;
 }
 
@@ -243,6 +248,36 @@ function derivedFromEvents(events: HarnessEvent[]) {
 
 function emptyChanges(): ChangeSummary {
   return summarizeChanges([]);
+}
+
+function hasProviderCredentialList(value: unknown): value is { providers: ProviderCredentialStatus[] } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "providers" in value &&
+    Array.isArray((value as { providers?: unknown }).providers) &&
+    (value as { providers: unknown[] }).providers.every(
+      (provider) =>
+        typeof provider === "object" &&
+        provider !== null &&
+        typeof (provider as ProviderCredentialStatus).provider_id === "string" &&
+        typeof (provider as ProviderCredentialStatus).credential?.available === "boolean",
+    )
+  );
+}
+
+function applyProviderCredentials(
+  settings: SettingsSnapshot,
+  providers: ProviderCredentialStatus[],
+): SettingsSnapshot {
+  const selected = providers.find((provider) => provider.provider_id === settings.models.provider_id);
+  return {
+    ...settings,
+    models: selected
+      ? { ...settings.models, credential: selected.credential, configured: selected.credential.available }
+      : settings.models,
+    runtime: { ...settings.runtime, credentials: providers },
+  };
 }
 
 function emptyRunState() {
@@ -744,6 +779,72 @@ export const useDesktopStore = create<DesktopStore>()(
           set({ modelTest: result });
         } catch (error) {
           set({ settingsError: errorMessage(error) });
+        }
+      },
+
+      refreshCredentialStatuses: async () => {
+        const { clientId, status, settings } = get();
+        if (!clientId || status !== "connected" || !settings) return;
+        try {
+          const result = expectResult(
+            await requestRuntime<{ providers: ProviderCredentialStatus[] }>(clientId, "credentials.list", {}),
+          );
+          if (!hasProviderCredentialList(result)) {
+            throw new RpcTransportError("runtime returned malformed credential statuses", "malformed_event");
+          }
+          set({ settings: applyProviderCredentials(settings, result.providers), settingsError: null });
+        } catch (error) {
+          set({ settingsError: errorMessage(error) });
+        }
+      },
+
+      connectProvider: async (providerId, apiKey) => {
+        const { clientId, status, settings } = get();
+        if (!clientId || status !== "connected" || !settings) {
+          apiKey = "";
+          return false;
+        }
+        set({ settingsError: null });
+        let enteredKey = apiKey;
+        apiKey = "";
+        try {
+          const result = expectResult(
+            await requestRuntime<CredentialActionResult>(clientId, "credentials.connect", {
+              provider_id: providerId,
+              api_key: enteredKey,
+            }),
+          );
+          if (!hasProviderCredentialList(result)) {
+            throw new RpcTransportError("runtime returned malformed credential statuses", "malformed_event");
+          }
+          set({ settings: applyProviderCredentials(settings, result.providers), settingsError: null });
+          return true;
+        } catch (error) {
+          set({ settingsError: errorMessage(error) });
+          return false;
+        } finally {
+          enteredKey = "";
+        }
+      },
+
+      disconnectProvider: async (providerId) => {
+        const { clientId, status, settings } = get();
+        if (!clientId || status !== "connected" || !settings) return false;
+        set({ settingsError: null });
+        try {
+          const result = expectResult(
+            await requestRuntime<CredentialActionResult>(clientId, "credentials.disconnect", {
+              provider_id: providerId,
+            }),
+          );
+          if (!hasProviderCredentialList(result)) {
+            throw new RpcTransportError("runtime returned malformed credential statuses", "malformed_event");
+          }
+          set({ settings: applyProviderCredentials(settings, result.providers), settingsError: null });
+          return true;
+        } catch (error) {
+          set({ settingsError: errorMessage(error) });
+          return false;
         }
       },
 

@@ -43,6 +43,7 @@ pub fn init_logging(level: &str) -> Result<(), Error> {
             reason: format!("invalid log level: {error}"),
         })?;
     tracing_subscriber::fmt()
+        .fmt_fields(crate::RedactingFields)
         .with_env_filter(filter)
         .try_init()
         .map_err(|error| Error::Logging(error.to_string()))

@@ -7,8 +7,9 @@ use harness_context::ContextBuilder;
 use harness_core::{discover_workspace, init_logging, AgentRuntime, Error, RunOutcome, RunRequest};
 use harness_git::{CheckpointStore, GitClient, ShadowCheckpointStore};
 use harness_models::{
-    ContentBlock, FinishReason, ModelConfig, ModelProvider, ModelResponse, ProviderKind,
-    ScriptedMockProvider, ToolCall, Usage,
+    provider_from_config_with_store, ContentBlock, CredentialStore, FinishReason, ModelConfig,
+    ModelProvider, ModelResponse, ProviderKind, ScriptedMockProvider, SystemCredentialStore,
+    ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_rpc::{AgentRunnerFactory, ApprovalBroker, RpcApprovalHandler, RpcServer, Runtime};
@@ -64,6 +65,7 @@ struct DevRunnerFactory {
     event_bus: EventBus,
     approvals: Arc<ApprovalBroker>,
     checkpoints: Arc<dyn CheckpointStore>,
+    credential_store: Arc<dyn CredentialStore>,
 }
 
 impl AgentRunnerFactory for DevRunnerFactory {
@@ -82,11 +84,11 @@ impl AgentRunnerFactory for DevRunnerFactory {
             ))
         } else {
             Arc::from(
-                harness_models::provider_from_config(model).map_err(|error| {
-                    harness_core::Error::InvalidConfig {
+                provider_from_config_with_store(model, self.credential_store.as_ref()).map_err(
+                    |error| harness_core::Error::InvalidConfig {
                         reason: error.to_string(),
-                    }
-                })?,
+                    },
+                )?,
             )
         };
         let policy: Arc<dyn Policy> = Arc::new(PolicyEngine::new(mode, &self.project_root));
@@ -169,6 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_checkpoints(Arc::clone(&checkpoints));
     // Clone the shared state the rebuild factory needs before it is moved into
     // the runtime.
+    let credential_store: Arc<dyn CredentialStore> = Arc::new(SystemCredentialStore::new());
     let factory = Arc::new(DevRunnerFactory {
         provider_script: Arc::new(vec![
             tool_response("list_directory", json!({"path": "."})),
@@ -186,6 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_bus: event_bus.clone(),
         approvals: Arc::clone(&approvals),
         checkpoints: Arc::clone(&checkpoints),
+        credential_store: Arc::clone(&credential_store),
     });
     let runtime = Arc::new(
         Runtime::new(
@@ -199,6 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_agent_runner(Arc::new(runner))
         .with_runner_factory(factory)
+        .with_credential_store(credential_store)
         .with_workspace_root(workspace_root),
     );
     let address: SocketAddr = address_argument.parse()?;

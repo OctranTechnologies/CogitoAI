@@ -84,6 +84,39 @@ fn no_subcommand_keeps_the_legacy_workspace_summary() {
 }
 
 #[test]
+fn auth_list_reports_environment_status_without_printing_the_key() {
+    const TEST_KEY: &str = "sk-auth-list-secret-must-not-print";
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path().to_string_lossy();
+    let sessions = temporary
+        .path()
+        .join("sessions")
+        .to_string_lossy()
+        .to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_harness-cli"))
+        .args([
+            "--workspace",
+            &workspace,
+            "--session-root",
+            &sessions,
+            "--json",
+            "auth",
+            "list",
+        ])
+        .env("OPENAI_API_KEY", TEST_KEY)
+        .output()
+        .expect("CLI should start");
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(stdout.contains("environment"));
+    assert!(stdout.contains("OPENAI_API_KEY"));
+    assert!(!stdout.contains(TEST_KEY));
+    assert!(!result.to_string().contains(TEST_KEY));
+}
+
+#[test]
 fn documents_and_runs_the_mock_cli_workflow() {
     let temporary = tempdir().unwrap();
     let root = temporary.path();

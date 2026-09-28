@@ -260,6 +260,24 @@ impl ModelRegistry {
     /// performs no network access; the selected model remains manually present
     /// even when its provider cannot be reached.
     pub fn with_builtins(active: &ModelConfig, cache_path: Option<PathBuf>) -> Self {
+        Self::with_builtins_using(active, cache_path, None)
+    }
+
+    /// Builds the built-in catalogs using the runtime's environment/keychain
+    /// credential source. This only constructs adapters and performs no HTTP.
+    pub fn with_builtins_and_credentials(
+        active: &ModelConfig,
+        cache_path: Option<PathBuf>,
+        store: &dyn super::CredentialStore,
+    ) -> Self {
+        Self::with_builtins_using(active, cache_path, Some(store))
+    }
+
+    fn with_builtins_using(
+        active: &ModelConfig,
+        cache_path: Option<PathBuf>,
+        store: Option<&dyn super::CredentialStore>,
+    ) -> Self {
         let registry = Self::new(cache_path, DEFAULT_TTL);
         for kind in [
             ProviderKind::Mock,
@@ -275,7 +293,11 @@ impl ModelRegistry {
                 ModelConfig::for_provider(kind)
             };
             let provider_id = provider_id(kind);
-            if let Ok(provider) = provider_from_config(&config) {
+            let provider = store.map_or_else(
+                || provider_from_config(&config),
+                |store| super::provider_from_config_with_store(&config, store),
+            );
+            if let Ok(provider) = provider {
                 registry.register_provider(provider_id, Arc::from(provider));
             }
             registry.set_default_model(provider_id, config.model.clone());
@@ -307,6 +329,31 @@ impl ModelRegistry {
     ) -> Result<(), ModelRegistryError> {
         let provider =
             provider_from_config(config).map_err(|_| ModelRegistryError::Configuration)?;
+        let provider_id = provider_id(config.provider);
+        self.providers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                provider_id.to_owned(),
+                ProviderEntry {
+                    provider: Arc::from(provider),
+                },
+            );
+        self.set_default_model(provider_id, config.model.clone());
+        self.register_manual_model(provider_id, config.model.clone(), None);
+        Ok(())
+    }
+
+    /// Rebuilds the configured provider adapter using the runtime credential
+    /// store. Called after a credential is connected or disconnected so the
+    /// registry's next refresh uses the new authentication state.
+    pub fn register_configured_model_with_credentials(
+        &self,
+        config: &ModelConfig,
+        store: &dyn super::CredentialStore,
+    ) -> Result<(), ModelRegistryError> {
+        let provider = super::provider_from_config_with_store(config, store)
+            .map_err(|_| ModelRegistryError::Configuration)?;
         let provider_id = provider_id(config.provider);
         self.providers
             .write()

@@ -257,6 +257,10 @@ impl ModelProvider for OpenAIProvider {
         }
     }
 
+    fn discover_models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+        OpenAIProvider::discover_models(self)
+    }
+
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
         let mut request = request.clone();
         request.model.clone_from(&self.model);

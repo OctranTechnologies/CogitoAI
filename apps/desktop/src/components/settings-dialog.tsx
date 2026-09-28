@@ -33,7 +33,7 @@ const SCREEN_ICONS: Record<SettingsScreen, typeof Settings2> = {
   verification: TestTube2,
 };
 
-/** Read-only settings dialog covering the five v0 configuration screens. */
+/** Runtime-backed settings dialog covering the five v0 configuration screens. */
 export function SettingsDialog({
   open,
   onClose,
@@ -233,12 +233,18 @@ function ModelsScreen() {
   const updateModel = useDesktopStore((state) => state.updateModel);
   const refreshModelCatalog = useDesktopStore((state) => state.refreshModelCatalog);
   const testModelConnection = useDesktopStore((state) => state.testModelConnection);
+  const refreshCredentialStatuses = useDesktopStore((state) => state.refreshCredentialStatuses);
+  const connectProvider = useDesktopStore((state) => state.connectProvider);
+  const disconnectProvider = useDesktopStore((state) => state.disconnectProvider);
   const modelTest = useDesktopStore((state) => state.modelTest);
   const [model, setModel] = useState(settings.models.model);
   const [baseUrl, setBaseUrl] = useState(settings.models.base_url);
   const [apiKeyEnv, setApiKeyEnv] = useState(settings.models.api_key_env);
   const [saved, setSaved] = useState(false);
   const [refreshingCatalog, setRefreshingCatalog] = useState(false);
+  const [editingCredentialProvider, setEditingCredentialProvider] = useState<string | null>(null);
+  const [credentialInput, setCredentialInput] = useState("");
+  const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
 
   // Re-seed the form when the runtime reports a different selection.
   useEffect(() => {
@@ -263,6 +269,25 @@ function ModelsScreen() {
     setRefreshingCatalog(false);
   }
 
+  async function submitCredential(providerId: string) {
+    let enteredKey = credentialInput;
+    setCredentialInput("");
+    setConnectingProvider(providerId);
+    try {
+      const connected = await connectProvider(providerId, enteredKey);
+      if (connected) setEditingCredentialProvider(null);
+    } finally {
+      enteredKey = "";
+      setConnectingProvider(null);
+    }
+  }
+
+  async function removeCredential(providerId: string) {
+    setConnectingProvider(providerId);
+    await disconnectProvider(providerId);
+    setConnectingProvider(null);
+  }
+
   const testTone: Tone = modelTest?.ok ? "success" : modelTest?.skipped ? "warning" : "error";
 
   return (
@@ -276,16 +301,86 @@ function ModelsScreen() {
       <Field label="Base URL" value={settings.models.base_url} mono />
 
       <div className="rounded-lg border border-line bg-sunken p-3">
-        <div className="flex items-center gap-2">
-          <KeyRound className="size-icon-sm text-faint" />
-          <span className="text-xs font-medium text-secondary">Credential</span>
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <KeyRound className="size-icon-sm text-faint" />
+            <span className="text-xs font-medium text-secondary">Provider connections</span>
+          </div>
+          <Button size="sm" onClick={() => void refreshCredentialStatuses()}>
+            Refresh status
+          </Button>
         </div>
-        <p className="mt-1.5 text-xs leading-4 text-muted">
-          {describeCredential(settings.models.credential)}
-        </p>
-        <p className="mt-1 text-2xs leading-4 text-faint">
-          Secrets are read from the runtime environment and are never sent to this app, so they cannot
-          be displayed or edited here.
+        <div className="divide-y divide-line">
+          {settings.runtime.credentials.map(({ provider_id: providerId, provider, credential }) => {
+            const environmentManaged = credential.source === "environment";
+            const connected = credential.source === "keychain";
+            const editing = editingCredentialProvider === providerId;
+            return (
+              <div key={providerId} className="py-2 first:pt-0 last:pb-0">
+                <div className="flex items-center gap-3">
+                  <span className="min-w-28 text-xs text-primary">{provider}</span>
+                  <span className="min-w-0 flex-1 truncate text-2xs text-muted" title={describeCredential(credential)}>
+                    {describeCredential(credential)}
+                  </span>
+                  {environmentManaged ? (
+                    <span className="shrink-0 text-2xs text-faint">Environment</span>
+                  ) : connected ? (
+                    <Button
+                      size="sm"
+                      disabled={connectingProvider === providerId}
+                      onClick={() => void removeCredential(providerId)}
+                    >
+                      Disconnect
+                    </Button>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      disabled={connectingProvider === providerId}
+                      onClick={() => {
+                        setCredentialInput("");
+                        setEditingCredentialProvider(editing ? null : providerId);
+                      }}
+                    >
+                      {editing ? "Cancel" : "Connect"}
+                    </Button>
+                  )}
+                </div>
+                {editing ? (
+                  <div className="ml-28 mt-2 flex gap-2">
+                    <input
+                      type="password"
+                      autoComplete="new-password"
+                      spellCheck={false}
+                      value={credentialInput}
+                      onChange={(event) => setCredentialInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && credentialInput.trim()) void submitCredential(providerId);
+                        if (event.key === "Escape") {
+                          setCredentialInput("");
+                          setEditingCredentialProvider(null);
+                        }
+                      }}
+                      aria-label={`${provider} API key`}
+                      placeholder="Paste API key"
+                      className="min-w-0 flex-1 rounded-md border border-line-strong bg-app px-2.5 py-1.5 font-mono text-xs text-primary outline-none focus:border-accent"
+                    />
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      disabled={!credentialInput.trim() || connectingProvider === providerId}
+                      onClick={() => void submitCredential(providerId)}
+                    >
+                      {connectingProvider === providerId ? "Checking…" : "Validate & connect"}
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+        <p className="mt-2 text-2xs leading-4 text-faint">
+          Environment credentials take priority and remain environment-managed. Keys entered here are validated by the runtime and stored in the OS credential store; this screen never receives saved keys.
         </p>
       </div>
 

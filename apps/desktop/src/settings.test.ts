@@ -82,6 +82,13 @@ const SNAPSHOT: SettingsSnapshot = {
     log_target: "runtime stdout",
     provider_names: ["openai"],
     credential_source: "environment",
+    credentials: [
+      { provider_id: "openai", provider: "OpenAI", credential: { available: true, source: "environment", env_var: "OPENAI_API_KEY" } },
+      { provider_id: "anthropic", provider: "Anthropic", credential: { available: false, source: "none", env_var: "ANTHROPIC_API_KEY" } },
+      { provider_id: "gemini", provider: "Google Gemini", credential: { available: false, source: "none", env_var: "GEMINI_API_KEY" } },
+      { provider_id: "opencode-zen", provider: "OpenCode Zen", credential: { available: false, source: "none", env_var: "OPENCODE_API_KEY" } },
+      { provider_id: "opencode-go", provider: "OpenCode Go", credential: { available: false, source: "none", env_var: "OPENCODE_API_KEY" } },
+    ],
   },
 };
 
@@ -216,6 +223,43 @@ describe("settings", () => {
     });
     expect(JSON.stringify(settings)).not.toContain(SECRET);
     expect(Object.keys(settings.models.credential)).toEqual(["available", "source", "env_var"]);
+  });
+
+  it("sends an entered key once and keeps it out of frontend state and persistence", async () => {
+    const enteredKey = "sk-newly-entered-key-must-not-persist";
+    const connectedProviders = SNAPSHOT.runtime.credentials.map((provider) =>
+      provider.provider_id === "anthropic"
+        ? { ...provider, credential: { available: true, source: "keychain" as const, env_var: "ANTHROPIC_API_KEY" } }
+        : provider,
+    );
+    requestRuntime.mockImplementation(async (_clientId: string, method: string) => {
+      if (method === "rpc.initialize") return response({ version: 1 });
+      if (method === "workspace.open") return response({ current_directory: "/repo", repository_root: "/repo", languages: [], manifests: [], instructions: [], configuration: { package_manager: null, commands: {}, source: null } });
+      if (method === "session.list") return response([]);
+      if (method === "git.status") return response({ repository_root: "/repo", branch: "main", head: "abc", is_clean: true, changed_files: [], staged_files: [], unstaged_files: [], untracked_files: [] });
+      if (method === "git.diff") return response({ unstaged: "", staged: "" });
+      if (method === "checkpoint.list") return response([]);
+      if (method === "settings.inspect") return response(SNAPSHOT);
+      if (method === "credentials.connect") return response({ provider: connectedProviders[1], providers: connectedProviders });
+      if (method === "credentials.list") return response({ providers: connectedProviders });
+      return response({});
+    });
+    localStorage.removeItem("cogitoai-desktop-ui");
+    await useDesktopStore.getState().connect("127.0.0.1:4545", "/repo");
+
+    expect(await useDesktopStore.getState().connectProvider("anthropic", enteredKey)).toBe(true);
+    expect(requestRuntime).toHaveBeenCalledWith("client-1", "credentials.connect", {
+      provider_id: "anthropic",
+      api_key: enteredKey,
+    });
+    expect(requestRuntime.mock.calls.filter((call) => call[1] === "credentials.connect")).toHaveLength(1);
+
+    await useDesktopStore.getState().refreshCredentialStatuses();
+    const state = useDesktopStore.getState();
+    expect(state.settings?.runtime.credentials[1].credential.source).toBe("keychain");
+    expect(JSON.stringify(state.settings)).not.toContain(enteredKey);
+    expect(localStorage.getItem("cogitoai-desktop-ui") ?? "").not.toContain(enteredKey);
+    expect(JSON.stringify(localStorage.getItem("cogitoai-desktop-ui"))).not.toContain(enteredKey);
   });
 
   it("switches the model and persists it in the snapshot", async () => {
@@ -416,10 +460,16 @@ describe("settings helpers", () => {
   it("describes a credential without revealing it", () => {
     expect(
       describeCredential({ available: true, source: "environment", env_var: "OPENAI_API_KEY" }),
-    ).toBe("Configured from OPENAI_API_KEY");
+    ).toBe("Connected from OPENAI_API_KEY · managed by the environment");
     expect(
       describeCredential({ available: false, source: "environment", env_var: "OPENAI_API_KEY" }),
-    ).toBe("Not set — set OPENAI_API_KEY in the runtime environment");
+    ).toBe("Not connected · set OPENAI_API_KEY or connect below");
+    expect(
+      describeCredential({ available: true, source: "keychain", env_var: "OPENAI_API_KEY" }),
+    ).toBe("Connected · stored in the OS credential store");
+    expect(
+      describeCredential({ available: false, source: "unavailable", env_var: "OPENAI_API_KEY" }),
+    ).toBe("OS credential store unavailable");
   });
 
   it("summarizes model capabilities", () => {

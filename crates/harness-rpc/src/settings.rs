@@ -7,115 +7,41 @@
 //! ([`CredentialStatus`]), never the value. That holds for
 //! [`SettingsSnapshot`], for every update response, and for error messages.
 //!
-//! Secrets are read through a [`SecretStore`]. The only implementation shipped
-//! is [`EnvironmentSecretStore`], which reads an environment variable named by
-//! the model settings. An operating-system keychain backend can be added
-//! later without changing any frontend code, because clients only ever see
-//! [`CredentialStatus`].
-//!
-//! No home-grown encryption is implemented here on purpose: an unverified
-//! cipher is worse than an honest environment variable, since it looks like
-//! protection without providing it.
+//! Secrets are read environment-first through a [`SecretStore`]. Interactive
+//! credentials are stored by the OS credential manager; clients only ever see
+//! [`CredentialStatus`], never values. No plaintext project configuration or
+//! home-grown encryption is used.
 
-use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use harness_core::discover_workspace;
 use harness_models::{
-    provider_from_config, ModelCapabilities, ModelConfig, ModelRegistry, ModelRegistryFilter,
-    ProviderKind,
+    provider_from_config, validate_provider_credential, CredentialError, CredentialStore,
+    ModelCapabilities, ModelConfig, ModelRegistry, ModelRegistryFilter, ProviderKind,
+    SystemCredentialStore,
 };
 use harness_policy::{ExecutionMode, OperationKind, PolicyDecision, PolicyEngine, PolicyRule};
 use serde::{Deserialize, Serialize};
 
 use crate::Runtime;
 
+pub use harness_models::CredentialStore as SecretStore;
+pub use harness_models::EnvironmentCredentialStore as EnvironmentSecretStore;
+pub use harness_models::{
+    CredentialSecret, CredentialSource, CredentialStatus, EnvironmentCredentialStore,
+    KeychainBackend,
+};
+
 /// Version reported by the runtime settings surface.
 pub const RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialSource {
-    /// Read from the process environment.
-    Environment,
-}
-
-impl CredentialSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Environment => "environment",
-        }
-    }
-}
-
-/// Whether a credential is available, and where from.
-///
-/// This is the only credential information a client ever receives. There is no
-/// field, and no method, that can carry the secret itself.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CredentialStatus {
-    /// True when a non-empty credential is available to the runtime.
-    pub available: bool,
-    pub source: CredentialSource,
-    /// Name of the environment variable holding the credential.
-    pub env_var: String,
-}
-
-impl CredentialStatus {
-    /// Redacted summary suitable for logs and the UI.
-    pub fn summary(&self) -> String {
-        if self.available {
-            format!("configured from {}", self.env_var)
-        } else {
-            format!("not set (set {})", self.env_var)
-        }
-    }
-}
-
-/// Supplies credentials to the runtime without ever revealing them.
-pub trait SecretStore: Send + Sync {
-    /// Returns true when a non-empty credential exists for `env_var`.
-    fn is_available(&self, env_var: &str) -> bool;
-    /// The credential for `env_var`, for internal use only.
-    ///
-    /// Callers must not log, serialize, or return this value.
-    fn get(&self, env_var: &str) -> Option<String>;
-    fn source(&self) -> CredentialSource;
-}
-
-/// Reads credentials from the process environment.
-///
-/// This is the only backend shipped. It is intentionally simple and honest: the
-/// secret is never copied into runtime configuration, never serialized, and
-/// never returned to a client.
-#[derive(Debug, Default)]
-pub struct EnvironmentSecretStore;
-
-impl SecretStore for EnvironmentSecretStore {
-    fn is_available(&self, env_var: &str) -> bool {
-        std::env::var(env_var)
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
-    }
-
-    fn get(&self, env_var: &str) -> Option<String> {
-        std::env::var(env_var)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    }
-
-    fn source(&self) -> CredentialSource {
-        CredentialSource::Environment
-    }
-}
 
 /// Redacts anything that looks like a credential in free-form text.
 ///
 /// Applied to every error surfaced to a client so a provider that echoes a key
 /// back cannot leak it into the UI or a log line.
 pub fn redact_secrets(text: &str, secrets: &[String]) -> String {
-    let mut redacted = text.to_owned();
+    let mut redacted = harness_core::redact_sensitive(text);
     for secret in secrets {
         if secret.len() >= 8 && redacted.contains(secret.as_str()) {
             redacted = redacted.replace(secret.as_str(), "[redacted]");
@@ -212,6 +138,14 @@ pub struct RuntimeSettingsView {
     pub log_target: String,
     pub provider_names: Vec<String>,
     pub credential_source: String,
+    pub credentials: Vec<ProviderCredentialView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCredentialView {
+    pub provider_id: String,
+    pub provider: String,
+    pub credential: CredentialStatus,
 }
 
 /// The full settings payload returned by `settings.inspect`.
@@ -249,6 +183,17 @@ pub struct ConnectionTestResult {
     pub message: String,
     /// True when the test could not run because no credential is configured.
     pub skipped: bool,
+}
+
+pub struct ProviderCredentialRequest {
+    pub provider_id: String,
+    pub api_key: zeroize::Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDisconnectRequest {
+    pub provider_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -459,11 +404,13 @@ pub fn advertised_execution_modes() -> Vec<String> {
 /// Reports whether the selected model has a usable credential, without
 /// ever reading the value into anything a client can observe.
 pub fn credential_status(model: &ModelConfig, store: &dyn SecretStore) -> CredentialStatus {
-    CredentialStatus {
-        available: store.is_available(&model.api_key_env),
-        source: store.source(),
-        env_var: model.api_key_env.clone(),
-    }
+    store
+        .status(provider_id(model.provider), &model.api_key_env)
+        .unwrap_or(CredentialStatus {
+            available: false,
+            source: CredentialSource::Unavailable,
+            env_var: model.api_key_env.clone(),
+        })
 }
 
 /// Capabilities the runtime knows about for the selected provider.
@@ -647,7 +594,8 @@ pub fn runtime_view(
         log_level: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned()),
         log_target: "runtime stdout".to_owned(),
         provider_names: runtime.provider_names(),
-        credential_source: store.source().as_str().to_owned(),
+        credential_source: "environment variables, then OS credential store".to_owned(),
+        credentials: provider_credentials(runtime, store),
     }
 }
 
@@ -806,13 +754,161 @@ pub fn test_model_connection(model: &ModelConfig, store: &dyn SecretStore) -> Co
     }
 }
 
-impl fmt::Display for CredentialSource {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+/// Builds a secret store for the runtime, defaulting to the environment.
+pub fn default_secret_store() -> Arc<dyn SecretStore> {
+    Arc::new(SystemCredentialStore::new())
+}
+
+pub fn provider_credentials(
+    runtime: &Runtime,
+    store: &dyn CredentialStore,
+) -> Vec<ProviderCredentialView> {
+    [
+        ProviderKind::OpenAi,
+        ProviderKind::Anthropic,
+        ProviderKind::Gemini,
+        ProviderKind::OpenCodeZen,
+        ProviderKind::OpenCodeGo,
+    ]
+    .into_iter()
+    .map(|provider| {
+        let model = credential_model(runtime, provider);
+        ProviderCredentialView {
+            provider_id: provider_id(provider).to_owned(),
+            provider: provider_label(&provider).to_owned(),
+            credential: credential_status(&model, store),
+        }
+    })
+    .collect()
+}
+
+pub fn validate_provider_key(
+    runtime: &Runtime,
+    provider_id: &str,
+    api_key: &str,
+) -> ConnectionTestResult {
+    let model = match credential_model_by_id(runtime, provider_id) {
+        Ok(model) => model,
+        Err(error) => {
+            return ConnectionTestResult {
+                ok: false,
+                skipped: false,
+                message: harness_core::redact_sensitive(&error.to_string()),
+            };
+        }
+    };
+    if api_key.trim().is_empty() {
+        return ConnectionTestResult {
+            ok: false,
+            skipped: false,
+            message: "Enter a non-empty provider key.".to_owned(),
+        };
+    }
+    match validate_provider_credential(&model, api_key) {
+        Ok(()) => ConnectionTestResult {
+            ok: true,
+            skipped: false,
+            message: format!("{} credential validated.", provider_label(&model.provider)),
+        },
+        Err(error) => ConnectionTestResult {
+            ok: false,
+            skipped: false,
+            message: harness_core::redact_sensitive(&redact_secrets(
+                &error.to_string(),
+                &[api_key.to_owned()],
+            )),
+        },
     }
 }
 
-/// Builds a secret store for the runtime, defaulting to the environment.
-pub fn default_secret_store() -> Arc<dyn SecretStore> {
-    Arc::new(EnvironmentSecretStore)
+pub fn connect_provider(
+    runtime: &Runtime,
+    store: &dyn CredentialStore,
+    provider_id: &str,
+    api_key: &str,
+) -> Result<ProviderCredentialView, SettingsError> {
+    let model = credential_model_by_id(runtime, provider_id)?;
+    let validation = validate_provider_key(runtime, provider_id, api_key);
+    if !validation.ok {
+        return Err(SettingsError::Unavailable(validation.message));
+    }
+    let status = credential_status(&model, store);
+    if status.source != CredentialSource::Environment {
+        store
+            .store(provider_id, &model.api_key_env, api_key)
+            .map_err(credential_error)?;
+    }
+    runtime
+        .model_registry()
+        .register_configured_model_with_credentials(&model, store)
+        .map_err(|_| {
+            SettingsError::Unavailable("could not refresh provider credentials".to_owned())
+        })?;
+    let updated = credential_status(&model, store);
+    Ok(ProviderCredentialView {
+        provider_id: provider_id.to_owned(),
+        provider: provider_label(&model.provider).to_owned(),
+        credential: updated,
+    })
+}
+
+pub fn disconnect_provider(
+    runtime: &Runtime,
+    store: &dyn CredentialStore,
+    provider_id: &str,
+) -> Result<ProviderCredentialView, SettingsError> {
+    let model = credential_model_by_id(runtime, provider_id)?;
+    let credential = store
+        .disconnect(provider_id, &model.api_key_env)
+        .map_err(credential_error)?;
+    runtime
+        .model_registry()
+        .register_configured_model_with_credentials(&model, store)
+        .map_err(|_| {
+            SettingsError::Unavailable("could not refresh provider credentials".to_owned())
+        })?;
+    Ok(ProviderCredentialView {
+        provider_id: provider_id.to_owned(),
+        provider: provider_label(&model.provider).to_owned(),
+        credential,
+    })
+}
+
+fn credential_model_by_id(
+    runtime: &Runtime,
+    provider_id: &str,
+) -> Result<ModelConfig, SettingsError> {
+    let provider = match provider_id {
+        "openai" => ProviderKind::OpenAi,
+        "anthropic" => ProviderKind::Anthropic,
+        "gemini" => ProviderKind::Gemini,
+        "opencode-zen" => ProviderKind::OpenCodeZen,
+        "opencode-go" => ProviderKind::OpenCodeGo,
+        _ => return Err(SettingsError::UnknownProvider(provider_id.to_owned())),
+    };
+    Ok(credential_model(runtime, provider))
+}
+
+fn credential_model(runtime: &Runtime, provider: ProviderKind) -> ModelConfig {
+    let active = runtime.model();
+    if active.provider == provider {
+        active
+    } else {
+        ModelConfig::for_provider(provider)
+    }
+}
+
+fn credential_error(error: CredentialError) -> SettingsError {
+    SettingsError::Unavailable(error.to_string())
+}
+
+fn provider_id(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Mock => "mock",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCodeZen => "opencode-zen",
+        ProviderKind::OpenCodeGo => "opencode-go",
+    }
 }

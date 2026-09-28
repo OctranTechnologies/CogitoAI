@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -8,8 +10,9 @@ use harness_context::{ContextBuilder, WorkspaceMetadata};
 use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest, SessionId};
 use harness_git::{CheckpointStore, ShadowCheckpointStore};
 use harness_models::{
-    ContentBlock, FinishReason, ModelCapabilities, ModelDescriptor, ModelProvider, ModelRequest,
-    ModelResponse, ModelStreamEvent, ProviderError, ScriptedMockProvider, ToolCall, Usage,
+    ContentBlock, CredentialError, CredentialStore, FinishReason, KeychainBackend,
+    ModelCapabilities, ModelDescriptor, ModelProvider, ModelRequest, ModelResponse,
+    ModelStreamEvent, ProviderError, ScriptedMockProvider, SystemCredentialStore, ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_rpc::AgentRunnerFactory as _;
@@ -145,6 +148,7 @@ fn setup_settings(
     root: &Path,
     provider: Arc<dyn ModelProvider>,
     approvals: Arc<ApprovalBroker>,
+    credential_store: Option<Arc<dyn CredentialStore>>,
 ) -> (Arc<Runtime>, Arc<JsonlSessionStore>) {
     std::process::Command::new("git")
         .args(["init", "--quiet"])
@@ -168,22 +172,109 @@ fn setup_settings(
             ExecutionMode::Normal,
         )
         .unwrap();
-    let runtime = Arc::new(
-        Runtime::new(
-            Arc::new(DummyAgent),
-            Vec::new(),
-            harness_tools::ToolRegistry::with_workspace_tools(),
-            Arc::new(PolicyEngine::new(ExecutionMode::Normal, root)),
-            Arc::clone(&sessions) as Arc<dyn SessionStore>,
-            Arc::clone(&checkpoints),
-            Vec::new(),
-        )
-        .with_agent_runner(initial)
-        .with_runner_factory(factory)
-        .with_workspace_root(root.to_path_buf()),
-    );
+    let runtime = Runtime::new(
+        Arc::new(DummyAgent),
+        Vec::new(),
+        harness_tools::ToolRegistry::with_workspace_tools(),
+        Arc::new(PolicyEngine::new(ExecutionMode::Normal, root)),
+        Arc::clone(&sessions) as Arc<dyn SessionStore>,
+        Arc::clone(&checkpoints),
+        Vec::new(),
+    )
+    .with_agent_runner(initial)
+    .with_runner_factory(factory)
+    .with_workspace_root(root.to_path_buf());
+    let runtime = match credential_store {
+        Some(store) => runtime.with_credential_store(store),
+        None => runtime,
+    };
+    let runtime = Arc::new(runtime);
     let _ = provider;
     (runtime, sessions)
+}
+
+#[derive(Default)]
+struct TestKeychain(Mutex<HashMap<String, String>>);
+
+impl KeychainBackend for TestKeychain {
+    fn get(&self, provider_id: &str) -> Result<Option<String>, CredentialError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(provider_id)
+            .cloned())
+    }
+
+    fn set(&self, provider_id: &str, secret: &str) -> Result<(), CredentialError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(provider_id.to_owned(), secret.to_owned());
+        Ok(())
+    }
+
+    fn delete(&self, provider_id: &str) -> Result<(), CredentialError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(provider_id);
+        Ok(())
+    }
+}
+
+/// Local OpenAI model-list endpoint used to test credentials without contacting
+/// a real provider. It records only whether the request had a valid key.
+fn mock_openai_model_endpoint(request_count: usize) -> (String, thread::JoinHandle<Vec<bool>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let mut auth_valid = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        while auth_valid.len() < request_count && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("mock HTTP accept failed: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            let valid = request.contains("Authorization: Bearer good-key-");
+            auth_valid.push(valid);
+            let (status, body) = if valid {
+                ("200 OK", r#"{"data":[{"id":"gpt-4o"}]}"#)
+            } else {
+                (
+                    "401 Unauthorized",
+                    r#"{"error":"rejected bad-key-secret-123"}"#,
+                )
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        }
+        auth_valid
+    });
+    (format!("http://{address}/v1"), handle)
 }
 
 /// Renders a value as JSON so a test can scan the whole payload for a secret.
@@ -588,7 +679,7 @@ fn exposes_typed_settings_and_never_returns_a_credential() {
     std::env::set_var(TEST_SECRET_VAR, TEST_SECRET);
     let approvals = Arc::new(ApprovalBroker::new());
     let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
-    let (runtime, _sessions) = setup_settings(root, provider, Arc::clone(&approvals));
+    let (runtime, _sessions) = setup_settings(root, provider, Arc::clone(&approvals), None);
     let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
 
     assert_ok(&client.request("rpc.initialize", json!({})).unwrap());
@@ -723,6 +814,117 @@ fn exposes_typed_settings_and_never_returns_a_credential() {
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     server.join().unwrap();
     std::env::remove_var(TEST_SECRET_VAR);
+}
+
+#[test]
+fn provider_credentials_validate_connect_reconnect_and_disconnect_without_leaks() {
+    const ENV_VAR: &str = "COGITO_RPC_CREDENTIAL_TEST_KEY";
+    const INVALID_KEY: &str = "bad-key-secret-123";
+    const FIRST_KEY: &str = "good-key-first-secret";
+    const SECOND_KEY: &str = "good-key-second-secret";
+    std::env::remove_var(ENV_VAR);
+
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let (base_url, provider_server) = mock_openai_model_endpoint(3);
+    let keychain = Arc::new(SystemCredentialStore::with_backend(Arc::new(
+        TestKeychain::default(),
+    )));
+    let store: Arc<dyn CredentialStore> = keychain;
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
+    let (runtime, sessions) = setup_settings(root, provider, Arc::clone(&approvals), Some(store));
+    let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
+
+    let configured = client
+        .request(
+            "settings.update_model",
+            json!({
+                "provider": "openai",
+                "model": "gpt-4o",
+                "base_url": base_url,
+                "api_key_env": ENV_VAR,
+            }),
+        )
+        .unwrap();
+    assert_ok(&configured);
+    assert_eq!(
+        configured.result.as_ref().unwrap()["models"]["provider_id"],
+        "openai"
+    );
+    assert_eq!(
+        configured.result.as_ref().unwrap()["models"]["base_url"],
+        base_url
+    );
+
+    let invalid = client
+        .request(
+            "credentials.validate",
+            json!({"provider_id": "openai", "api_key": INVALID_KEY}),
+        )
+        .unwrap();
+    assert_ok(&invalid);
+    let invalid = invalid.result.unwrap();
+    assert!(!rendered(&invalid).contains(INVALID_KEY));
+
+    for key in [FIRST_KEY, SECOND_KEY] {
+        let connected = client
+            .request(
+                "credentials.connect",
+                json!({"provider_id": "openai", "api_key": key}),
+            )
+            .unwrap();
+        assert_ok(&connected);
+        let connected = connected.result.unwrap();
+        assert_eq!(connected["provider"]["credential"]["source"], "keychain");
+        assert!(!rendered(&connected).contains(key));
+        assert!(!rendered(&connected).contains(INVALID_KEY));
+    }
+
+    let listed = client.request("credentials.list", json!({})).unwrap();
+    assert_ok(&listed);
+    let listed = listed.result.unwrap();
+    assert_eq!(listed["providers"][0]["provider_id"], "openai");
+    assert_eq!(listed["providers"][0]["credential"]["source"], "keychain");
+    assert!(!rendered(&listed).contains(FIRST_KEY));
+    assert!(!rendered(&listed).contains(SECOND_KEY));
+
+    let disconnected = client
+        .request("credentials.disconnect", json!({"provider_id": "openai"}))
+        .unwrap();
+    assert_ok(&disconnected);
+    assert_eq!(
+        disconnected.result.unwrap()["provider"]["credential"]["source"],
+        "none"
+    );
+    let auth_results = provider_server.join().unwrap();
+    assert_eq!(
+        auth_results,
+        vec![false, true, true],
+        "unexpected authorization path"
+    );
+
+    let _session = sessions.create(root).unwrap();
+    let session_root = root.join("sessions");
+    if let Ok(entries) = std::fs::read_dir(session_root) {
+        for entry in entries.flatten() {
+            if entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("jsonl")
+            {
+                let contents = std::fs::read_to_string(entry.path()).unwrap();
+                for key in [INVALID_KEY, FIRST_KEY, SECOND_KEY] {
+                    assert!(!contents.contains(key), "credential leaked into JSONL");
+                }
+            }
+        }
+    }
+
+    drop(client);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    server.join().unwrap();
 }
 
 #[test]

@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::settings::SecretStore;
 use harness_agent::{AgentError, AgentTask, ApprovalHandler};
 use harness_core::{discover_workspace, CheckpointId, RunId, SessionId};
 use harness_git::{is_runtime_state_path, GitClient, GitError};
@@ -19,12 +18,14 @@ use harness_tools::{CancellationToken, ToolRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 use crate::client::RpcClientError;
 use crate::protocol::{
     RpcError, RpcNotification, RpcRequest, RpcResponse, ServerMessage, METHODS,
     RPC_PROTOCOL_VERSION,
 };
+use crate::settings::SecretStore;
 use crate::Runtime;
 
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -69,8 +70,11 @@ impl RpcServer {
     ) -> Result<Self, RpcServerError> {
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
-        let state =
-            Arc::new(ServerState::new(approvals).with_session_root(session_root(runtime.as_ref())));
+        let credential_store = runtime.credential_store();
+        let state = Arc::new(
+            ServerState::new(approvals, credential_store)
+                .with_session_root(session_root(runtime.as_ref())),
+        );
         let event_subscription = runtime.agent_event_bus().map(|bus| {
             let state = Arc::clone(&state);
             bus.subscribe(Arc::new(EventForwarder { state }))
@@ -143,7 +147,7 @@ struct ServerState {
     client_terminals: Mutex<HashMap<u64, Vec<String>>>,
     /// Credential source for the settings surfaces. Holds no secret values: the
     /// store is asked only whether a credential exists.
-    secret_store: Arc<dyn SecretStore>,
+    secret_store: Arc<dyn harness_models::CredentialStore>,
     /// Where sessions are written, reported by the Runtime settings screen.
     session_root: PathBuf,
 }
@@ -154,7 +158,10 @@ struct ActiveRun {
 }
 
 impl ServerState {
-    fn new(approvals: Arc<ApprovalBroker>) -> Self {
+    fn new(
+        approvals: Arc<ApprovalBroker>,
+        secret_store: Arc<dyn harness_models::CredentialStore>,
+    ) -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(0),
@@ -163,7 +170,7 @@ impl ServerState {
             seen_events: Mutex::new(Vec::new()),
             approvals,
             client_terminals: Mutex::new(HashMap::new()),
-            secret_store: crate::settings::default_secret_store(),
+            secret_store,
             session_root: PathBuf::from("."),
         }
     }
@@ -544,6 +551,7 @@ fn serve_connection(
         let read = match reader.read_line(&mut line) {
             Ok(read) => read,
             Err(error) => {
+                line.zeroize();
                 read_failure = Some(error);
                 break;
             }
@@ -552,6 +560,7 @@ fn serve_connection(
             break;
         }
         if line.len() > MAX_LINE_BYTES {
+            line.zeroize();
             state.send(
                 client_id,
                 ServerMessage::Response(error_response(
@@ -562,7 +571,11 @@ fn serve_connection(
             );
             break;
         }
-        match serde_json::from_str::<RpcRequest>(&line) {
+        let parsed = serde_json::from_str::<RpcRequest>(&line);
+        // The wire buffer can contain an entered API key. Clear it before
+        // dispatch, logging, or the next read overwrites the allocation.
+        line.zeroize();
+        match parsed {
             Ok(request) => {
                 let response = dispatch(request, &state, &runtime, client_id);
                 state.send(client_id, ServerMessage::Response(response));
@@ -628,12 +641,13 @@ fn write_messages(
 }
 
 fn dispatch(
-    request: RpcRequest,
+    mut request: RpcRequest,
     state: &Arc<ServerState>,
     runtime: &Arc<Runtime>,
     client_id: u64,
 ) -> RpcResponse {
     if request.version != RPC_PROTOCOL_VERSION {
+        clear_secret_param(&mut request.params);
         return error_response(
             request.id,
             "unsupported_version",
@@ -641,6 +655,7 @@ fn dispatch(
         );
     }
     if request.id.is_none() {
+        clear_secret_param(&mut request.params);
         return error_response(request.id, "missing_id", "RPC requests require an id");
     }
     let result = match request.method.as_str() {
@@ -658,6 +673,16 @@ fn dispatch(
             settings_update_permissions(state, runtime, &request.params)
         }
         "settings.test_model" => settings_test_model(state, runtime),
+        "credentials.list" => credentials_list(state, runtime),
+        "credentials.validate" => {
+            let mut params = std::mem::take(&mut request.params);
+            credentials_validate(runtime, &mut params)
+        }
+        "credentials.connect" => {
+            let mut params = std::mem::take(&mut request.params);
+            credentials_connect(state, runtime, &mut params)
+        }
+        "credentials.disconnect" => credentials_disconnect(state, runtime, &request.params),
         "models.list" => models_list(runtime, &request.params),
         "models.refresh" => models_refresh(runtime, &request.params),
         "session.create" => session_create(runtime, &request.params),
@@ -839,7 +864,7 @@ fn start_run(request: RpcRequest, state: &Arc<ServerState>, runtime: &Arc<Runtim
                 method: "agent.failed".to_owned(),
                 params: json!({
                     "run_id": run_for_worker,
-                    "error": {"code": error_code_agent(&error), "message": error.to_string()},
+                    "error": {"code": error_code_agent(&error), "message": harness_core::redact_sensitive(&error.to_string())},
                 }),
             },
         };
@@ -1143,6 +1168,95 @@ fn settings_test_model(state: &ServerState, runtime: &Runtime) -> Result<Value, 
     Ok(serde_json::to_value(result)?)
 }
 
+fn credentials_list(state: &ServerState, runtime: &Runtime) -> Result<Value, RpcServerError> {
+    Ok(
+        json!({"providers": crate::settings::provider_credentials(runtime, state.secret_store().as_ref())}),
+    )
+}
+
+fn credentials_validate(runtime: &Runtime, params: &mut Value) -> Result<Value, RpcServerError> {
+    let request = take_provider_credential_request(params)?;
+    let result = crate::settings::validate_provider_key(
+        runtime,
+        &request.provider_id,
+        request.api_key.as_str(),
+    );
+    serde_json::to_value(result).map_err(Into::into)
+}
+
+fn credentials_connect(
+    state: &ServerState,
+    runtime: &Runtime,
+    params: &mut Value,
+) -> Result<Value, RpcServerError> {
+    let request = take_provider_credential_request(params)?;
+    let result = crate::settings::connect_provider(
+        runtime,
+        state.secret_store().as_ref(),
+        &request.provider_id,
+        request.api_key.as_str(),
+    );
+    let result = result?;
+    runtime.refresh_agent_runner().map_err(|error| {
+        RpcServerError::Runtime(harness_core::redact_sensitive(&error.to_string()))
+    })?;
+    Ok(
+        json!({"provider": result, "providers": crate::settings::provider_credentials(runtime, state.secret_store().as_ref())}),
+    )
+}
+
+fn take_provider_credential_request(
+    params: &mut Value,
+) -> Result<crate::settings::ProviderCredentialRequest, RpcServerError> {
+    let Some(object) = params.as_object_mut() else {
+        return Err(RpcServerError::Runtime(
+            "credential request must be an object".to_owned(),
+        ));
+    };
+    let api_key = match object.remove("api_key") {
+        Some(Value::String(value)) => zeroize::Zeroizing::new(value),
+        _ => {
+            return Err(RpcServerError::Runtime(
+                "api_key is required as a string".to_owned(),
+            ));
+        }
+    };
+    let provider_id = object
+        .remove("provider_id")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| RpcServerError::Runtime("provider_id is required".to_owned()))?;
+    Ok(crate::settings::ProviderCredentialRequest {
+        provider_id,
+        api_key,
+    })
+}
+
+fn clear_secret_param(params: &mut Value) {
+    if let Some(Value::String(secret)) = params.get_mut("api_key") {
+        secret.zeroize();
+    }
+}
+
+fn credentials_disconnect(
+    state: &ServerState,
+    runtime: &Runtime,
+    params: &Value,
+) -> Result<Value, RpcServerError> {
+    let request: crate::settings::ProviderDisconnectRequest =
+        serde_json::from_value(params.clone())?;
+    let result = crate::settings::disconnect_provider(
+        runtime,
+        state.secret_store().as_ref(),
+        &request.provider_id,
+    )?;
+    runtime.refresh_agent_runner().map_err(|error| {
+        RpcServerError::Runtime(harness_core::redact_sensitive(&error.to_string()))
+    })?;
+    Ok(
+        json!({"provider": result, "providers": crate::settings::provider_credentials(runtime, state.secret_store().as_ref())}),
+    )
+}
+
 fn models_list(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
     let filter = if params.is_null() {
         ModelRegistryFilter::default()
@@ -1213,7 +1327,7 @@ fn error_response(id: Option<String>, code: &str, message: impl Into<String>) ->
         result: None,
         error: Some(RpcError {
             code: code.to_owned(),
-            message: message.into(),
+            message: harness_core::redact_sensitive(&message.into()),
             data: None,
         }),
     }

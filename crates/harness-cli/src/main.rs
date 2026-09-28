@@ -12,9 +12,11 @@ use harness_core::{
 };
 use harness_git::{CheckpointStore, GitClient, GitDiff, ShadowCheckpointStore};
 use harness_models::{
-    provider_from_config, ContentBlock, FinishReason, Message, ModelConfig, ModelProvider,
-    ModelRegistry, ModelRegistryFilter, ModelRequest, ModelResponse, ModelStreamEvent,
-    ProviderError, ProviderKind, ScriptedMockProvider, ToolCall, Usage,
+    provider_from_config_with_store, validate_provider_credential, ContentBlock, CredentialSecret,
+    CredentialSource, CredentialStatus, CredentialStore, FinishReason, Message, ModelConfig,
+    ModelProvider, ModelRegistry, ModelRegistryFilter, ModelRequest, ModelResponse,
+    ModelStreamEvent, ProviderError, ProviderKind, ScriptedMockProvider, SystemCredentialStore,
+    ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{
@@ -41,6 +43,7 @@ enum InteractiveCommand {
     Config,
     Model,
     Models,
+    Connect,
     Mode,
     Clear,
     Cancel,
@@ -132,6 +135,13 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandDefinition] = &[
         usage: "/models [refresh [provider-id]]",
         description: "List cached models or refresh provider catalogs",
         command: InteractiveCommand::Models,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/connect",
+        usage: "/connect [provider-id]",
+        description: "Validate and securely store a provider credential",
+        command: InteractiveCommand::Connect,
         plain_supported: true,
     },
     InteractiveCommandDefinition {
@@ -280,7 +290,18 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     Tui,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum AuthCommand {
+    List,
+    Connect { provider: Option<String> },
+    Disconnect { provider: String },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -305,8 +326,9 @@ fn main() -> ExitCode {
     match execute(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let error = harness_core::redact_sensitive(&error.to_string());
             if cli.json {
-                eprintln!("{}", json!({"type": "error", "error": error.to_string()}));
+                eprintln!("{}", json!({"type": "error", "error": error}));
             } else {
                 eprintln!("error: {error}");
             }
@@ -355,6 +377,7 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             run_agent(cli, task.clone(), effective_path(cli, path), None)
         }
         Some(Command::Session { command }) => session_command(cli, command),
+        Some(Command::Auth { command }) => auth_command(cli, command),
         Some(Command::Tui) => interactive(cli),
         None => {
             if cli.json {
@@ -564,6 +587,9 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 InteractiveCommand::Config => config_command(cli, None)?,
                 InteractiveCommand::Model => model_info(cli)?,
                 InteractiveCommand::Models => models_command(cli, arguments)?,
+                InteractiveCommand::Connect => {
+                    connect_provider_cli(cli, (!arguments.is_empty()).then_some(arguments))?
+                }
                 InteractiveCommand::Mode => {
                     if !arguments.is_empty() {
                         eprintln!("usage: /mode (shows the workspace-configured mode)");
@@ -688,6 +714,9 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
         InteractiveCommand::Config => run_visible_command(tui, || config_command(cli, None)),
         InteractiveCommand::Model => run_visible_command(tui, || model_info(cli)),
         InteractiveCommand::Models => run_visible_command(tui, || models_command(cli, arguments)),
+        InteractiveCommand::Connect => run_visible_command(tui, || {
+            connect_provider_cli(cli, (!arguments.is_empty()).then_some(arguments))
+        }),
         InteractiveCommand::Mode => {
             if !arguments.is_empty() {
                 return Err("usage: /mode (shows the workspace-configured mode)".to_owned());
@@ -774,7 +803,7 @@ fn model_config(cli: &Cli) -> Result<ModelConfig, ProviderError> {
 
 fn ask(cli: &Cli, prompt: &str, stream: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config = model_config(cli)?;
-    let provider = provider_from_config(&config)?;
+    let provider = provider_from_config_with_store(&config, &SystemCredentialStore::new())?;
     let request = ModelRequest::new(config.model.clone(), vec![Message::user_text(prompt)]);
     let response = provider.generate(&request, &mut |event: ModelStreamEvent| {
         if stream && !cli.json {
@@ -805,7 +834,7 @@ fn ask(cli: &Cli, prompt: &str, stream: bool) -> Result<(), Box<dyn std::error::
 
 fn model_info(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let config = model_config(cli)?;
-    let provider = provider_from_config(&config)?;
+    let provider = provider_from_config_with_store(&config, &SystemCredentialStore::new())?;
     let descriptor = provider.descriptor();
     let info = json!({
         "provider": descriptor.provider,
@@ -842,8 +871,12 @@ fn models_command(cli: &Cli, arguments: &str) -> Result<(), Box<dyn std::error::
     }
     let config = model_config(cli)?;
     let workspace = effective_path(cli, Path::new("."));
-    let registry =
-        ModelRegistry::with_builtins(&config, Some(workspace.join(".cogito/model-catalog.json")));
+    let credential_store = SystemCredentialStore::new();
+    let registry = ModelRegistry::with_builtins_and_credentials(
+        &config,
+        Some(workspace.join(".cogito/model-catalog.json")),
+        &credential_store,
+    );
     let refresh = if action == Some("refresh") {
         Some(match provider_id {
             Some(provider_id) => registry.refresh_provider_report(provider_id),
@@ -1257,6 +1290,226 @@ fn run_agent_with_ui(
     Ok(())
 }
 
+fn auth_command(cli: &Cli, command: &AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SystemCredentialStore::new();
+    match command {
+        AuthCommand::List => print_credential_statuses(cli, &store),
+        AuthCommand::Connect { provider } => connect_provider_cli(cli, provider.as_deref()),
+        AuthCommand::Disconnect { provider } => {
+            let provider = parse_auth_provider(provider)?;
+            let config = credential_model_config(cli, provider);
+            let status = store.disconnect(provider_id(provider), &config.api_key_env)?;
+            print_credential_status(cli, provider, &status, "Credential disconnected.")
+        }
+    }
+}
+
+fn print_credential_statuses(
+    cli: &Cli,
+    store: &dyn CredentialStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let providers = [
+        ProviderKind::OpenAi,
+        ProviderKind::Anthropic,
+        ProviderKind::Gemini,
+        ProviderKind::OpenCodeZen,
+        ProviderKind::OpenCodeGo,
+    ]
+    .into_iter()
+    .map(|provider| {
+        let config = credential_model_config(cli, provider);
+        let status = store
+            .status(provider_id(provider), &config.api_key_env)
+            .unwrap_or(CredentialStatus {
+                available: false,
+                source: CredentialSource::Unavailable,
+                env_var: config.api_key_env,
+            });
+        json!({
+            "provider_id": provider_id(provider),
+            "provider": provider_label(provider),
+            "connected": status.available,
+            "source": status.source,
+            "env_var": status.env_var,
+        })
+    })
+    .collect::<Vec<_>>();
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"providers": providers}))?
+        );
+    } else {
+        for provider in providers {
+            let label = provider["provider"].as_str().unwrap_or("Provider");
+            let connected = provider["connected"].as_bool().unwrap_or(false);
+            let source = provider["source"].as_str().unwrap_or("unavailable");
+            let env_var = provider["env_var"].as_str().unwrap_or_default();
+            let status = match source {
+                "environment" => format!("Connected · environment ({env_var})"),
+                "keychain" => "Connected · OS credential store".to_owned(),
+                "unavailable" => "OS credential store unavailable".to_owned(),
+                _ if connected => "Connected".to_owned(),
+                _ => format!("Not connected · set {env_var} or run `harness auth connect`"),
+            };
+            println!("{label:<15} {status}");
+        }
+    }
+    Ok(())
+}
+
+fn connect_provider_cli(
+    cli: &Cli,
+    provider_id_argument: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !io::stdin().is_terminal() {
+        return Err("provider connection requires an interactive terminal".into());
+    }
+    let provider = match provider_id_argument {
+        Some(value) => parse_auth_provider(value)?,
+        None => select_auth_provider()?,
+    };
+    let config = credential_model_config(cli, provider);
+    let store = SystemCredentialStore::new();
+    let current = store
+        .status(provider_id(provider), &config.api_key_env)
+        .unwrap_or(CredentialStatus {
+            available: false,
+            source: CredentialSource::Unavailable,
+            env_var: config.api_key_env.clone(),
+        });
+    if current.source == CredentialSource::Environment {
+        let key = store
+            .get(provider_id(provider), &config.api_key_env)?
+            .ok_or("environment credential became unavailable")?;
+        validate_provider_credential(&config, key.expose_secret()).map_err(|error| {
+            harness_core::redact_sensitive(&format!("credential validation failed: {error}"))
+        })?;
+        return print_credential_status(
+            cli,
+            provider,
+            &current,
+            "Environment credential validated; it remains managed by the environment.",
+        );
+    }
+
+    eprintln!(
+        "Connecting {} ({})",
+        provider_label(provider),
+        config.api_key_env
+    );
+    let key = CredentialSecret::new(rpassword::prompt_password("API key (input hidden): ")?);
+    validate_provider_credential(&config, key.expose_secret()).map_err(|error| {
+        harness_core::redact_sensitive(&format!("credential validation failed: {error}"))
+    })?;
+    let status = store.store(
+        provider_id(provider),
+        &config.api_key_env,
+        key.expose_secret(),
+    )?;
+    print_credential_status(
+        cli,
+        provider,
+        &status,
+        "Credential validated and stored in the OS credential store.",
+    )
+}
+
+fn select_auth_provider() -> Result<ProviderKind, Box<dyn std::error::Error>> {
+    let providers = [
+        (ProviderKind::OpenAi, "OpenAI"),
+        (ProviderKind::Anthropic, "Anthropic"),
+        (ProviderKind::Gemini, "Google Gemini"),
+        (ProviderKind::OpenCodeZen, "OpenCode Zen"),
+        (ProviderKind::OpenCodeGo, "OpenCode Go"),
+    ];
+    for (index, (_, label)) in providers.iter().enumerate() {
+        eprintln!("{}. {label}", index + 1);
+    }
+    eprint!("Choose provider [1-5]: ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let selection = line.trim().parse::<usize>()?;
+    providers
+        .get(selection.saturating_sub(1))
+        .map(|(provider, _)| *provider)
+        .ok_or_else(|| "choose a provider from 1 to 5".into())
+}
+
+fn parse_auth_provider(value: &str) -> Result<ProviderKind, Box<dyn std::error::Error>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "openai" => Ok(ProviderKind::OpenAi),
+        "anthropic" => Ok(ProviderKind::Anthropic),
+        "gemini" | "google-gemini" | "google" => Ok(ProviderKind::Gemini),
+        "opencode-zen" | "opencode" => Ok(ProviderKind::OpenCodeZen),
+        "opencode-go" => Ok(ProviderKind::OpenCodeGo),
+        _ => Err(format!("unknown provider `{value}`").into()),
+    }
+}
+
+fn credential_model_config(cli: &Cli, provider: ProviderKind) -> ModelConfig {
+    let active = model_config(cli).ok();
+    active
+        .filter(|config| config.provider == provider)
+        .unwrap_or_else(|| ModelConfig::for_provider(provider))
+}
+
+fn provider_id(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Mock => "mock",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCodeZen => "opencode-zen",
+        ProviderKind::OpenCodeGo => "opencode-go",
+    }
+}
+
+fn provider_label(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Mock => "Mock",
+        ProviderKind::OpenAi => "OpenAI",
+        ProviderKind::Anthropic => "Anthropic",
+        ProviderKind::Gemini => "Google Gemini",
+        ProviderKind::OpenCodeZen => "OpenCode Zen",
+        ProviderKind::OpenCodeGo => "OpenCode Go",
+    }
+}
+
+fn print_credential_status(
+    cli: &Cli,
+    provider: ProviderKind,
+    status: &CredentialStatus,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "provider_id": provider_id(provider),
+                "provider": provider_label(provider),
+                "connected": status.available,
+                "source": status.source,
+                "env_var": status.env_var,
+                "message": message,
+            }))?
+        );
+    } else {
+        let status_text = match status.source {
+            CredentialSource::Environment => {
+                format!("Connected · environment ({})", status.env_var)
+            }
+            CredentialSource::Keychain => "Connected · OS credential store".to_owned(),
+            CredentialSource::None => "Not connected".to_owned(),
+            CredentialSource::Unavailable => "OS credential store unavailable".to_owned(),
+        };
+        println!("{}: {status_text}", provider_label(provider));
+        println!("{message}");
+    }
+    Ok(())
+}
+
 fn provider_for_agent(config: &ModelConfig) -> Result<Arc<dyn ModelProvider>, ProviderError> {
     if config.provider == ProviderKind::Mock {
         if let Some(repair) = mock_repair_script()? {
@@ -1291,7 +1544,10 @@ fn provider_for_agent(config: &ModelConfig) -> Result<Arc<dyn ModelProvider>, Pr
             ],
         )));
     }
-    Ok(Arc::from(provider_from_config(config)?))
+    Ok(Arc::from(provider_from_config_with_store(
+        config,
+        &SystemCredentialStore::new(),
+    )?))
 }
 
 /// A deliberately broken edit followed by a corrective one, so the mock can

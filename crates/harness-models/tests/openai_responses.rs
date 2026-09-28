@@ -541,7 +541,9 @@ fn model_discovery_filters_endpoint_results_with_capability_metadata() {
         }),
     )]);
     let provider = server.provider("gpt-4.1-mini");
-    let models = provider.discover_models().unwrap();
+    // Exercise discovery through the shared provider interface used by the
+    // registry and credential validator.
+    let models = ModelProvider::discover_models(&provider).unwrap();
     server.wait_for_response();
 
     let ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();

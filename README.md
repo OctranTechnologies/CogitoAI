@@ -28,10 +28,10 @@ provider is a first-class provider, not a test stub bolted on afterwards, which 
 what makes the whole system testable without a network.
 
 **Local first.** The runtime runs in-process on your machine and the RPC transport
-binds to loopback. There is no cloud service, no account, and no telemetry.
-Credentials are read from the environment of the process you started and are never
-sent to a client, written to a config file, or logged. Your code does not leave the
-machine.
+binds to loopback. There is no cloud service and no telemetry. Credentials come
+from explicitly configured environment variables or the OS credential manager.
+They are never returned to a client, written to project configuration or session
+history, or included in logs. Your code does not leave the machine.
 
 **Deterministic execution control.** The model's freedom ends at the tool
 boundary. A model may only ask for an action; the runtime decides whether that
@@ -226,8 +226,44 @@ The default API roots are `https://opencode.ai/zen/v1` for Zen and
 when using a compatible gateway. Both catalogs are cached in memory for 30
 minutes; `OpenCodeProvider::refresh_models()` bypasses the cache.
 
-For the desktop, the key must be present in the runtime process environment.
-In one terminal, configure the provider and start the local runtime:
+### Connect and manage credentials
+
+The process environment takes priority over the OS credential manager. To
+connect interactively from a terminal, run:
+
+```bash
+cargo run -p harness-cli -- auth connect
+```
+
+Choose a provider when prompted, then enter its key at the hidden prompt. Harness
+validates the key with a small model-list request before saving it to Windows
+Credential Manager, macOS Keychain, or the Linux Secret Service. You can select a
+provider directly, for example `harness auth connect openai`. For scripts and
+headless machines, set the provider's environment variable instead; environment
+keys remain environment-managed and are never copied into the OS store.
+
+List connection state or delete a key stored by Harness:
+
+```bash
+cargo run -p harness-cli -- auth list
+cargo run -p harness-cli -- auth disconnect openai
+```
+
+`auth list` reports only connected/not connected and whether the value is
+environment-managed or stored in the OS credential manager. Disconnect removes
+the Harness keychain entry; it does not change environment variables.
+
+In the desktop app, open **Settings → Models → Provider connections**. Entered
+keys are sent once to the local runtime, validated there, and stored in the OS
+credential manager. The desktop retains only connection status. Environment
+credentials are shown as environment-managed and take priority over stored keys.
+The runtime provides `credentials.list`, `credentials.validate`,
+`credentials.connect`, and `credentials.disconnect` RPC operations; there is no
+RPC method for reading a stored secret.
+
+Environment variables are an alternative to connecting in the desktop settings;
+they are useful for headless runtime launches and always take precedence over an
+OS-stored key. To start a runtime with an environment-managed Anthropic key:
 
 ```powershell
 $env:ANTHROPIC_API_KEY = "<your-key>"

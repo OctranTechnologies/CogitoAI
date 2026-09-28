@@ -1,12 +1,14 @@
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod redaction;
 pub mod runtime;
 pub mod workspace;
 
 pub use config::{init_logging, HarnessConfig};
 pub use error::Error;
 pub use ids::{CheckpointId, Id, RunId, SessionId};
+pub use redaction::{redact_sensitive, register_sensitive_value, RedactingFields};
 pub use runtime::{AgentRuntime, RunEvent, RunOutcome, RunRequest};
 pub use workspace::{
     discover_current_workspace, discover_workspace, CommandSpec, GitDescription, InstructionFile,
