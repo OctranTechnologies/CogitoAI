@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use harness_core::discover_workspace;
 use harness_models::{
-    provider_from_config, validate_provider_credential, CredentialError, CredentialStore,
-    ModelCapabilities, ModelConfig, ModelRegistry, ModelRegistryFilter, ProviderKind,
+    provider_from_config, save_project_model_preference, save_user_model_preference,
+    validate_provider_credential, CredentialError, CredentialStore, ModelCapabilities, ModelConfig,
+    ModelPreference, ModelRegistry, ModelRegistryFilter, ProviderKind, ReasoningEffort,
     SystemCredentialStore,
 };
 use harness_policy::{ExecutionMode, OperationKind, PolicyDecision, PolicyEngine, PolicyRule};
@@ -62,6 +63,10 @@ pub struct ModelSettingsView {
     pub credential: CredentialStatus,
     /// Catalogued or manually configured model IDs for this provider.
     pub available_models: Vec<String>,
+    /// Reasoning levels advertised for this exact selected model. Empty means
+    /// the runtime cannot safely offer a configurable effort control.
+    pub reasoning_levels: Vec<String>,
+    pub reasoning_effort: Option<String>,
     pub configured: bool,
 }
 
@@ -167,6 +172,13 @@ pub struct UpdateModelRequest {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// `user`, `project`, `session`, or `none`. Omitted defaults to `none` for
+    /// older clients that only change the in-memory runtime selection.
+    pub preference_scope: Option<String>,
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub record_session_event: bool,
 }
 
 /// A typed request to change the permission mode.
@@ -446,6 +458,21 @@ fn model_view_with_registry(
                 .collect()
         })
         .unwrap_or_default();
+    let selected_descriptor = registry.and_then(|registry| {
+        registry
+            .models(&ModelRegistryFilter {
+                provider_id: Some(provider_id.clone()),
+                requirements: Vec::new(),
+            })
+            .into_iter()
+            .find(|descriptor| descriptor.id == model.model)
+    });
+    let reasoning_levels = selected_descriptor
+        .and_then(|descriptor| descriptor.metadata.reasoning_levels)
+        .unwrap_or_default()
+        .into_iter()
+        .map(reasoning_effort_name)
+        .collect();
     ModelSettingsView {
         provider: provider_label(&model.provider).to_owned(),
         provider_id,
@@ -463,6 +490,8 @@ fn model_view_with_registry(
             | ProviderKind::OpenCodeGo => credential.available,
         },
         available_models,
+        reasoning_levels,
+        reasoning_effort: model.reasoning_effort.map(reasoning_effort_name),
         credential,
     }
 }
@@ -624,7 +653,8 @@ pub fn apply_model(
     runtime: &Runtime,
     request: &UpdateModelRequest,
 ) -> Result<ModelConfig, SettingsError> {
-    let mut next = runtime.model();
+    let current = runtime.model();
+    let mut next = current.clone();
     if let Some(provider) = &request.provider {
         let provider = parse_provider(provider)?;
         next.select_provider(provider);
@@ -632,18 +662,122 @@ pub fn apply_model(
     if let Some(model) = &request.model {
         next.model = model.trim().to_owned();
     }
+    if (next.provider != current.provider || next.model != current.model)
+        && request.reasoning_effort.is_none()
+    {
+        next.reasoning_effort = None;
+    }
     if let Some(base_url) = &request.base_url {
         next.base_url = base_url.trim().to_owned();
     }
     if let Some(api_key_env) = &request.api_key_env {
         next.api_key_env = api_key_env.trim().to_owned();
     }
+    if let Some(effort) = &request.reasoning_effort {
+        let provider_id = provider_from_config(&next)
+            .map(|provider| provider.descriptor().provider)
+            .unwrap_or_default();
+        let selected = runtime
+            .model_registry()
+            .models(&ModelRegistryFilter {
+                provider_id: Some(provider_id),
+                requirements: Vec::new(),
+            })
+            .into_iter()
+            .find(|descriptor| descriptor.id == next.model);
+        let supported = selected
+            .as_ref()
+            .and_then(|descriptor| descriptor.metadata.reasoning_levels.as_ref())
+            .is_some_and(|levels| !levels.is_empty());
+        if !supported {
+            return Err(SettingsError::Invalid(
+                "the selected model does not advertise configurable reasoning levels".to_owned(),
+            ));
+        }
+        next.reasoning_effort = if effort.eq_ignore_ascii_case("off") {
+            None
+        } else {
+            Some(
+                serde_json::from_value(serde_json::Value::String(effort.to_ascii_lowercase()))
+                    .map_err(|_| SettingsError::Invalid("unsupported reasoning effort".into()))?,
+            )
+        };
+        if let Some(effort) = next.reasoning_effort {
+            let allowed = selected
+                .and_then(|descriptor| descriptor.metadata.reasoning_levels)
+                .is_some_and(|levels| levels.contains(&effort));
+            if !allowed {
+                return Err(SettingsError::Invalid(
+                    "reasoning effort is not supported by the selected model".to_owned(),
+                ));
+            }
+        }
+    }
     next.validate().map_err(SettingsError::Invalid)?;
+    match request.preference_scope.as_deref().unwrap_or("none") {
+        "none" | "user" | "project" | "session" => {}
+        scope => {
+            return Err(SettingsError::Invalid(format!(
+                "unknown model preference scope '{scope}'"
+            )))
+        }
+    }
+    if request.record_session_event && request.session_id.is_none() {
+        return Err(SettingsError::Invalid(
+            "session_id is required to record a model change".to_owned(),
+        ));
+    }
     let mode = runtime.execution_mode();
     runtime
         .apply_settings(next.clone(), mode)
         .map_err(|error| SettingsError::Unavailable(error.to_string()))?;
+
+    let preference = ModelPreference::from_canonical_id(
+        &format!("{}/{}", model_provider_id(next.provider), next.model),
+        next.reasoning_effort,
+    )
+    .map_err(|error| SettingsError::Internal(error.to_string()))?;
+    match request.preference_scope.as_deref().unwrap_or("none") {
+        "none" => {}
+        "user" => save_user_model_preference(&preference)
+            .map_err(|error| SettingsError::Internal(error.to_string()))?,
+        "project" => {
+            let root = runtime.workspace_root().ok_or_else(|| {
+                SettingsError::Invalid("project preference needs an open workspace".to_owned())
+            })?;
+            save_project_model_preference(root, &preference)
+                .map_err(|error| SettingsError::Internal(error.to_string()))?;
+        }
+        "session" => {}
+        _ => unreachable!("preference scope validated above"),
+    }
+    if request.record_session_event {
+        let session_id = request.session_id.as_deref().ok_or_else(|| {
+            SettingsError::Invalid("session_id is required to record a model change".to_owned())
+        })?;
+        runtime
+            .record_model_change(session_id, &next)
+            .map_err(|error| SettingsError::Unavailable(error.to_string()))?;
+    }
     Ok(next)
+}
+
+fn reasoning_effort_name(effort: ReasoningEffort) -> String {
+    serde_json::to_value(effort)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn model_provider_id(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Mock => "mock",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCodeZen => "opencode-zen",
+        ProviderKind::OpenCodeGo => "opencode-go",
+    }
 }
 
 /// Applies a permission-mode change, validating the mode first.

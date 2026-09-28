@@ -70,6 +70,8 @@ function resetStore() {
     checkpoints: [],
     restoringCheckpointId: null,
     lastRestore: null,
+    modelCatalog: null,
+    isLoadingModelCatalog: false,
   });
 }
 
@@ -86,6 +88,7 @@ describe("desktop runtime store", () => {
       if (method === "agent.send") return response({ run_id: "run-1" });
       if (method === "session.resume") return response({});
       if (method === "session.inspect") return response({ session: { id: "session-1", workspace_root: "/repo", events: [] }, warnings: [] });
+      if (method === "models.list") return response({ models: [], defaults: {} });
       return response({});
     });
   });

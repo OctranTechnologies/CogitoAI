@@ -24,14 +24,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use harness_agent::{AgentOutcome, AgentRunner, AgentTask};
-use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest};
+use harness_core::{AgentRuntime, Error, RunOutcome, RunRequest, SessionId};
 use harness_git::{Checkpoint, CheckpointInfo, CheckpointStore, GitError, RestoreReport};
 use harness_models::{
-    CredentialStore, ModelConfig, ModelProvider, ModelRegistry, SystemCredentialStore,
+    has_model_environment_override, load_project_model_preference, load_user_model_preference,
+    CredentialStore, ModelConfig, ModelPreference, ModelPreferenceError, ModelProvider,
+    ModelRegistry, SystemCredentialStore,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{
-    HarnessEvent, Session, SessionLoadReport, SessionState, SessionStore, SessionSummary,
+    EventPayload, HarnessEvent, Session, SessionLoadReport, SessionState, SessionStore,
+    SessionSummary,
 };
 use harness_tools::{ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{VerificationReport, VerificationRequest, Verifier};
@@ -238,6 +241,67 @@ impl Runtime {
         Ok(())
     }
 
+    /// Applies the saved user default followed by the workspace's project
+    /// override. Explicit model environment configuration remains authoritative.
+    pub fn apply_saved_model_preferences(&self) -> Result<(), Error> {
+        if has_model_environment_override() {
+            return Ok(());
+        }
+        let original = self.model();
+        let mut preferred = original.clone();
+        if let Some(preference) = load_user_model_preference().map_err(preference_error)? {
+            preference
+                .apply_to(&mut preferred)
+                .map_err(preference_error)?;
+        }
+        if let Some(root) = &self.workspace_root {
+            if let Some(preference) =
+                load_project_model_preference(root).map_err(preference_error)?
+            {
+                preference
+                    .apply_to(&mut preferred)
+                    .map_err(preference_error)?;
+            }
+        }
+        if preferred != original {
+            self.apply_settings(preferred, self.execution_mode())?;
+        }
+        Ok(())
+    }
+
+    /// Persists a model-selection event after confirming the session belongs to
+    /// this runtime's workspace.
+    pub fn record_model_change(&self, session: &str, model: &ModelConfig) -> Result<(), Error> {
+        let session_id = SessionId::new(session.to_owned())?;
+        let existing = self.sessions.load(&session_id)?;
+        if let Some(workspace_root) = &self.workspace_root {
+            let workspace_root = std::fs::canonicalize(workspace_root)?;
+            if existing.workspace_root != workspace_root {
+                return Err(Error::InvalidRequest {
+                    reason: "session belongs to a different workspace".to_owned(),
+                });
+            }
+        }
+        let reasoning_effort = model.reasoning_effort.and_then(|effort| {
+            serde_json::to_value(effort)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+        });
+        self.sessions.append_event(
+            &session_id,
+            HarnessEvent::new(
+                session_id.clone(),
+                EventPayload::ModelChanged {
+                    provider: model_provider_id(model.provider).to_owned(),
+                    model: model.model.clone(),
+                    reasoning_effort,
+                },
+                None,
+                None,
+            ),
+        )
+    }
+
     /// Human-operated terminal sessions for the open workspace.
     pub fn ptys(&self) -> std::sync::MutexGuard<'_, PtyManager> {
         self.ptys.lock().expect("PTY manager lock poisoned")
@@ -325,7 +389,33 @@ impl Runtime {
     }
 
     pub fn resume_session(&self, session_id: &harness_core::SessionId) -> Result<Session, Error> {
-        self.sessions.resume(session_id)
+        let existing = self.sessions.load(session_id)?;
+        let preference = existing.events.iter().rev().find_map(|event| {
+            if let EventPayload::ModelChanged {
+                provider,
+                model,
+                reasoning_effort,
+            } = &event.payload
+            {
+                let effort = reasoning_effort.as_ref().and_then(|value| {
+                    serde_json::from_value(serde_json::Value::String(value.clone())).ok()
+                });
+                ModelPreference::from_canonical_id(&format!("{provider}/{model}"), effort).ok()
+            } else {
+                None
+            }
+        });
+        let resumed = self.sessions.resume(session_id)?;
+        if let Some(preference) = preference {
+            let mut model = self.model();
+            preference.apply_to(&mut model).map_err(preference_error)?;
+            if model != self.model() {
+                self.apply_settings(model, self.execution_mode())?;
+            }
+        } else {
+            self.apply_saved_model_preferences()?;
+        }
+        Ok(resumed)
     }
 
     pub fn session_state(
@@ -379,5 +469,22 @@ impl Runtime {
             reports.extend(verifier.verify(request)?);
         }
         Ok(reports)
+    }
+}
+
+fn preference_error(error: ModelPreferenceError) -> Error {
+    Error::InvalidConfig {
+        reason: error.to_string(),
+    }
+}
+
+fn model_provider_id(provider: harness_models::ProviderKind) -> &'static str {
+    match provider {
+        harness_models::ProviderKind::Mock => "mock",
+        harness_models::ProviderKind::OpenAi => "openai",
+        harness_models::ProviderKind::Anthropic => "anthropic",
+        harness_models::ProviderKind::Gemini => "gemini",
+        harness_models::ProviderKind::OpenCodeZen => "opencode-zen",
+        harness_models::ProviderKind::OpenCodeGo => "opencode-go",
     }
 }

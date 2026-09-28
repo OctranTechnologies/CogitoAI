@@ -50,6 +50,7 @@ import {
 import {
   isSettingsSnapshot,
   type CatalogRefreshReport,
+  type ModelCatalog,
   type CredentialActionResult,
   type ConnectionTestResult,
   type ProviderCredentialStatus,
@@ -123,6 +124,8 @@ export interface DesktopStore {
   isStartingTerminal: boolean;
   terminalExit: TerminalExit | null;
   settings: SettingsSnapshot | null;
+  modelCatalog: ModelCatalog | null;
+  isLoadingModelCatalog: boolean;
   isLoadingSettings: boolean;
   settingsError: string | null;
   modelTest: ConnectionTestResult | null;
@@ -152,6 +155,7 @@ export interface DesktopStore {
   closeTerminal: () => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshModelCatalog: (providerId: string) => Promise<boolean>;
+  loadModelCatalog: () => Promise<boolean>;
   updateModel: (request: UpdateModelRequest) => Promise<boolean>;
   updatePermissionMode: (mode: string) => Promise<boolean>;
   testModelConnection: () => Promise<void>;
@@ -331,13 +335,15 @@ export const useDesktopStore = create<DesktopStore>()(
       isStartingTerminal: false,
       terminalExit: null,
       settings: null,
+      modelCatalog: null,
+      isLoadingModelCatalog: false,
       isLoadingSettings: false,
       settingsError: null,
       modelTest: null,
 
       connect: async (address, workspacePath) => {
         if (get().clientId) await get().disconnect();
-        set({ status: "connecting", address, workspacePath, lastError: null, isLoadingWorkspace: true });
+        set({ status: "connecting", address, workspacePath, lastError: null, isLoadingWorkspace: true, modelCatalog: null });
         try {
           const clientId = await connectRuntime(address);
           set({ clientId });
@@ -356,6 +362,7 @@ export const useDesktopStore = create<DesktopStore>()(
           await get().refreshChanges();
           // Settings are workspace-derived, so they load alongside the rest.
           await get().refreshSettings();
+          await get().loadModelCatalog();
         } catch (error) {
           const clientId = get().clientId;
           if (clientId) await disconnectRuntime(clientId).catch(() => undefined);
@@ -366,7 +373,7 @@ export const useDesktopStore = create<DesktopStore>()(
       disconnect: async () => {
         const clientId = get().clientId;
         if (clientId) await disconnectRuntime(clientId);
-        set({ status: "disconnected", clientId: null, activeRunId: null, runPhase: "idle" });
+        set({ status: "disconnected", clientId: null, activeRunId: null, runPhase: "idle", modelCatalog: null });
       },
 
       setWorkspacePath: (workspacePath) => {
@@ -390,6 +397,8 @@ export const useDesktopStore = create<DesktopStore>()(
           restoringCheckpointId: null,
           lastRestore: null,
           settings: null,
+          modelCatalog: null,
+          isLoadingModelCatalog: false,
           settingsError: null,
         });
       },
@@ -459,6 +468,8 @@ export const useDesktopStore = create<DesktopStore>()(
             throw new RpcTransportError("runtime returned a malformed persisted event", "malformed_event");
           }
           const events = report.session.events;
+          const settings = expectResult(await requestRuntime(clientId, "settings.inspect", {}));
+          if (isSettingsSnapshot(settings)) set({ settings });
           set({
             activeSessionId: targetSession,
             ...derivedFromEvents(events),
@@ -721,9 +732,29 @@ export const useDesktopStore = create<DesktopStore>()(
               ? failures.map((provider) => `${provider.provider_id}: ${provider.error}`).join("; ")
               : null,
           });
+          await get().loadModelCatalog();
           return true;
         } catch (error) {
           set({ settingsError: errorMessage(error) });
+          return false;
+        }
+      },
+
+      loadModelCatalog: async () => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return false;
+        set({ isLoadingModelCatalog: true });
+        try {
+          const catalog = expectResult(
+            await requestRuntime<ModelCatalog>(clientId, "models.list", {}),
+          );
+          if (!catalog || !Array.isArray(catalog.models) || typeof catalog.defaults !== "object") {
+            throw new RpcTransportError("runtime returned malformed model catalog", "malformed_event");
+          }
+          set({ modelCatalog: catalog, isLoadingModelCatalog: false });
+          return true;
+        } catch (error) {
+          set({ isLoadingModelCatalog: false, settingsError: errorMessage(error) });
           return false;
         }
       },
@@ -741,7 +772,24 @@ export const useDesktopStore = create<DesktopStore>()(
           if (!isSettingsSnapshot(payload)) {
             throw new RpcTransportError("runtime returned malformed settings", "malformed_event");
           }
-          set({ settings: payload, modelTest: null });
+          let sessionEvents: HarnessEvent[] | null = null;
+          if (request.record_session_event && request.session_id) {
+            const report = expectResult(
+              await requestRuntime<SessionInspectReport>(clientId, "session.inspect", {
+                session_id: request.session_id,
+              }),
+            );
+            if (!report.session.events.every(isHarnessEvent)) {
+              throw new RpcTransportError("runtime returned a malformed persisted event", "malformed_event");
+            }
+            sessionEvents = report.session.events;
+          }
+          set({
+            settings: payload,
+            modelTest: null,
+            ...(sessionEvents ? derivedFromEvents(sessionEvents) : {}),
+          });
+          if (request.provider || request.model) await get().loadModelCatalog();
           return true;
         } catch (error) {
           set({ settingsError: errorMessage(error) });

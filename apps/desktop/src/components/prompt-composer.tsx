@@ -1,6 +1,6 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { FolderGit2, LoaderCircle, Send, Square, X } from "lucide-react";
-import type { ModelSettings, PermissionSettings } from "../lib/settings";
+import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
 import { Button, IconButton, Tooltip, cx } from "./ui";
 import { ComposerShell } from "./composer-parts";
 import { useAutoGrow } from "../lib/composer";
@@ -15,8 +15,14 @@ export interface PromptComposerProps {
   running: boolean;
   onCancel: () => void;
   models: ModelSettings | null;
+  modelCatalog: ModelDescriptor[];
+  providerCredentials: ProviderCredentialStatus[];
+  isLoadingModelCatalog: boolean;
   permissions: PermissionSettings | null;
-  onSelectModel: (model: string) => void;
+  onSelectModel: (provider: string, model: string) => void;
+  onRefreshModelCatalog: (providerId: string) => void;
+  onConnectProvider: (providerId: string) => void;
+  onSelectReasoning: (effort: string) => void;
   onSelectMode: (mode: string) => void;
   pendingMode: string | null;
   /** Workspace path shown above the textarea, with a switch affordance. */
@@ -46,8 +52,14 @@ export function PromptComposer({
   running,
   onCancel,
   models,
+  modelCatalog,
+  providerCredentials,
+  isLoadingModelCatalog,
   permissions,
   onSelectModel,
+  onRefreshModelCatalog,
+  onConnectProvider,
+  onSelectReasoning,
   onSelectMode,
   pendingMode,
   workspacePath,
@@ -135,7 +147,13 @@ export function PromptComposer({
           />
           <ModelSelector
             models={models}
+            catalog={modelCatalog}
+            credentials={providerCredentials}
+            loading={isLoadingModelCatalog}
             onSelect={onSelectModel}
+            onRefresh={onRefreshModelCatalog}
+            onConnect={onConnectProvider}
+            onSelectReasoning={onSelectReasoning}
             disabled={!connected}
             disabledReason={!connected ? "Connect a runtime to change the model" : undefined}
           />

@@ -65,6 +65,7 @@ function App() {
   const [terminalVisible, setTerminalVisible] = useState(false);
   const [railTarget, setRailTarget] = useState<RailTarget>(readStoredRailTarget);
   const [settingsScreen, setSettingsScreen] = useState<SettingsScreen>("models");
+  const [connectProviderId, setConnectProviderId] = useState<string | null>(null);
   const [pendingMode, setPendingMode] = useState<string | null>(null);
   const {
     status,
@@ -97,7 +98,10 @@ function App() {
     terminal,
     isStartingTerminal,
     settings,
+    modelCatalog,
+    isLoadingModelCatalog,
     updateModel,
+    refreshModelCatalog,
     updatePermissionMode,
     closeTerminal,
     startTerminal,
@@ -200,8 +204,28 @@ function App() {
     await sendMessage(text);
   }, [sendMessage]);
 
-  async function selectModel(model: string) {
-    await updateModel({ model });
+  async function selectModel(provider: string, model: string) {
+    await updateModel({
+      provider,
+      model,
+      preference_scope: "user",
+      session_id: activeSessionId ?? undefined,
+      record_session_event: Boolean(activeSessionId),
+    });
+  }
+
+  async function selectReasoning(effort: string) {
+    await updateModel({
+      reasoning_effort: effort,
+      preference_scope: "user",
+      session_id: activeSessionId ?? undefined,
+      record_session_event: Boolean(activeSessionId),
+    });
+  }
+
+  function connectProviderFromPicker(providerId: string) {
+    setConnectProviderId(providerId);
+    openSettings("models");
   }
 
   async function selectMode(mode: string) {
@@ -406,6 +430,9 @@ function App() {
               projectName={workspace?.repository_root ?? workspace?.current_directory ?? null}
               branch={gitStatus?.branch ?? null}
               models={settings?.models ?? null}
+              modelCatalog={modelCatalog?.models ?? []}
+              providerCredentials={settings?.runtime.credentials ?? []}
+              isLoadingModelCatalog={isLoadingModelCatalog}
               permissions={settings?.permissions ?? null}
               composer={{
                 value: composer,
@@ -416,6 +443,9 @@ function App() {
                 onChooseWorkspace: chooseWorkspace,
                 pendingMode,
                 onSelectModel: selectModel,
+                onRefreshModelCatalog: (providerId: string) => void refreshModelCatalog(providerId),
+                onConnectProvider: connectProviderFromPicker,
+                onSelectReasoning: selectReasoning,
                 onSelectMode: selectMode,
               }}
               onApprove={approve}
@@ -458,8 +488,14 @@ function App() {
               workspacePath={workspacePath}
               onChooseWorkspace={chooseWorkspace}
               models={settings?.models ?? null}
+              modelCatalog={modelCatalog?.models ?? []}
+              providerCredentials={settings?.runtime.credentials ?? []}
+              isLoadingModelCatalog={isLoadingModelCatalog}
               permissions={settings?.permissions ?? null}
               onSelectModel={selectModel}
+              onRefreshModelCatalog={(providerId) => void refreshModelCatalog(providerId)}
+              onConnectProvider={connectProviderFromPicker}
+              onSelectReasoning={selectReasoning}
               onSelectMode={selectMode}
               pendingMode={pendingMode}
               runtimeError={lastError}
@@ -488,6 +524,7 @@ function App() {
       <SettingsDialog
         open={showSettings}
         initialScreen={settingsScreen}
+        connectProviderId={connectProviderId}
         onClose={() => setShowSettings(false)}
       />
       <CommandMenu

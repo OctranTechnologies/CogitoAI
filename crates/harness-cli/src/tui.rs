@@ -10,6 +10,7 @@ use crossterm::terminal::{
     self, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use crossterm::{cursor::Show, style::ResetColor};
+use harness_models::{ModelConfig, ProviderKind};
 use harness_session::EventPayload;
 use harness_tools::CancellationToken;
 use ratatui::backend::CrosstermBackend;
@@ -48,6 +49,7 @@ enum UiMessage {
         response: SyncSender<bool>,
     },
     RunFinished(Result<(), String>),
+    SessionId(String),
 }
 
 #[derive(Clone)]
@@ -95,6 +97,12 @@ impl TuiSender {
     pub fn run_finished(&self, result: Result<(), String>) {
         let _ = self.sender.send(UiMessage::RunFinished(result));
     }
+
+    pub fn active_session(&self, session_id: &str) {
+        let _ = self
+            .sender
+            .send(UiMessage::SessionId(session_id.to_owned()));
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -128,6 +136,7 @@ struct AppState {
     pending_approval: Option<(String, SyncSender<bool>)>,
     quit: bool,
     colors: bool,
+    active_session_id: Option<String>,
 }
 
 impl AppState {
@@ -156,6 +165,7 @@ impl AppState {
             pending_approval: None,
             quit: false,
             colors,
+            active_session_id: None,
         };
         state.push_activity("Ready. Enter a task or type /help.".to_owned());
         state
@@ -567,10 +577,11 @@ pub struct Tui {
     state: AppState,
     suspended: bool,
     dirty: bool,
+    model_config: ModelConfig,
 }
 
 impl Tui {
-    pub fn new(startup: StartupInfo) -> io::Result<Self> {
+    pub fn new(startup: StartupInfo, model_config: ModelConfig) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let colors = std::env::var_os("NO_COLOR").is_none()
             && std::env::var("TERM").map_or(true, |term| term != "dumb");
@@ -602,11 +613,39 @@ impl Tui {
             state: AppState::new(startup, colors),
             suspended: false,
             dirty: true,
+            model_config,
         })
     }
 
     pub fn sender(&self) -> TuiSender {
         self.sender.clone()
+    }
+
+    pub fn model_config(&self) -> ModelConfig {
+        self.model_config.clone()
+    }
+
+    pub fn set_model_config(&mut self, model: ModelConfig) {
+        self.state.startup.model = model.model.clone();
+        self.state.startup.provider = match model.provider {
+            ProviderKind::Mock => "mock",
+            ProviderKind::OpenAi => "openai",
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::Gemini => "gemini",
+            ProviderKind::OpenCodeZen => "opencode-zen",
+            ProviderKind::OpenCodeGo => "opencode-go",
+        }
+        .to_owned();
+        self.model_config = model;
+        self.dirty = true;
+    }
+
+    pub fn active_session_id(&self) -> Option<String> {
+        self.state.active_session_id.clone()
+    }
+
+    pub fn set_active_session_id(&mut self, session_id: Option<String>) {
+        self.state.active_session_id = session_id;
     }
 
     pub fn start_run(&mut self, label: &str, cancellation: CancellationToken) -> bool {
@@ -790,6 +829,9 @@ impl Tui {
                             self.state.push_activity(format!("Task failed · {error}"));
                         }
                     }
+                }
+                UiMessage::SessionId(session_id) => {
+                    self.state.active_session_id = Some(session_id);
                 }
             }
             self.dirty = true;
@@ -1027,7 +1069,7 @@ fn status_line(state: &AppState, width: u16, colors: bool) -> Line<'static> {
 
     let fixed_width = status_fixed_width(&mode, &middle, runtime.as_deref());
     let model_width = available.saturating_sub(fixed_width);
-    let model = truncate_status(&compact(&state.startup.model, 240), model_width);
+    let model = truncate_status(&compact(&status_model(&state.startup), 240), model_width);
     let has_middle = !middle.is_empty();
     let total_width = fixed_width + model.chars().count();
     let extra = available.saturating_sub(total_width);
@@ -1082,6 +1124,14 @@ fn status_line(state: &AppState, width: u16, colors: bool) -> Line<'static> {
         spans.push(Span::styled(runtime, Style::default().fg(muted)));
     }
     Line::from(spans)
+}
+
+fn status_model(startup: &StartupInfo) -> String {
+    let model = startup
+        .model
+        .strip_prefix(&format!("{}/", startup.provider))
+        .unwrap_or(&startup.model);
+    format!("{}/{}", startup.provider, model)
 }
 
 fn status_fixed_width(mode: &str, middle: &[(String, Color)], runtime: Option<&str>) -> usize {
@@ -1434,7 +1484,7 @@ mod tests {
 
     fn status_fixture() -> AppState {
         let mut state = AppState::new(startup(), false);
-        state.startup.provider = "OpenAI".to_owned();
+        state.startup.provider = "anthropic".to_owned();
         state.startup.model = "anthropic/claude-sonnet-4.5-super-long-model-name".to_owned();
         state.execution_mode = "normal".to_owned();
         state.branch = Some("main".to_owned());

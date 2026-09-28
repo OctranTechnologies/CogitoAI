@@ -12,15 +12,17 @@ use harness_core::{
 };
 use harness_git::{CheckpointStore, GitClient, GitDiff, ShadowCheckpointStore};
 use harness_models::{
-    provider_from_config_with_store, validate_provider_credential, ContentBlock, CredentialSecret,
-    CredentialSource, CredentialStatus, CredentialStore, FinishReason, Message, ModelConfig,
-    ModelProvider, ModelRegistry, ModelRegistryFilter, ModelRequest, ModelResponse,
-    ModelStreamEvent, ProviderError, ProviderKind, ScriptedMockProvider, SystemCredentialStore,
-    ToolCall, Usage,
+    has_model_environment_override, load_project_model_preference, load_user_model_preference,
+    provider_from_config_with_store, save_project_model_preference, save_user_model_preference,
+    validate_provider_credential, ContentBlock, CredentialSecret, CredentialSource,
+    CredentialStatus, CredentialStore, FinishReason, Message, ModelConfig, ModelPreference,
+    ModelPreferenceError, ModelProvider, ModelRegistry, ModelRegistryFilter, ModelRequest,
+    ModelResponse, ModelStreamEvent, ProviderError, ProviderKind, ReasoningEffort,
+    ScriptedMockProvider, SystemCredentialStore, ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{
-    EventBus, EventId, EventPayload, EventSubscription, HarnessEvent, JsonlSessionStore,
+    EventBus, EventId, EventPayload, EventSubscription, HarnessEvent, JsonlSessionStore, Session,
     SessionStore,
 };
 use harness_tools::{CancellationToken, LocalProcessRunner, ToolRegistry};
@@ -41,8 +43,8 @@ enum InteractiveCommand {
     Diff,
     Undo,
     Config,
-    Model,
     Models,
+    ModelSelect,
     Connect,
     Mode,
     Clear,
@@ -125,15 +127,15 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandDefinition] = &[
     },
     InteractiveCommandDefinition {
         name: "/model",
-        usage: "/model",
-        description: "Show the configured model and capabilities",
-        command: InteractiveCommand::Model,
+        usage: "/model [provider/model] [--effort level]",
+        description: "Show or select a registry model",
+        command: InteractiveCommand::ModelSelect,
         plain_supported: true,
     },
     InteractiveCommandDefinition {
         name: "/models",
         usage: "/models [refresh [provider-id]]",
-        description: "List cached models or refresh provider catalogs",
+        description: "List dynamic model catalog or refresh provider catalogs",
         command: InteractiveCommand::Models,
         plain_supported: true,
     },
@@ -216,6 +218,8 @@ struct Cli {
     model_provider: Option<String>,
     #[arg(long)]
     model: Option<String>,
+    #[arg(long)]
+    model_effort: Option<String>,
     #[arg(long, default_value = ".cogito/sessions")]
     session_root: PathBuf,
     #[arg(long)]
@@ -281,6 +285,19 @@ enum Command {
         stream: bool,
     },
     ModelInfo,
+    Model {
+        selection: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long)]
+        project: bool,
+    },
+    Models {
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        provider: Option<String>,
+    },
     Agent {
         task: String,
         #[arg(default_value = ".")]
@@ -373,6 +390,21 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Inspect { path }) => inspect(cli, &effective_path(cli, path)),
         Some(Command::Ask { prompt, stream }) => ask(cli, prompt, *stream),
         Some(Command::ModelInfo) => model_info(cli),
+        Some(Command::Model {
+            selection,
+            effort,
+            project,
+        }) => model_command(cli, selection.as_deref(), effort.as_deref(), *project),
+        Some(Command::Models { refresh, provider }) => {
+            let arguments = if *refresh {
+                format!("refresh {}", provider.as_deref().unwrap_or("all"))
+            } else if let Some(provider) = provider {
+                format!("refresh {provider}")
+            } else {
+                String::new()
+            };
+            models_command(cli, &arguments)
+        }
         Some(Command::Agent { task, path }) => {
             run_agent(cli, task.clone(), effective_path(cli, path), None)
         }
@@ -433,8 +465,8 @@ fn interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
     let startup = StartupInfo {
-        model: model.model,
-        provider: format!("{:?}", model.provider),
+        model: model.model.clone(),
+        provider: provider_id(model.provider).to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         workspace: display_workspace_path(&workspace_path),
         notice: (!notices.is_empty()).then(|| notices.join("  |  ")),
@@ -446,7 +478,7 @@ fn interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             .map(|state| matches!(state, WorkingTreeState::Dirty)),
     };
     let cli = cli.clone();
-    let mut tui = Tui::new(startup)?;
+    let mut tui = Tui::new(startup, model)?;
     tui.run(move |line, tui| dispatch_interactive(&cli, line, tui))?;
     Ok(())
 }
@@ -492,8 +524,9 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
 
 /// A line-oriented fallback for terminals that report `TERM=dumb`.
 fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace = std::fs::canonicalize(effective_path(cli, Path::new(".")))?;
-    let model = model_config(cli)?;
+    let mut session_cli = cli.clone();
+    let workspace = std::fs::canonicalize(effective_path(&session_cli, Path::new(".")))?;
+    let model = model_config(&session_cli)?;
     println!(
         "[<>] COGITOAI harness v{} (plain terminal mode)\nModel: {}  |  Provider: {:?}\nWorkspace: {}",
         env!("CARGO_PKG_VERSION"),
@@ -534,9 +567,9 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("usage: /run <task>");
                     } else {
                         run_agent(
-                            cli,
+                            &session_cli,
                             arguments.to_owned(),
-                            effective_path(cli, Path::new(".")),
+                            effective_path(&session_cli, Path::new(".")),
                             None,
                         )?;
                         break;
@@ -553,17 +586,17 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                             .map(str::to_owned);
-                        resume_session(cli, id, task, None)?;
+                        resume_session(&session_cli, id, task, None)?;
                         break;
                     }
                 }
                 InteractiveCommand::Inspect => {
                     let path = if arguments.is_empty() {
-                        effective_path(cli, Path::new("."))
+                        effective_path(&session_cli, Path::new("."))
                     } else {
                         PathBuf::from(arguments.trim_matches('"'))
                     };
-                    inspect(cli, &path)?;
+                    inspect(&session_cli, &path)?;
                 }
                 InteractiveCommand::Sessions => {
                     let limit = if arguments.is_empty() {
@@ -571,30 +604,43 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         arguments.parse::<usize>()?
                     };
-                    sessions(cli, limit)?;
+                    sessions(&session_cli, limit)?;
                 }
-                InteractiveCommand::Status => {
-                    status(cli, (!arguments.is_empty()).then_some(arguments), None)?
-                }
+                InteractiveCommand::Status => status(
+                    &session_cli,
+                    (!arguments.is_empty()).then_some(arguments),
+                    None,
+                )?,
                 InteractiveCommand::Diff => {
                     let file =
                         (!arguments.is_empty()).then(|| PathBuf::from(arguments.trim_matches('"')));
-                    diff(cli, file.as_deref(), None)?;
+                    diff(&session_cli, file.as_deref(), None)?;
                 }
-                InteractiveCommand::Undo => {
-                    undo(cli, (!arguments.is_empty()).then_some(arguments), None)?
+                InteractiveCommand::Undo => undo(
+                    &session_cli,
+                    (!arguments.is_empty()).then_some(arguments),
+                    None,
+                )?,
+                InteractiveCommand::Config => config_command(&session_cli, None)?,
+                InteractiveCommand::ModelSelect => {
+                    if arguments.is_empty() {
+                        model_info(&session_cli)?;
+                    } else {
+                        let selected = select_interactive_model(&session_cli, arguments, None)?;
+                        configure_cli_model(&mut session_cli, &selected);
+                        println!("selected {}", canonical_model_id(&selected));
+                    }
                 }
-                InteractiveCommand::Config => config_command(cli, None)?,
-                InteractiveCommand::Model => model_info(cli)?,
-                InteractiveCommand::Models => models_command(cli, arguments)?,
-                InteractiveCommand::Connect => {
-                    connect_provider_cli(cli, (!arguments.is_empty()).then_some(arguments))?
-                }
+                InteractiveCommand::Models => models_command(&session_cli, arguments)?,
+                InteractiveCommand::Connect => connect_provider_cli(
+                    &session_cli,
+                    (!arguments.is_empty()).then_some(arguments),
+                )?,
                 InteractiveCommand::Mode => {
                     if !arguments.is_empty() {
                         eprintln!("usage: /mode (shows the workspace-configured mode)");
                     } else {
-                        mode_info(cli)?;
+                        mode_info(&session_cli)?;
                     }
                 }
                 InteractiveCommand::Clear | InteractiveCommand::Cancel => {
@@ -610,9 +656,9 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         run_agent(
-            cli,
+            &session_cli,
             line.to_owned(),
-            effective_path(cli, Path::new(".")),
+            effective_path(&session_cli, Path::new(".")),
             None,
         )?;
         // The line-oriented fallback has no persistent event loop for signal
@@ -661,6 +707,12 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
             let store =
                 JsonlSessionStore::new(&cli.session_root).map_err(|error| error.to_string())?;
             let existing = store.load(&session_id).map_err(|error| error.to_string())?;
+            if cli.model_provider.is_none() && cli.model.is_none() && cli.model_effort.is_none() {
+                let mut selected = tui.model_config();
+                apply_session_model_preference(cli, &existing, &mut selected)
+                    .map_err(|error| error.to_string())?;
+                tui.set_model_config(selected);
+            }
             let task = fields
                 .next()
                 .map(str::trim)
@@ -669,6 +721,7 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
                     "Continue from the compacted session state and finish the remaining work.",
                 )
                 .to_owned();
+            tui.set_active_session_id(Some(session_id.to_string()));
             start_interactive_run(cli, task, existing.workspace_root, Some(session_id), tui)
         }
         InteractiveCommand::Clear => {
@@ -712,7 +765,20 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
             undo(cli, (!arguments.is_empty()).then_some(arguments), None)
         }),
         InteractiveCommand::Config => run_visible_command(tui, || config_command(cli, None)),
-        InteractiveCommand::Model => run_visible_command(tui, || model_info(cli)),
+        InteractiveCommand::ModelSelect => {
+            if arguments.is_empty() {
+                run_visible_command(tui, || model_info(cli))
+            } else {
+                let selected = select_interactive_model(cli, arguments, Some(tui))
+                    .map_err(|error| error.to_string())?;
+                tui.set_model_config(selected.clone());
+                tui.add_activity(format!(
+                    "Model selected · {}",
+                    canonical_model_id(&selected)
+                ));
+                Ok(())
+            }
+        }
         InteractiveCommand::Models => run_visible_command(tui, || models_command(cli, arguments)),
         InteractiveCommand::Connect => run_visible_command(tui, || {
             connect_provider_cli(cli, (!arguments.is_empty()).then_some(arguments))
@@ -746,13 +812,16 @@ fn start_interactive_run(
     resume_session: Option<SessionId>,
     tui: &mut Tui,
 ) -> Result<(), String> {
+    tui.set_active_session_id(resume_session.as_ref().map(ToString::to_string));
+    let selected_model = tui.model_config();
+    let mut cli = cli.clone();
+    configure_cli_model(&mut cli, &selected_model);
     let cancellation = CancellationToken::new();
     if !tui.start_run(&task, cancellation.clone()) {
         return Err("a task is already running".to_owned());
     }
     let sender = tui.sender();
     let failed_sender = sender.clone();
-    let cli = cli.clone();
     let spawn = std::thread::Builder::new()
         .name("harness-agent-tui".to_owned())
         .spawn(move || {
@@ -785,6 +854,20 @@ fn inspect(cli: &Cli, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 fn model_config(cli: &Cli) -> Result<ModelConfig, ProviderError> {
     let mut config = ModelConfig::from_env();
+    if !has_model_environment_override() {
+        let preference_error = |error: ModelPreferenceError| ProviderError::Configuration {
+            reason: error.to_string(),
+        };
+        if let Some(preference) = load_user_model_preference().map_err(preference_error)? {
+            preference.apply_to(&mut config).map_err(preference_error)?;
+        }
+        let workspace = effective_path(cli, Path::new("."));
+        if let Some(preference) =
+            load_project_model_preference(&workspace).map_err(preference_error)?
+        {
+            preference.apply_to(&mut config).map_err(preference_error)?;
+        }
+    }
     if let Some(provider) = &cli.model_provider {
         let provider =
             serde_json::from_value(Value::String(provider.clone())).map_err(|error| {
@@ -796,7 +879,209 @@ fn model_config(cli: &Cli) -> Result<ModelConfig, ProviderError> {
         config.select_provider(provider);
     }
     if let Some(model) = &cli.model {
-        config.model = model.clone();
+        if let Ok(preference) = ModelPreference::from_canonical_id(model, config.reasoning_effort) {
+            preference
+                .apply_to(&mut config)
+                .map_err(|error| ProviderError::Configuration {
+                    reason: error.to_string(),
+                })?;
+        } else {
+            config.model = model.clone();
+        }
+    }
+    if let Some(effort) = &cli.model_effort {
+        config.reasoning_effort = parse_reasoning_effort(effort)
+            .map_err(|reason| ProviderError::Configuration { reason })?;
+    }
+    Ok(config)
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<Option<ReasoningEffort>, String> {
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    serde_json::from_value(Value::String(value.to_ascii_lowercase()))
+        .map(Some)
+        .map_err(|_| format!("unsupported reasoning effort '{value}'"))
+}
+
+fn canonical_model_id(config: &ModelConfig) -> String {
+    let provider = match config.provider {
+        ProviderKind::Mock => "mock",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCodeZen => "opencode-zen",
+        ProviderKind::OpenCodeGo => "opencode-go",
+    };
+    let model = config
+        .model
+        .strip_prefix(&format!("{provider}/"))
+        .unwrap_or(&config.model);
+    format!("{provider}/{model}")
+}
+
+fn configure_cli_model(cli: &mut Cli, model: &ModelConfig) {
+    cli.model_provider = Some(provider_id(model.provider).to_owned());
+    cli.model = Some(model.model.clone());
+    cli.model_effort = model.reasoning_effort.and_then(|effort| {
+        serde_json::to_value(effort)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+    });
+}
+
+fn model_command(
+    cli: &Cli,
+    selection: Option<&str>,
+    effort: Option<&str>,
+    project: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = model_config(cli)?;
+    if selection.is_none() && effort.is_none() {
+        return model_info(cli);
+    }
+    if let Some(selection) = selection {
+        let preference = ModelPreference::from_canonical_id(selection, config.reasoning_effort)?;
+        preference.apply_to(&mut config)?;
+    }
+    if let Some(effort) = effort {
+        let effort_value = parse_reasoning_effort(effort)?;
+        if let Some(effort) = effort_value {
+            ensure_model_reasoning_level(cli, &config, effort)?;
+        } else {
+            ensure_model_reasoning_supported(cli, &config)?;
+        }
+        config.reasoning_effort = effort_value;
+    }
+    let preference =
+        ModelPreference::from_canonical_id(&canonical_model_id(&config), config.reasoning_effort)?;
+    if project {
+        save_project_model_preference(&effective_path(cli, Path::new(".")), &preference)?;
+    } else {
+        save_user_model_preference(&preference)?;
+    }
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&preference)?);
+    } else {
+        println!("selected {}", preference.canonical_id());
+    }
+    Ok(())
+}
+
+fn ensure_model_reasoning_supported(
+    cli: &Cli,
+    config: &ModelConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = model_registry(cli, config);
+    let selected = registry
+        .models(&ModelRegistryFilter {
+            provider_id: Some(provider_id(config.provider).to_owned()),
+            requirements: Vec::new(),
+        })
+        .into_iter()
+        .find(|descriptor| descriptor.canonical_id() == canonical_model_id(config));
+    if !selected
+        .and_then(|descriptor| descriptor.metadata.reasoning_levels)
+        .is_some_and(|levels| !levels.is_empty())
+    {
+        return Err("this model does not advertise configurable reasoning levels".into());
+    }
+    Ok(())
+}
+
+fn ensure_model_reasoning_level(
+    cli: &Cli,
+    config: &ModelConfig,
+    effort: ReasoningEffort,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = model_registry(cli, config);
+    let selected = registry
+        .models(&ModelRegistryFilter {
+            provider_id: Some(provider_id(config.provider).to_owned()),
+            requirements: Vec::new(),
+        })
+        .into_iter()
+        .find(|descriptor| descriptor.canonical_id() == canonical_model_id(config));
+    if !selected
+        .and_then(|descriptor| descriptor.metadata.reasoning_levels)
+        .is_some_and(|levels| levels.contains(&effort))
+    {
+        return Err(
+            "reasoning effort is not advertised for this model; use /models refresh first".into(),
+        );
+    }
+    Ok(())
+}
+
+fn model_registry(cli: &Cli, config: &ModelConfig) -> ModelRegistry {
+    let workspace = effective_path(cli, Path::new("."));
+    let credential_store = SystemCredentialStore::new();
+    ModelRegistry::with_builtins_and_credentials(
+        config,
+        Some(workspace.join(".cogito/model-catalog.json")),
+        &credential_store,
+    )
+}
+
+fn select_interactive_model(
+    cli: &Cli,
+    arguments: &str,
+    tui: Option<&mut Tui>,
+) -> Result<ModelConfig, Box<dyn std::error::Error>> {
+    let mut fields = arguments.split_whitespace();
+    let selection = fields.next().unwrap_or_default();
+    let mut effort = None;
+    while let Some(field) = fields.next() {
+        match field {
+            "--effort" => {
+                effort = Some(
+                    fields
+                        .next()
+                        .ok_or("usage: /model provider/model [--effort level]")?,
+                );
+            }
+            other => return Err(format!("unexpected model option '{other}'").into()),
+        }
+    }
+    let mut config = match tui.as_ref() {
+        Some(tui) => tui.model_config(),
+        None => model_config(cli)?,
+    };
+    let preference = ModelPreference::from_canonical_id(selection, config.reasoning_effort)?;
+    preference.apply_to(&mut config)?;
+    if let Some(effort) = effort {
+        let parsed = parse_reasoning_effort(effort)?;
+        if let Some(value) = parsed {
+            ensure_model_reasoning_level(cli, &config, value)?;
+        } else {
+            ensure_model_reasoning_supported(cli, &config)?;
+        }
+        config.reasoning_effort = parsed;
+    }
+    let preference =
+        ModelPreference::from_canonical_id(&canonical_model_id(&config), config.reasoning_effort)?;
+    save_user_model_preference(&preference)?;
+    if let Some(session_id) = tui.as_ref().and_then(|tui| tui.active_session_id()) {
+        let store = JsonlSessionStore::new(&cli.session_root)?;
+        let id = SessionId::new(session_id)?;
+        store.append_event(
+            &id,
+            HarnessEvent::new(
+                id.clone(),
+                EventPayload::ModelChanged {
+                    provider: provider_id(config.provider).to_owned(),
+                    model: config.model.clone(),
+                    reasoning_effort: config.reasoning_effort.and_then(|effort| {
+                        serde_json::to_value(effort)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                    }),
+                },
+                None,
+                None,
+            ),
+        )?;
     }
     Ok(config)
 }
@@ -991,11 +1276,59 @@ fn resume_session(
     let session_id = SessionId::new(id.to_owned())?;
     let store = JsonlSessionStore::new(&cli.session_root)?;
     let existing = store.load(&session_id)?;
+    let mut effective_cli = cli.clone();
+    if effective_cli.model_provider.is_none()
+        && effective_cli.model.is_none()
+        && effective_cli.model_effort.is_none()
+    {
+        let mut selected = model_config(cli)?;
+        apply_session_model_preference(cli, &existing, &mut selected)?;
+        effective_cli.model_provider = Some(provider_id(selected.provider).to_owned());
+        effective_cli.model = Some(selected.model);
+        effective_cli.model_effort = selected.reasoning_effort.and_then(|effort| {
+            serde_json::to_value(effort)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+        });
+    }
     let path = path.unwrap_or_else(|| existing.workspace_root.clone());
     let task = task.unwrap_or_else(|| {
         "Continue from the compacted session state and finish the remaining work.".to_owned()
     });
-    run_agent(cli, task, path, Some(session_id))
+    run_agent(&effective_cli, task, path, Some(session_id))
+}
+
+fn apply_session_model_preference(
+    cli: &Cli,
+    session: &Session,
+    model: &mut ModelConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if has_model_environment_override()
+        || cli.model_provider.is_some()
+        || cli.model.is_some()
+        || cli.model_effort.is_some()
+    {
+        return Ok(());
+    }
+    let preference = session.events.iter().rev().find_map(|event| {
+        if let EventPayload::ModelChanged {
+            provider,
+            model,
+            reasoning_effort,
+        } = &event.payload
+        {
+            let effort = reasoning_effort
+                .as_ref()
+                .and_then(|value| serde_json::from_value(Value::String(value.clone())).ok());
+            ModelPreference::from_canonical_id(&format!("{provider}/{model}"), effort).ok()
+        } else {
+            None
+        }
+    });
+    if let Some(preference) = preference {
+        preference.apply_to(model)?;
+    }
+    Ok(())
 }
 
 fn status(
@@ -1245,6 +1578,7 @@ fn run_agent_with_ui(
         let handler_token = cancellation.clone();
         ctrlc::set_handler(move || handler_token.cancel())?;
     }
+    let reasoning_config = model_config.reasoning_config();
     let runner = AgentRunner::new(
         provider,
         model_config.model,
@@ -1259,6 +1593,7 @@ fn run_agent_with_ui(
         }),
     )
     .with_event_bus(event_bus)
+    .with_reasoning_config(reasoning_config)
     .with_compaction_config(CompactionConfig {
         threshold_tokens: cli
             .compaction_threshold
@@ -1624,6 +1959,7 @@ fn text_response(text: &str) -> ModelResponse {
 
 fn print_completion(cli: &Cli, outcome: &harness_agent::AgentOutcome, tui: Option<&TuiSender>) {
     if let Some(tui) = tui {
+        tui.active_session(&outcome.session_id.to_string());
         tui.activity(format!(
             "Session {} finished · turns={} · tools={} · tokens={}",
             outcome.session_id, outcome.turns, outcome.tool_calls, outcome.model_tokens
@@ -1976,6 +2312,26 @@ mod interactive_command_tests {
             parse_interactive_command("/models refresh opencode-go"),
             Some((InteractiveCommand::Models, "refresh opencode-go")),
         );
+        assert_eq!(
+            parse_interactive_command("/model opencode-go/vendor/model --effort high"),
+            Some((
+                InteractiveCommand::ModelSelect,
+                "opencode-go/vendor/model --effort high"
+            )),
+        );
+        let parsed = Cli::try_parse_from([
+            "harness",
+            "model",
+            "anthropic/claude-test",
+            "--effort",
+            "high",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Command::Model { .. })));
+        let parsed =
+            Cli::try_parse_from(["harness", "models", "--refresh", "--provider", "gemini"])
+                .unwrap();
+        assert!(matches!(parsed.command, Some(Command::Models { .. })));
         assert_eq!(parse_interactive_command("/not-a-command"), None);
         assert_eq!(parse_interactive_command("ordinary task"), None);
     }
@@ -2012,6 +2368,7 @@ mod interactive_command_tests {
             log_level: "info".to_owned(),
             model_provider: None,
             model: None,
+            model_effort: None,
             session_root: directory.path().join("sessions"),
             compaction_threshold: None,
             json: false,

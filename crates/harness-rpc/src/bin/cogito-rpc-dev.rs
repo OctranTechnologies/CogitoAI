@@ -104,6 +104,7 @@ impl AgentRunnerFactory for DevRunnerFactory {
                 Arc::new(RpcApprovalHandler::new(Arc::clone(&self.approvals))),
             )
             .with_event_bus(self.event_bus.clone())
+            .with_reasoning_config(model.reasoning_config())
             .with_checkpoints(Arc::clone(&self.checkpoints)),
         ))
     }
@@ -191,21 +192,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         checkpoints: Arc::clone(&checkpoints),
         credential_store: Arc::clone(&credential_store),
     });
-    let runtime = Arc::new(
-        Runtime::new(
-            Arc::new(UnavailableAgent),
-            Vec::new(),
-            ToolRegistry::with_workspace_tools(),
-            policy,
-            sessions,
-            checkpoints,
-            Vec::new(),
-        )
-        .with_agent_runner(Arc::new(runner))
-        .with_runner_factory(factory)
-        .with_credential_store(credential_store)
-        .with_workspace_root(workspace_root),
-    );
+    let runtime = Runtime::new(
+        Arc::new(UnavailableAgent),
+        Vec::new(),
+        ToolRegistry::with_workspace_tools(),
+        policy,
+        sessions,
+        checkpoints,
+        Vec::new(),
+    )
+    .with_agent_runner(Arc::new(runner))
+    .with_runner_factory(factory)
+    .with_credential_store(credential_store)
+    .with_workspace_root(workspace_root);
+    runtime.apply_saved_model_preferences()?;
+    let runtime = Arc::new(runtime);
     let address: SocketAddr = address_argument.parse()?;
     let server = RpcServer::bind_with_approvals(address, runtime, approvals)?;
     println!(

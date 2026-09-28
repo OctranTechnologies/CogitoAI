@@ -39,14 +39,22 @@ const SNAPSHOT: SettingsSnapshot = {
     base_url: "https://api.openai.com/v1",
     api_key_env: "OPENAI_API_KEY",
     capabilities: {
+      text_input: true,
+      image_input: false,
       streaming: true,
       tool_calling: true,
+      parallel_tool_calls: false,
       vision: true,
       reasoning: false,
+      configurable_reasoning_effort: false,
       context_window: 128000,
+      max_output_tokens: null,
+      structured_output: false,
     },
     credential: { available: true, source: "environment", env_var: "OPENAI_API_KEY" },
     available_models: ["gpt-4o", "gpt-4o-mini"],
+    reasoning_levels: [],
+    reasoning_effort: null,
     configured: true,
   },
   permissions: {
@@ -133,6 +141,8 @@ function resetStore() {
     isStartingTerminal: false,
     terminalExit: null,
     settings: null,
+    modelCatalog: null,
+    isLoadingModelCatalog: false,
     isLoadingSettings: false,
     settingsError: null,
     modelTest: null,
@@ -172,6 +182,7 @@ describe("settings", () => {
       if (method === "git.diff") return response({ unstaged: "", staged: "" });
       if (method === "checkpoint.list") return response([]);
       if (method === "settings.inspect") return response(SNAPSHOT);
+      if (method === "models.list") return response({ models: [], defaults: {} });
       if (method === "models.refresh") {
         return response({
           providers: [{ provider_id: "openai", model_count: 2, error: null }],

@@ -70,6 +70,8 @@ pub enum EventType {
     ModelRequested,
     #[serde(rename = "model.response")]
     ModelResponse,
+    #[serde(rename = "model.changed")]
+    ModelChanged,
     #[serde(rename = "tool.requested")]
     ToolRequested,
     #[serde(rename = "tool.approved")]
@@ -192,6 +194,13 @@ pub enum EventPayload {
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
     },
+    #[serde(rename = "model.changed")]
+    ModelChanged {
+        provider: String,
+        model: String,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
+    },
     #[serde(rename = "tool.requested")]
     ToolRequested {
         tool: String,
@@ -286,6 +295,7 @@ impl EventPayload {
             Self::AssistantMessage { .. } => EventType::AssistantMessage,
             Self::ModelRequested { .. } => EventType::ModelRequested,
             Self::ModelResponse { .. } => EventType::ModelResponse,
+            Self::ModelChanged { .. } => EventType::ModelChanged,
             Self::ToolRequested { .. } => EventType::ToolRequested,
             Self::ToolApproved { .. } => EventType::ToolApproved,
             Self::ToolDenied { .. } => EventType::ToolDenied,

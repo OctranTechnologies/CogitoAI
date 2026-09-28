@@ -19,6 +19,7 @@ export interface PopoverProps extends PropsWithChildren {
   placement?: "bottom-start" | "bottom-end" | "top-start" | "top-end";
   className?: string;
   panelClassName?: string;
+  render?: (close: () => void) => ReactNode;
 }
 
 /**
@@ -36,6 +37,7 @@ export function Popover({
   placement = "bottom-start",
   className,
   panelClassName,
+  render,
 }: PopoverProps) {
   const [open, setOpen] = useState(false);
   const { surfaceRef } = useDismissable<HTMLDivElement>(open, () => setOpen(false));
@@ -63,7 +65,7 @@ export function Popover({
           aria-label={label}
           className={cx(SURFACE, PLACEMENT[placement], panelClassName)}
         >
-          {typeof children === "function" ? (children as () => ReactNode)() : children}
+          {render ? render(() => setOpen(false)) : children}
         </div>
       ) : null}
     </div>

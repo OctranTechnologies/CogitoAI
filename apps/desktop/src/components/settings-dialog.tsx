@@ -38,11 +38,13 @@ export function SettingsDialog({
   open,
   onClose,
   initialScreen = "models",
+  connectProviderId,
 }: {
   open: boolean;
   onClose: () => void;
   /** Lets the navigation rail open the dialog on a chosen screen. */
   initialScreen?: SettingsScreen;
+  connectProviderId?: string | null;
 }) {
   const settings = useDesktopStore((state) => state.settings);
   const isLoading = useDesktopStore((state) => state.isLoadingSettings);
@@ -119,7 +121,7 @@ export function SettingsDialog({
             </div>
           ) : (
             <>
-              {screen === "models" ? <ModelsScreen /> : null}
+              {screen === "models" ? <ModelsScreen connectProviderId={connectProviderId} /> : null}
               {screen === "runtime" ? <RuntimeScreen /> : null}
               {screen === "permissions" ? <PermissionsScreen /> : null}
               {screen === "project" ? <ProjectScreen /> : null}
@@ -228,8 +230,10 @@ function LabelledInput({
   );
 }
 
-function ModelsScreen() {
+function ModelsScreen({ connectProviderId }: { connectProviderId?: string | null }) {
   const settings = useDesktopStore((state) => state.settings)!;
+  const catalog = useDesktopStore((state) => state.modelCatalog?.models);
+  const activeSessionId = useDesktopStore((state) => state.activeSessionId);
   const updateModel = useDesktopStore((state) => state.updateModel);
   const refreshModelCatalog = useDesktopStore((state) => state.refreshModelCatalog);
   const testModelConnection = useDesktopStore((state) => state.testModelConnection);
@@ -242,9 +246,12 @@ function ModelsScreen() {
   const [apiKeyEnv, setApiKeyEnv] = useState(settings.models.api_key_env);
   const [saved, setSaved] = useState(false);
   const [refreshingCatalog, setRefreshingCatalog] = useState(false);
-  const [editingCredentialProvider, setEditingCredentialProvider] = useState<string | null>(null);
+  const [editingCredentialProvider, setEditingCredentialProvider] = useState<string | null>(connectProviderId ?? null);
   const [credentialInput, setCredentialInput] = useState("");
   const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
+  const availableModels = (catalog ?? []).filter(
+    (descriptor) => descriptor.provider === settings.models.provider_id,
+  );
 
   // Re-seed the form when the runtime reports a different selection.
   useEffect(() => {
@@ -253,13 +260,28 @@ function ModelsScreen() {
     setApiKeyEnv(settings.models.api_key_env);
   }, [settings.models.model, settings.models.base_url, settings.models.api_key_env]);
 
+  useEffect(() => {
+    if (connectProviderId) {
+      setCredentialInput("");
+      setEditingCredentialProvider(connectProviderId);
+    }
+  }, [connectProviderId]);
+
   async function save() {
     const changed =
       model !== settings.models.model ||
       baseUrl !== settings.models.base_url ||
       apiKeyEnv !== settings.models.api_key_env;
     if (!changed) return;
-    const ok = await updateModel({ model, base_url: baseUrl, api_key_env: apiKeyEnv });
+    const modelChanged = model !== settings.models.model;
+    const ok = await updateModel({
+      model,
+      base_url: baseUrl,
+      api_key_env: apiKeyEnv,
+      preference_scope: modelChanged ? "user" : "none",
+      session_id: modelChanged ? activeSessionId ?? undefined : undefined,
+      record_session_event: modelChanged && Boolean(activeSessionId),
+    });
     setSaved(ok);
   }
 
@@ -408,27 +430,28 @@ function ModelsScreen() {
               </Button>
             </div>
             <div className="flex flex-wrap gap-1">
-              {settings.models.available_models.map((name) => (
+              {availableModels.map((descriptor) => (
                 <button
-                  key={name}
+                  key={descriptor.id}
+                  title={`${descriptor.display_name} · ${descriptor.id}`}
                   onClick={() => {
-                    setModel(name);
+                    setModel(descriptor.id);
                     setSaved(false);
                   }}
                   className={cx(
                     "rounded-sm px-1.5 py-0.5 font-mono text-2xs",
                     "transition-colors duration-fast",
-                    name === model
+                    descriptor.id === model
                       ? "bg-accent/15 text-accent"
                       : "bg-elevated text-muted hover:text-primary",
                   )}
                 >
-                  {name}
+                  {descriptor.display_name}
                 </button>
               ))}
             </div>
           </div>
-          {settings.models.available_models.length === 0 ? (
+          {availableModels.length === 0 ? (
             <p className="ml-[10.75rem] text-2xs text-faint">
               No catalog entries yet. Refresh to discover models; custom model IDs remain accepted.
             </p>

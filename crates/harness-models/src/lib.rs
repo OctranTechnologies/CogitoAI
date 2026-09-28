@@ -4,6 +4,7 @@ mod gemini;
 mod mock;
 mod openai;
 mod opencode;
+mod preferences;
 mod protocol;
 mod registry;
 mod transport;
@@ -23,6 +24,12 @@ pub use gemini::{GeminiNativeTransport, GeminiProvider};
 pub use mock::{DeterministicMockProvider, MockProvider, MockScenario, ScriptedMockProvider};
 pub use openai::{OpenAIProvider, OpenAIResponsesTransport, OpenAiProvider};
 pub use opencode::{OpenCodeProduct, OpenCodeProvider};
+pub use preferences::{
+    has_model_environment_override, load_project_model_preference, load_user_model_preference,
+    load_user_model_preference_from, save_project_model_preference, save_user_model_preference,
+    save_user_model_preference_to, user_model_preferences_path, ModelPreference,
+    ModelPreferenceError,
+};
 pub use registry::{
     CapabilityKnowledge, CapabilityRequirement, CatalogRefreshReport, CatalogRefreshResult,
     ModelCapability, ModelCapabilityKnowledgeMap, ModelMetadata, ModelMetadataSource, ModelPricing,
@@ -553,6 +560,8 @@ pub struct ModelConfig {
     pub api_key_env: String,
     pub base_url: String,
     pub context_window: Option<u32>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Default for ModelConfig {
@@ -572,6 +581,7 @@ impl ModelConfig {
                 api_key_env: "OPENAI_API_KEY".to_owned(),
                 base_url: "https://api.openai.com/v1".to_owned(),
                 context_window: Some(8_192),
+                reasoning_effort: None,
             },
             ProviderKind::OpenAi => Self {
                 provider,
@@ -579,6 +589,7 @@ impl ModelConfig {
                 api_key_env: "OPENAI_API_KEY".to_owned(),
                 base_url: "https://api.openai.com/v1".to_owned(),
                 context_window: None,
+                reasoning_effort: None,
             },
             ProviderKind::Anthropic => Self {
                 provider,
@@ -586,6 +597,7 @@ impl ModelConfig {
                 api_key_env: "ANTHROPIC_API_KEY".to_owned(),
                 base_url: "https://api.anthropic.com/v1".to_owned(),
                 context_window: None,
+                reasoning_effort: None,
             },
             ProviderKind::Gemini => Self {
                 provider,
@@ -593,6 +605,7 @@ impl ModelConfig {
                 api_key_env: "GEMINI_API_KEY".to_owned(),
                 base_url: "https://generativelanguage.googleapis.com/v1beta".to_owned(),
                 context_window: None,
+                reasoning_effort: None,
             },
             ProviderKind::OpenCodeZen => Self {
                 provider,
@@ -600,6 +613,7 @@ impl ModelConfig {
                 api_key_env: "OPENCODE_API_KEY".to_owned(),
                 base_url: "https://opencode.ai/zen/v1".to_owned(),
                 context_window: None,
+                reasoning_effort: None,
             },
             ProviderKind::OpenCodeGo => Self {
                 provider,
@@ -607,6 +621,7 @@ impl ModelConfig {
                 api_key_env: "OPENCODE_API_KEY".to_owned(),
                 base_url: "https://opencode.ai/zen/go/v1".to_owned(),
                 context_window: None,
+                reasoning_effort: None,
             },
         }
     }
@@ -620,6 +635,7 @@ impl ModelConfig {
         }
         let previous = Self::for_provider(self.provider);
         let next = Self::for_provider(provider);
+        self.reasoning_effort = None;
         if self.model == previous.model {
             self.model.clone_from(&next.model);
         }
@@ -633,6 +649,14 @@ impl ModelConfig {
             self.context_window = next.context_window;
         }
         self.provider = provider;
+    }
+
+    pub fn reasoning_config(&self) -> Option<ReasoningConfig> {
+        self.reasoning_effort.map(|effort| ReasoningConfig {
+            effort: Some(effort),
+            budget_tokens: None,
+            include_summary: false,
+        })
     }
 
     /// Rejects settings that would leave the runtime unable to reach a model.
@@ -693,6 +717,9 @@ impl ModelConfig {
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or(defaults.base_url),
             context_window: Some(defaults.context_window.unwrap_or(8_192)),
+            reasoning_effort: std::env::var("COGITO_MODEL_REASONING_EFFORT")
+                .ok()
+                .and_then(|value| serde_json::from_value(serde_json::Value::String(value)).ok()),
         }
     }
 }
@@ -820,6 +847,7 @@ impl fmt::Debug for ModelConfig {
             .field("api_key_env", &self.api_key_env)
             .field("base_url", &self.base_url)
             .field("context_window", &self.context_window)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish()
     }
 }

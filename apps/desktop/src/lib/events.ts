@@ -62,6 +62,7 @@ export type RunPhase =
 const TIMELINE_EVENTS = new Set([
   "user.message",
   "assistant.message",
+  "model.changed",
   "tool.requested",
   "tool.approved",
   "tool.denied",
@@ -208,6 +209,9 @@ export function deriveTimeline(events: HarnessEvent[]): TimelineEntry[] {
       const warning = event.event_type === "tool.approved" || event.event_type === "verification.started";
       const detail =
         text(event) ||
+        (event.event_type === "model.changed"
+          ? `${stringField(event, "provider")}/${stringField(event, "model")}`
+          : "") ||
         stringField(event, "tool") ||
         stringField(event, "command") ||
         stringField(event, "path") ||
@@ -216,7 +220,7 @@ export function deriveTimeline(events: HarnessEvent[]): TimelineEntry[] {
       return {
         id: event.event_id,
         eventType: event.event_type,
-        label: event.event_type,
+        label: event.event_type === "model.changed" ? "Model changed" : event.event_type,
         detail,
         timestamp: event.timestamp,
         tone: failed ? ("danger" as const) : completed ? ("success" as const) : warning ? ("warning" as const) : ("neutral" as const),

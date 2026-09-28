@@ -20,7 +20,7 @@ use harness_rpc::{
     ApprovalBroker, RpcApprovalHandler, RpcClient, RpcServer, Runtime, ServerMessage,
 };
 use harness_session::{EventBus, JsonlSessionStore, SessionStore};
-use harness_tools::ToolRegistry;
+use harness_tools::{CancellationToken, ToolRegistry};
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
@@ -128,7 +128,13 @@ impl harness_rpc::AgentRunnerFactory for TestRunnerFactory {
             harness_agent::AgentRunner::new(
                 Arc::new(harness_models::ScriptedMockProvider::new(
                     model.model.clone(),
-                    Vec::new(),
+                    vec![
+                        response(
+                            Some(("read_file", json!({"path": "registry-tool.txt"}))),
+                            "",
+                        ),
+                        response(None, "The selected model completed the tool round trip."),
+                    ],
                 )),
                 model.model.clone(),
                 harness_tools::ToolRegistry::with_workspace_tools(),
@@ -138,6 +144,7 @@ impl harness_rpc::AgentRunnerFactory for TestRunnerFactory {
                 harness_agent::AgentLimits::default(),
                 Arc::new(RpcApprovalHandler::new(Arc::clone(&self.approvals))),
             )
+            .with_reasoning_config(model.reasoning_config())
             .with_checkpoints(Arc::clone(&self.checkpoints)),
         ))
     }
@@ -680,7 +687,7 @@ fn exposes_typed_settings_and_never_returns_a_credential() {
     let approvals = Arc::new(ApprovalBroker::new());
     let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
     let (runtime, _sessions) = setup_settings(root, provider, Arc::clone(&approvals), None);
-    let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
+    let (mut client, _address, shutdown, server) = start_server(Arc::clone(&runtime), approvals);
 
     assert_ok(&client.request("rpc.initialize", json!({})).unwrap());
     let initialized = client.request("rpc.initialize", json!({})).unwrap();
@@ -738,14 +745,80 @@ fn exposes_typed_settings_and_never_returns_a_credential() {
     );
 
     // A model change is applied and reflected back.
+    let created = client.request("session.create", json!({})).unwrap();
+    assert_ok(&created);
+    let session_id = created.result.unwrap()["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let switched = client
         .request(
             "settings.update_model",
-            json!({"provider": "mock", "model": "mock-alt"}),
+            json!({
+                "provider": "mock",
+                "model": "mock-alt",
+                "preference_scope": "session",
+                "session_id": session_id,
+                "record_session_event": true
+            }),
         )
         .unwrap();
     assert_ok(&switched);
     assert_eq!(switched.result.unwrap()["models"]["model"], "mock-alt");
+    let session = client
+        .request("session.inspect", json!({ "session_id": session_id }))
+        .unwrap();
+    assert_ok(&session);
+    let events = session.result.unwrap()["session"]["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(events.iter().any(|event| {
+        event["event_type"] == "model.changed"
+            && event["payload"]["data"]["provider"] == "mock"
+            && event["payload"]["data"]["model"] == "mock-alt"
+    }));
+
+    // A selected model from every user-facing provider is applied through the
+    // same runtime settings path; the test runner remains deterministic.
+    for (provider, model) in [
+        ("openai", "gpt-test"),
+        ("anthropic", "claude-test"),
+        ("gemini", "gemini-test"),
+        ("opencode-zen", "zen/test-model"),
+        ("opencode-go", "go/test-model"),
+    ] {
+        let selection = client
+            .request(
+                "settings.update_model",
+                json!({ "provider": provider, "model": model }),
+            )
+            .unwrap();
+        assert_ok(&selection);
+        let snapshot = selection.result.unwrap();
+        assert_eq!(snapshot["models"]["provider_id"], provider);
+        assert_eq!(snapshot["models"]["model"], model);
+    }
+    std::fs::write(
+        root.join("registry-tool.txt"),
+        "tool use remains available after changing models",
+    )
+    .unwrap();
+    let outcome = runtime
+        .run_agent(&task(root, None), &CancellationToken::new())
+        .unwrap();
+    assert_eq!(outcome.tool_calls, 1);
+    assert_eq!(
+        outcome.final_message,
+        "The selected model completed the tool round trip."
+    );
+
+    let resumed = client
+        .request("session.resume", json!({ "session_id": session_id }))
+        .unwrap();
+    assert_ok(&resumed);
+    let restored = client.request("settings.inspect", json!({})).unwrap();
+    assert_eq!(restored.result.unwrap()["models"]["model"], "mock-alt");
 
     // Invalid settings are rejected and leave the model untouched.
     for (payload, label) in [

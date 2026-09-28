@@ -455,7 +455,12 @@ pub fn reconstruct_state(
     };
     let mut terminal = false;
     for event in events {
-        if terminal && !matches!(event.payload, EventPayload::SessionResumed { .. }) {
+        if terminal
+            && !matches!(
+                event.payload,
+                EventPayload::SessionResumed { .. } | EventPayload::ModelChanged { .. }
+            )
+        {
             return Err(Error::InvalidEvent {
                 reason: "events cannot follow a terminal session event".to_owned(),
             });
@@ -524,7 +529,9 @@ pub fn reconstruct_state(
                 state.status = SessionStatus::Failed;
                 terminal = true;
             }
-            EventPayload::ModelRequested { .. } | EventPayload::ModelResponse { .. } => {}
+            EventPayload::ModelRequested { .. }
+            | EventPayload::ModelResponse { .. }
+            | EventPayload::ModelChanged { .. } => {}
             EventPayload::ProcessStarted { .. }
             | EventPayload::ProcessStdout { .. }
             | EventPayload::ProcessStderr { .. }

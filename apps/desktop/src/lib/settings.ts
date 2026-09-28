@@ -20,11 +20,48 @@ export interface ProviderCredentialStatus {
 }
 
 export interface ModelCapabilities {
+  text_input: boolean;
+  image_input: boolean;
   streaming: boolean;
   tool_calling: boolean;
+  parallel_tool_calls: boolean;
   vision: boolean;
   reasoning: boolean;
+  configurable_reasoning_effort: boolean;
   context_window: number | null;
+  max_output_tokens: number | null;
+  structured_output: boolean;
+}
+
+export type CapabilityKnowledge = "unknown" | "supported" | "unsupported";
+
+export interface ModelDescriptor {
+  provider: string;
+  id: string;
+  display_name: string;
+  capabilities: ModelCapabilities;
+  metadata: {
+    source: "unknown" | "discovered" | "cached" | "manually_configured";
+    stale: boolean;
+    refreshed_at_unix: number | null;
+    reasoning_levels: string[] | null;
+    capabilities: {
+      text_input: CapabilityKnowledge;
+      vision: CapabilityKnowledge;
+      streaming: CapabilityKnowledge;
+      tool_calling: CapabilityKnowledge;
+      parallel_tool_calls: CapabilityKnowledge;
+      reasoning: CapabilityKnowledge;
+      configurable_reasoning_effort: CapabilityKnowledge;
+      structured_output: CapabilityKnowledge;
+    };
+    pricing: { input_usd_per_million_tokens: string | null; output_usd_per_million_tokens: string | null } | null;
+  };
+}
+
+export interface ModelCatalog {
+  models: ModelDescriptor[];
+  defaults: Record<string, string>;
 }
 
 export interface ModelSettings {
@@ -36,6 +73,8 @@ export interface ModelSettings {
   capabilities: ModelCapabilities;
   credential: CredentialStatus;
   available_models: string[];
+  reasoning_levels: string[];
+  reasoning_effort: string | null;
   configured: boolean;
 }
 
@@ -114,6 +153,10 @@ export interface UpdateModelRequest {
   model?: string;
   base_url?: string;
   api_key_env?: string;
+  reasoning_effort?: string;
+  preference_scope?: "none" | "user" | "project" | "session";
+  session_id?: string;
+  record_session_event?: boolean;
 }
 
 export interface UpdatePermissionsRequest {

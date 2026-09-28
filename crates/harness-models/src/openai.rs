@@ -1063,6 +1063,7 @@ mod tests {
         let provider = OpenAIProvider::from_config(&ModelConfig {
             provider: crate::ProviderKind::OpenAi,
             model: "custom-deployment".to_owned(),
+            reasoning_effort: None,
             ..ModelConfig::default()
         })
         .unwrap();

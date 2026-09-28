@@ -350,11 +350,38 @@ and unknown; facts absent from provider metadata remain unknown. No pricing is
 shown unless a provider supplies trustworthy pricing metadata. Configured model
 IDs remain valid when missing from or stale in the catalog.
 
-In the interactive CLI, `/models` lists cached and manually configured models,
-`/models refresh` refreshes every provider, and `/models refresh openai` refreshes
-one provider. The desktop Models screen refreshes the selected provider through
-the runtime. Desktop clients use the `models.list` and `models.refresh` RPC
-methods; provider API requests and credentials stay in the runtime process.
+The model registry is the source for both clients. The desktop composer picker
+groups its discovered models by provider, filters across names and IDs, shows
+only capability facts the registry knows, and refreshes catalogs through the
+runtime. Missing credentials are shown per provider; **Connect provider** opens
+the secure connection form. A reasoning selector appears only when the selected
+model advertises supported effort levels.
+
+For scripts and terminals, `harness models` lists the cached registry and
+`harness models --refresh` refreshes every provider. Refresh one provider with
+`harness models --refresh --provider openai`. `harness model` prints the current
+selection, while `harness model provider/model-id` selects a model. Add
+`--effort <advertised-level>` only when the model's catalog metadata advertises
+that level; `--effort off` disables configurable reasoning. Add `--project` to save
+the selection under `[model]` in `.agent/config.toml` instead of as the user
+default. A manually entered model ID remains selectable even when it is absent
+from discovery.
+
+The CLI stores the user default in the OS user config directory (`models.toml`;
+`COGITO_CONFIG_DIR` can choose a portable location). The project setting takes
+precedence over that default, and a `model.changed` session event restores a
+session-specific choice when the session resumes. Explicit `COGITO_MODEL_*`
+environment settings and command-line model flags take precedence over saved
+preferences. Model changes made in an active desktop or interactive CLI session
+are recorded in that session's event history.
+
+In the interactive CLI, `/models` lists the registry, `/models refresh` refreshes
+all providers, `/models refresh openai` refreshes one provider, and
+`/model provider/model-id [--effort level]` changes the selection. `/connect`
+starts the secure credential flow. Equivalent shell commands include
+`harness models`, `harness model openai/model-id`, and `harness auth connect openai`.
+Desktop clients use the `models.list` and `models.refresh` RPC methods; provider
+API requests and credentials stay in the runtime process.
 
 ## Current v0 capabilities
 
@@ -486,9 +513,10 @@ action, or shortcuts. Context percentage, price, and reasoning effort are omitte
 when the runtime cannot determine them.
 
 The interactive slash commands are `/help`, `/run`, `/resume`, `/inspect`,
-`/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/models`, `/mode`,
+`/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/models`, `/connect`, `/mode`,
 `/clear`, `/cancel`, and `/exit`. `/models` shows the cached model registry;
-`/models refresh [provider-id]` refreshes all catalogs or one provider. `/mode`
+`/models refresh [provider-id]` refreshes all catalogs or one provider. `/model`
+shows the current provider/model; `/model provider/model-id` changes it. `/mode`
 reports the execution mode loaded from the
 workspace policy; change that setting in `.agent/config.toml` and restart the CLI.
 Tab completes commands. The `TERM=dumb` line-oriented fallback lists only the

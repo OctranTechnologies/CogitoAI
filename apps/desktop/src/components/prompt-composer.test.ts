@@ -17,9 +17,23 @@ const MODELS: ModelSettings = {
   model: "gpt-4o",
   base_url: "https://api.openai.com/v1",
   api_key_env: "OPENAI_API_KEY",
-  capabilities: { streaming: true, tool_calling: true, vision: false, reasoning: true, context_window: 128000 },
+  capabilities: {
+    text_input: true,
+    image_input: false,
+    streaming: true,
+    tool_calling: true,
+    parallel_tool_calls: false,
+    vision: false,
+    reasoning: true,
+    configurable_reasoning_effort: false,
+    context_window: 128000,
+    max_output_tokens: null,
+    structured_output: false,
+  },
   credential: { available: true, source: "environment", env_var: "OPENAI_API_KEY" },
   available_models: ["gpt-4o", "gpt-4o-mini"],
+  reasoning_levels: [],
+  reasoning_effort: null,
   configured: true,
 };
 
@@ -45,8 +59,14 @@ function setup(overrides: Partial<Parameters<typeof PromptComposer>[0]> = {}) {
     running: false,
     onCancel: vi.fn(),
     models: MODELS,
+    modelCatalog: [],
+    providerCredentials: [{ provider_id: "openai", provider: "OpenAI", credential: MODELS.credential }],
+    isLoadingModelCatalog: false,
     permissions: PERMISSIONS,
     onSelectModel,
+    onRefreshModelCatalog: vi.fn(),
+    onConnectProvider: vi.fn(),
+    onSelectReasoning: vi.fn(),
     onSelectMode,
     pendingMode: null,
     workspacePath: "C:/repo",
@@ -127,16 +147,80 @@ describe("PromptComposer", () => {
 
   it("shows the active model as provider and model", () => {
     setup();
-    expect(screen.getByText("openai")).toBeTruthy();
+    expect(screen.getByText("OpenAI")).toBeTruthy();
     expect(screen.getByText("gpt-4o")).toBeTruthy();
   });
 
-  it("offers only the models the runtime advertises", async () => {
-    const { onSelectModel } = setup();
-    fireEvent.click(screen.getByRole("button", { name: /^Model: openai/ }));
-    const option = await screen.findByRole("menuitem", { name: /gpt-4o-mini/ });
+  it("groups and selects only models returned by the runtime catalog", async () => {
+    const catalog = [
+      {
+        provider: "openai",
+        id: "gpt-4o-mini",
+        display_name: "GPT-4o mini",
+        capabilities: MODELS.capabilities,
+        metadata: {
+          source: "discovered" as const,
+          stale: false,
+          refreshed_at_unix: null,
+          reasoning_levels: null,
+          capabilities: {
+            text_input: "supported" as const,
+            vision: "unsupported" as const,
+            streaming: "supported" as const,
+            tool_calling: "supported" as const,
+            parallel_tool_calls: "unknown" as const,
+            reasoning: "unknown" as const,
+            configurable_reasoning_effort: "unknown" as const,
+            structured_output: "unknown" as const,
+          },
+          pricing: null,
+        },
+      },
+    ];
+    const { onSelectModel } = setup({ modelCatalog: catalog });
+    fireEvent.click(screen.getByRole("button", { name: /Choose model/ }));
+    const option = await screen.findByRole("option", { name: /GPT-4o mini/ });
     fireEvent.click(option);
-    expect(onSelectModel).toHaveBeenCalledWith("gpt-4o-mini");
+    expect(onSelectModel).toHaveBeenCalledWith("openai", "gpt-4o-mini");
+  });
+
+  it("shows disconnected provider state and routes connect and refresh actions", async () => {
+    const { props } = setup({
+      providerCredentials: [{
+        provider_id: "openai",
+        provider: "OpenAI",
+        credential: { available: false, source: "none", env_var: "OPENAI_API_KEY" },
+      }],
+      modelCatalog: [{
+        provider: "openai",
+        id: "gpt-4o-mini",
+        display_name: "GPT-4o mini",
+        capabilities: MODELS.capabilities,
+        metadata: {
+          source: "discovered",
+          stale: false,
+          refreshed_at_unix: null,
+          reasoning_levels: null,
+          capabilities: {
+            text_input: "supported",
+            vision: "supported",
+            streaming: "supported",
+            tool_calling: "supported",
+            parallel_tool_calls: "unknown",
+            reasoning: "unknown",
+            configurable_reasoning_effort: "unknown",
+            structured_output: "unknown",
+          },
+          pricing: null,
+        },
+      }],
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Choose model/ }));
+    expect(screen.getAllByText("Not connected")).toHaveLength(5);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh OpenAI catalog" }));
+    expect(props.onRefreshModelCatalog).toHaveBeenCalledWith("openai");
+    fireEvent.click(screen.getByRole("button", { name: "Connect provider" }));
+    expect(props.onConnectProvider).toHaveBeenCalledWith("openai");
   });
 
   it("labels every execution mode for people rather than for the runtime", async () => {
@@ -159,11 +243,80 @@ describe("PromptComposer", () => {
     expect(model.getAttribute("aria-disabled")).toBe("true");
   });
 
-  it("reports the runtime's capabilities without inventing an effort control", () => {
+  it("does not render reasoning effort controls when the registry reports none", () => {
     setup();
-    const trigger = screen.getByRole("button", { name: /^Model: openai/ });
-    expect(trigger.textContent).toContain("Supports tool calling, reasoning.");
-    expect(screen.queryByRole("button", { name: /effort|thinking|reasoning level/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Choose model/ }));
+    expect(screen.queryByRole("combobox", { name: "Reasoning effort" })).toBeNull();
+  });
+
+  it("filters the live catalog and moves model focus with the keyboard", async () => {
+    const catalog = ["gpt-4o-mini", "gpt-4.1"].map((id) => ({
+      provider: "openai",
+      id,
+      display_name: id,
+      capabilities: MODELS.capabilities,
+      metadata: {
+        source: "discovered" as const,
+        stale: false,
+        refreshed_at_unix: null,
+        reasoning_levels: null,
+        capabilities: {
+          text_input: "supported" as const,
+          vision: "unsupported" as const,
+          streaming: "supported" as const,
+          tool_calling: "supported" as const,
+          parallel_tool_calls: "unknown" as const,
+          reasoning: "unknown" as const,
+          configurable_reasoning_effort: "unknown" as const,
+          structured_output: "unknown" as const,
+        },
+        pricing: null,
+      },
+    }));
+    setup({ modelCatalog: catalog });
+    fireEvent.click(screen.getByRole("button", { name: /Choose model/ }));
+    const search = await screen.findByRole("textbox", { name: "Search models and providers" });
+    fireEvent.change(search, { target: { value: "4.1" } });
+    expect(screen.getByRole("option", { name: /gpt-4.1/ })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: /gpt-4o-mini/ })).toBeNull();
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(screen.getByRole("option", { name: /gpt-4.1/ }));
+  });
+
+  it("exposes only the selected model's advertised reasoning efforts", async () => {
+    const descriptor = {
+      provider: "openai",
+      id: "gpt-4o",
+      display_name: "GPT-4o",
+      capabilities: MODELS.capabilities,
+      metadata: {
+        source: "discovered" as const,
+        stale: false,
+        refreshed_at_unix: null,
+        reasoning_levels: ["low", "high"],
+        capabilities: {
+          text_input: "supported" as const,
+          vision: "unsupported" as const,
+          streaming: "supported" as const,
+          tool_calling: "supported" as const,
+          parallel_tool_calls: "unknown" as const,
+          reasoning: "supported" as const,
+          configurable_reasoning_effort: "supported" as const,
+          structured_output: "unknown" as const,
+        },
+        pricing: null,
+      },
+    };
+    const { props } = setup({ models: { ...MODELS, reasoning_levels: ["low", "high"] }, modelCatalog: [descriptor] });
+    fireEvent.click(screen.getByRole("button", { name: /Choose model/ }));
+    const effort = await screen.findByRole("combobox", { name: "Reasoning effort" });
+    expect(Array.from((effort as HTMLSelectElement).options).map((option) => option.value)).toEqual([
+      "off",
+      "low",
+      "high",
+    ]);
+    fireEvent.change(effort, { target: { value: "high" } });
+    expect(props.onSelectReasoning).toHaveBeenCalledWith("high");
   });
 
   it("marks attachment as unavailable rather than offering a dead button", () => {
@@ -217,8 +370,14 @@ describe("LandingView notice", () => {
         workspacePath: "",
         onChooseWorkspace: vi.fn(),
         models: null,
+        modelCatalog: [],
+        providerCredentials: [],
+        isLoadingModelCatalog: false,
         permissions: null,
         onSelectModel: vi.fn(),
+        onRefreshModelCatalog: vi.fn(),
+        onConnectProvider: vi.fn(),
+        onSelectReasoning: vi.fn(),
         onSelectMode: vi.fn(),
         pendingMode: null,
         runtimeError: null,
@@ -238,8 +397,14 @@ describe("LandingView notice", () => {
         workspacePath: "C:/repo",
         onChooseWorkspace: vi.fn(),
         models: null,
+        modelCatalog: [],
+        providerCredentials: [],
+        isLoadingModelCatalog: false,
         permissions: null,
         onSelectModel: vi.fn(),
+        onRefreshModelCatalog: vi.fn(),
+        onConnectProvider: vi.fn(),
+        onSelectReasoning: vi.fn(),
         onSelectMode: vi.fn(),
         pendingMode: null,
         runtimeError: "runtime said no",

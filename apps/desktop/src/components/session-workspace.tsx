@@ -6,7 +6,7 @@ import { SessionHeader } from "./session-header";
 import { TerminalPanel } from "./terminal-panel";
 import { buildActivityStream, summariseStream, type ActivityBlock } from "../lib/activity";
 import { useAutoScroll } from "../lib/auto-scroll";
-import type { ModelSettings, PermissionSettings } from "../lib/settings";
+import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
 import type { HarnessEvent } from "../lib/rpc";
 import type { CheckpointEntry, ChangeEntry, FileChange, FileView } from "../lib/changes";
 import type { RunPhase } from "../lib/events";
@@ -24,6 +24,9 @@ export interface SessionWorkspaceProps {
   projectName: string | null;
   branch: string | null;
   models: ModelSettings | null;
+  modelCatalog: ModelDescriptor[];
+  providerCredentials: ProviderCredentialStatus[];
+  isLoadingModelCatalog: boolean;
   permissions: PermissionSettings | null;
 
   composer: {
@@ -34,7 +37,10 @@ export interface SessionWorkspaceProps {
     workspacePath: string;
     onChooseWorkspace: () => void;
     pendingMode: string | null;
-    onSelectModel: (model: string) => void;
+    onSelectModel: (provider: string, model: string) => void;
+    onRefreshModelCatalog: (providerId: string) => void;
+    onConnectProvider: (providerId: string) => void;
+    onSelectReasoning: (effort: string) => void;
     onSelectMode: (mode: string) => void;
   };
   terminal?: {
@@ -164,8 +170,14 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 running={props.running}
                 onCancel={props.composer.onCancel}
                 models={props.models}
+                modelCatalog={props.modelCatalog}
+                providerCredentials={props.providerCredentials}
+                isLoadingModelCatalog={props.isLoadingModelCatalog}
                 permissions={props.permissions}
                 onSelectModel={props.composer.onSelectModel}
+                onRefreshModelCatalog={props.composer.onRefreshModelCatalog}
+                onConnectProvider={props.composer.onConnectProvider}
+                onSelectReasoning={props.composer.onSelectReasoning}
                 onSelectMode={props.composer.onSelectMode}
                 pendingMode={props.composer.pendingMode}
                 workspacePath={props.composer.workspacePath}

@@ -7,7 +7,8 @@ use harness_context::{ContextBuilder, ContextInput, ToolContextResult, Workspace
 use harness_core::{Error, SessionId};
 use harness_git::CheckpointStore;
 use harness_models::{
-    Message, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, Role, Usage,
+    Message, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ReasoningConfig, Role,
+    Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest};
 use harness_session::{
@@ -190,6 +191,7 @@ pub struct AgentRunner {
     compaction_strategy: Arc<dyn CompactionStrategy>,
     checkpoints: Option<Arc<dyn CheckpointStore>>,
     event_bus: EventBus,
+    reasoning: Option<ReasoningConfig>,
 }
 
 impl AgentRunner {
@@ -218,11 +220,17 @@ impl AgentRunner {
             compaction_strategy: Arc::new(DeriveCompactionStrategy),
             checkpoints: None,
             event_bus: EventBus::new(),
+            reasoning: None,
         }
     }
 
     pub fn with_event_bus(mut self, event_bus: EventBus) -> Self {
         self.event_bus = event_bus;
+        self
+    }
+
+    pub fn with_reasoning_config(mut self, reasoning: Option<ReasoningConfig>) -> Self {
+        self.reasoning = reasoning;
         self
     }
 
@@ -404,7 +412,7 @@ impl AgentRunner {
                 max_output_tokens: None,
                 temperature: None,
                 metadata: Default::default(),
-                reasoning: None,
+                reasoning: self.reasoning.clone(),
             };
             let descriptor = self.provider.descriptor();
             self.emit(

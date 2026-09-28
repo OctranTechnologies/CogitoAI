@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Bot } from "lucide-react";
-import type { ModelSettings, PermissionSettings } from "../lib/settings";
+import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
 import { ComposerNotice, PromptComposer } from "./prompt-composer";
 
 export interface LandingViewProps {
@@ -14,8 +14,14 @@ export interface LandingViewProps {
   workspacePath: string;
   onChooseWorkspace: () => void;
   models: ModelSettings | null;
+  modelCatalog: ModelDescriptor[];
+  providerCredentials: ProviderCredentialStatus[];
+  isLoadingModelCatalog: boolean;
   permissions: PermissionSettings | null;
-  onSelectModel: (model: string) => void;
+  onSelectModel: (provider: string, model: string) => void;
+  onRefreshModelCatalog: (providerId: string) => void;
+  onConnectProvider: (providerId: string) => void;
+  onSelectReasoning: (effort: string) => void;
   onSelectMode: (mode: string) => void;
   pendingMode: string | null;
   /** Shown as a dismissible banner above the composer. */
@@ -40,8 +46,14 @@ export function LandingView({
   workspacePath,
   onChooseWorkspace,
   models,
+  modelCatalog,
+  providerCredentials,
+  isLoadingModelCatalog,
   permissions,
   onSelectModel,
+  onRefreshModelCatalog,
+  onConnectProvider,
+  onSelectReasoning,
   onSelectMode,
   pendingMode,
   runtimeError,
@@ -87,8 +99,14 @@ export function LandingView({
             running={running}
             onCancel={onCancel}
             models={models}
+            modelCatalog={modelCatalog}
+            providerCredentials={providerCredentials}
+            isLoadingModelCatalog={isLoadingModelCatalog}
             permissions={permissions}
             onSelectModel={onSelectModel}
+            onRefreshModelCatalog={onRefreshModelCatalog}
+            onConnectProvider={onConnectProvider}
+            onSelectReasoning={onSelectReasoning}
             onSelectMode={onSelectMode}
             pendingMode={pendingMode}
             workspacePath={workspacePath}

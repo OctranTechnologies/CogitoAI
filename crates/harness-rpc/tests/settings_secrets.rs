@@ -66,6 +66,7 @@ fn model_config(provider: ProviderKind) -> ModelConfig {
         api_key_env: "COGITO_TEST_KEY".to_owned(),
         base_url: "https://api.openai.com/v1".to_owned(),
         context_window: Some(8192),
+        reasoning_effort: None,
     }
 }
 
