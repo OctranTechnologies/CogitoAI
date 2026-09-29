@@ -807,84 +807,33 @@ pub fn test_model_connection(model: &ModelConfig, store: &dyn SecretStore) -> Co
             message: redact_secrets(&format!("Model configuration is invalid: {reason}"), &[]),
         };
     }
-    match model.provider {
-        ProviderKind::Mock => ConnectionTestResult {
+    if model.provider == ProviderKind::Mock {
+        return ConnectionTestResult {
             ok: true,
             skipped: false,
             message: "The mock provider runs locally; no connection is required.".to_owned(),
-        },
-        ProviderKind::OpenAi => {
-            if !credential.available {
-                return ConnectionTestResult {
-                    ok: false,
-                    skipped: true,
-                    message: format!(
-                        "No credential found. Set {} in the runtime environment.",
-                        credential.env_var
-                    ),
-                };
-            }
-            ConnectionTestResult {
-                ok: true,
-                skipped: false,
-                message: format!("Ready. The runtime can read {}.", credential.env_var),
-            }
-        }
-        ProviderKind::Anthropic => {
-            if !credential.available {
-                return ConnectionTestResult {
-                    ok: false,
-                    skipped: true,
-                    message: format!(
-                        "No credential found. Set {} in the runtime environment.",
-                        credential.env_var
-                    ),
-                };
-            }
-            ConnectionTestResult {
-                ok: true,
-                skipped: false,
-                message: format!("Ready. The runtime can read {}.", credential.env_var),
-            }
-        }
-        ProviderKind::Gemini => {
-            if !credential.available {
-                return ConnectionTestResult {
-                    ok: false,
-                    skipped: true,
-                    message: format!(
-                        "No credential found. Set {} in the runtime environment.",
-                        credential.env_var
-                    ),
-                };
-            }
-            ConnectionTestResult {
-                ok: true,
-                skipped: false,
-                message: format!("Ready. The runtime can read {}.", credential.env_var),
-            }
-        }
-        ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => {
-            if !credential.available {
-                return ConnectionTestResult {
-                    ok: false,
-                    skipped: true,
-                    message: format!(
-                        "No credential found. Set {} in the runtime environment.",
-                        credential.env_var
-                    ),
-                };
-            }
-            ConnectionTestResult {
-                ok: true,
-                skipped: false,
-                message: format!(
-                    "{} is ready. The runtime can read {}.",
-                    provider_label(&model.provider),
-                    credential.env_var
-                ),
-            }
-        }
+        };
+    }
+
+    if !credential.available {
+        return ConnectionTestResult {
+            ok: false,
+            skipped: true,
+            message: format!(
+                "No credential found. Set {} in the runtime environment.",
+                credential.env_var
+            ),
+        };
+    }
+
+    ConnectionTestResult {
+        ok: true,
+        skipped: false,
+        message: format!(
+            "{} is ready. The runtime can read {}.",
+            provider_label(&model.provider),
+            credential.env_var
+        ),
     }
 }
 

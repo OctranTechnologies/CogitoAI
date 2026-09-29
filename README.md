@@ -135,7 +135,30 @@ pnpm 10 blocks dependency lifecycle scripts by default and prints an
 does not need `pnpm approve-builds`; the build works because those packages ship
 prebuilt binaries.
 
-## Model configuration
+## LLM Providers
+
+Provider support is gated on the deterministic coding-agent conformance fixture,
+cross-route error/cancellation checks, and adapter-level protocol tests. The
+fixture runs the same read, search, missing-file, patch, test-failure recovery,
+and final-response flow through every supported transport route. The shared
+conformance suite also checks normalized authentication, invalid-model, and
+rate-limit errors plus cancellation on every route; timeout handling is tested
+at the shared SSE transport boundary. Live credentials are optional and are not
+used in CI.
+
+| Provider | API transport | Credential environment variable |
+| --- | --- | --- |
+| OpenAI | Responses API | `OPENAI_API_KEY` |
+| Anthropic | Messages API | `ANTHROPIC_API_KEY` |
+| Google Gemini | Native Generate Content API | `GEMINI_API_KEY` |
+| OpenCode Zen | Catalog-selected Responses, Chat Completions, or Messages | `OPENCODE_API_KEY` |
+| OpenCode Go | Catalog-selected Responses, Chat Completions, or Messages | `OPENCODE_API_KEY` |
+
+Zen and Go are separate services and catalogs on the same OpenCode account.
+Go model access requires the account's Go subscription. OpenCode chooses a
+protocol from each model's catalog metadata; it does not assume one protocol
+for every model. Available model lists are discovered dynamically and may
+change as provider catalogs and account access change.
 
 The harness runs without any credentials. The default provider is a deterministic
 mock that executes a fixed, scripted workflow through the real agent loop, policy
@@ -382,6 +405,46 @@ starts the secure credential flow. Equivalent shell commands include
 `harness models`, `harness model openai/model-id`, and `harness auth connect openai`.
 Desktop clients use the `models.list` and `models.refresh` RPC methods; provider
 API requests and credentials stay in the runtime process.
+
+### Troubleshooting
+
+- If a provider appears disconnected, check the environment of the process that
+  launches Harness. Environment credentials take priority over OS-stored keys;
+  desktop environment keys must be available to the local runtime, not only to
+  the desktop shell.
+- If discovery is unavailable, cached catalogs remain usable offline and a
+  manually entered model ID can still be selected. Refresh with `harness models
+  --refresh` or the desktop model picker's refresh action when network access is
+  restored.
+- A model absent from OpenCode's picker may not be available to the current
+  account or may lack supported protocol metadata. Check the Zen versus Go
+  subscription and refresh the matching provider catalog.
+- Authentication failures require a valid provider key. Rate limits are
+  normalized and retried when safe; repeated 429 responses require waiting for
+  the provider's limit window to reset.
+- When testing a custom `COGITO_MODEL_BASE_URL`, confirm it implements the
+  selected API protocol and, for discovery, its expected model-listing endpoint.
+
+### Adding another provider
+
+Implement a `ModelProvider` adapter in `crates/harness-models`, or add a reusable
+wire adapter behind the existing private `ProtocolAdapter` boundary. Translate
+requests, streamed events, usage, tool calls, tool results, cancellation, and
+normalized errors into the canonical model types. Keep provider-native payloads
+and continuation state inside the adapter; do not add provider checks to the
+agent loop, session events, or desktop activity renderer. Record only metadata
+the catalog or provider can establish, leaving unavailable capabilities
+`unknown`.
+
+Add the new route to
+[`provider_conformance.rs`](crates/harness-agent/tests/provider_conformance.rs)
+so the same deterministic coding-agent fixture runs through it. Add protocol
+mock tests for discovery, streaming, tool-result continuation, multiple calls,
+usage, errors, cancellation, and secret redaction as applicable. A provider is
+not considered supported until its complete tool-use fixture and adapter tests
+pass. Then run `cargo test --workspace`, `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and the frontend checks
+listed under [Running tests](#running-tests).
 
 ## Current v0 capabilities
 

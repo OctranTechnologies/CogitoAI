@@ -48,6 +48,10 @@ pub struct ToolResult {
     pub metadata: BTreeMap<String, serde_json::Value>,
     pub changed_files: Vec<PathBuf>,
     pub truncated: bool,
+    /// Tool execution errors are returned to the model as observations. Policy
+    /// denials remain harness errors and never reach this result type.
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 impl ToolResult {
@@ -57,6 +61,7 @@ impl ToolResult {
             metadata: BTreeMap::new(),
             changed_files: Vec::new(),
             truncated: false,
+            is_error: false,
         }
     }
 }

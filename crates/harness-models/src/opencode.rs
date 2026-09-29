@@ -670,7 +670,10 @@ fn model_capabilities(model: &Value) -> ModelCapabilities {
             .unwrap_or(false),
         streaming: true,
         tool_calling,
-        parallel_tool_calls: tool_calling,
+        // The catalog exposes whether tools exist, but does not state whether
+        // a model supports parallel calls. Keep that fact unknown in the
+        // registry instead of inferring it from ordinary tool support.
+        parallel_tool_calls: false,
         reasoning,
         // OpenCode's endpoint docs list wire protocols, but do not promise that
         // model-native reasoning controls pass through those gateways.
@@ -1568,6 +1571,23 @@ mod tests {
 
     fn listing_value(id: &str) -> Value {
         json!({ "object": "list", "data": [{ "id": id, "object": "model", "owned_by": "opencode" }] })
+    }
+
+    #[test]
+    fn catalog_tool_support_does_not_fabricate_parallel_call_support() {
+        let catalog = parse_catalog(
+            OpenCodeProduct::Zen,
+            &catalog_value(OpenCodeProduct::Zen, "test-model", "@ai-sdk/openai"),
+            &listing_value("test-model"),
+        )
+        .unwrap();
+        let descriptor = &catalog.available[0];
+        assert!(descriptor.capabilities.tool_calling);
+        assert!(!descriptor.capabilities.parallel_tool_calls);
+        assert_eq!(
+            descriptor.metadata.capabilities.parallel_tool_calls,
+            crate::CapabilityKnowledge::Unknown
+        );
     }
 
     fn response_for(protocol: WireProtocol, id: &str) -> Value {

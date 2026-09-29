@@ -816,15 +816,7 @@ pub fn validate_provider_credential(
         .map_err(|reason| ProviderError::Configuration { reason })?;
     harness_core::register_sensitive_value(api_key);
     let provider = provider_from_config_with_api_key(config, api_key)?;
-    match config.provider {
-        ProviderKind::Mock => Ok(()),
-        ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo => {
-            provider.refresh_models().map(|_| ())
-        }
-        ProviderKind::OpenAi | ProviderKind::Anthropic | ProviderKind::Gemini => {
-            provider.discover_models().map(|_| ())
-        }
-    }
+    provider.refresh_models().map(|_| ())
 }
 
 fn provider_id(provider: ProviderKind) -> &'static str {

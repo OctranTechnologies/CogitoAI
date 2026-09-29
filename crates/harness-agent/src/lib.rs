@@ -534,7 +534,7 @@ impl AgentRunner {
                 tool_calls += 1;
                 let is_shell = tool_call.name == "shell";
                 let request = ToolRequest::new(tool_call.name.clone(), tool_call.arguments.clone());
-                let result = match self.execute_tool(
+                let mut result = match self.execute_tool(
                     &session_id,
                     &task.workspace_root,
                     &approval_policy,
@@ -545,6 +545,10 @@ impl AgentRunner {
                     Ok(result) => result,
                     Err(error) => return self.fail(session_id, collector, error),
                 };
+                let (bounded_output, output_truncated) =
+                    bound_tool_result_output(&result.output, result.truncated);
+                result.output = bounded_output;
+                result.truncated = output_truncated;
                 let changed_files = result.changed_files.clone();
                 if let (Some(checkpoints), Some(checkpoint_id)) =
                     (&self.checkpoints, &checkpoint_id)
@@ -558,7 +562,7 @@ impl AgentRunner {
                 next_model_history.push(Message::tool_result(harness_models::ToolResult {
                     tool_call_id: tool_call.id,
                     content: result.output.clone(),
-                    is_error: false,
+                    is_error: result.is_error,
                 }));
                 context_input.tool_results.push(ToolContextResult {
                     name: tool_call.name,
@@ -738,8 +742,13 @@ impl AgentRunner {
                     .insert(approval_key(&request));
                 let result = self.tools.execute(&context, request);
                 self.flush(session_id, collector)?;
-                result.map_err(|error| AgentError::Tool(error.to_string()))
+                match result {
+                    Ok(result) => Ok(result),
+                    Err(Error::Tool { tool, message }) => Ok(tool_error_result(tool, message)),
+                    Err(error) => Err(AgentError::Tool(error.to_string())),
+                }
             }
+            Err(Error::Tool { tool, message }) => Ok(tool_error_result(tool, message)),
             Err(error) => Err(AgentError::Tool(error.to_string())),
         }
     }
@@ -821,6 +830,34 @@ impl AgentRunner {
     }
 }
 
+const MAX_MODEL_TOOL_RESULT_BYTES: usize = 16 * 1024;
+const TOOL_RESULT_TRUNCATION_MARKER: &str = "\n[truncated]";
+
+fn tool_error_result(tool: String, message: String) -> ToolResult {
+    let mut result = ToolResult::new(format!("Tool {tool} failed: {message}"));
+    result.is_error = true;
+    result
+}
+
+fn bound_tool_result_output(output: &str, already_truncated: bool) -> (String, bool) {
+    let truncated = already_truncated || output.len() > MAX_MODEL_TOOL_RESULT_BYTES;
+    if !truncated {
+        return (output.to_owned(), false);
+    }
+
+    let content_limit =
+        MAX_MODEL_TOOL_RESULT_BYTES.saturating_sub(TOOL_RESULT_TRUNCATION_MARKER.len());
+    let mut end = output.len().min(content_limit);
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = output[..end].to_owned();
+    if !bounded.ends_with(TOOL_RESULT_TRUNCATION_MARKER) {
+        bounded.push_str(TOOL_RESULT_TRUNCATION_MARKER);
+    }
+    (bounded, true)
+}
+
 struct ApprovedPolicy {
     base: Arc<dyn Policy>,
     approved: Arc<Mutex<HashSet<String>>>,
@@ -879,4 +916,22 @@ fn usage_tokens(usage: Option<&Usage>) -> u64 {
                 .map(|(input, output)| u64::from(input) + u64::from(output))
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod conformance_hardening_tests {
+    use super::{bound_tool_result_output, tool_error_result};
+
+    #[test]
+    fn tool_errors_are_marked_and_large_utf8_results_are_bounded() {
+        let error = tool_error_result("read_file".to_owned(), "missing file".to_owned());
+        assert!(error.is_error);
+        assert!(error.output.contains("missing file"));
+
+        let long = "🙂".repeat(20_000);
+        let (bounded, truncated) = bound_tool_result_output(&long, false);
+        assert!(truncated);
+        assert!(bounded.len() <= 16 * 1024);
+        assert!(bounded.ends_with("[truncated]"));
+    }
 }

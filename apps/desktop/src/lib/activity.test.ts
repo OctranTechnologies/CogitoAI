@@ -131,6 +131,24 @@ describe("buildActivityStream", () => {
     });
   });
 
+  it("renders model metadata for provider IDs unknown to the desktop", () => {
+    const blocks = buildActivityStream([
+      event("assistant.message", { text: "response" }),
+      event("model.response", {
+        provider: "future-provider",
+        model: "future-provider/example-model",
+        input_tokens: 3,
+        output_tokens: 2,
+      }),
+    ]);
+    expect(blocks.find((block) => block.kind === "assistant")).toMatchObject({
+      provider: "future-provider",
+      model: "future-provider/example-model",
+      inputTokens: 3,
+      outputTokens: 2,
+    });
+  });
+
   it("tracks a tool call through to its outcome with a duration", () => {
     const requested = event("tool.requested", { tool: "shell", arguments: { command: "pnpm test" } });
     const started = event("tool.started", { tool: "shell" }, requested.timestamp + 100);
