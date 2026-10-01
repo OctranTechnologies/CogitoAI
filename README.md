@@ -27,8 +27,8 @@ models changes a configuration value, not the architecture. A deterministic mock
 provider is a first-class provider, not a test stub bolted on afterwards, which is
 what makes the whole system testable without a network.
 
-**Local first.** The runtime runs in-process on your machine and the RPC transport
-binds to loopback. There is no cloud service and no telemetry. Credentials come
+**Local first.** A persistent runtime process runs on your machine and the RPC
+transport binds to loopback. There is no cloud service and no telemetry. Credentials come
 from explicitly configured environment variables or the OS credential manager.
 They are never returned to a client, written to project configuration or session
 history, or included in logs. Your code does not leave the machine.
@@ -44,12 +44,13 @@ is watching.
 
 **CLI and desktop over one runtime.** Both clients use the shared loopback RPC
 bootstrap for agent runs and drive the same agent core, policy engine, and session
-store. They reuse a healthy runtime or start the embedded RPC server when none is
-available. The server binds an OS-assigned loopback port and publishes a small
+store. They reuse a healthy runtime or start a detached runtime process when none
+is available. The server binds an OS-assigned loopback port and publishes a small
 per-user metadata record so the other client can find it. The connector verifies
-the RPC protocol and runtime instance ID before reuse; a startup lock prevents
-simultaneous clients from launching duplicate servers for one workspace. Neither
-client contains the agent loop.
+the health protocol, process ID, and runtime instance ID before reuse; a startup
+lock prevents simultaneous clients from launching duplicate servers for one
+workspace. Closing a client leaves the runtime available to other clients.
+Neither client contains the agent loop.
 
 **Event-sourced sessions.** A session is a JSONL file with one schema-versioned
 event per line. Nothing is mutated in place: tool calls, approvals, verification
@@ -80,7 +81,7 @@ with your dirty working tree rather than requiring a clean one.
                               └──────────────────────────────┘
 
    Both clients use the same connector and RPC runtime for agent runs. If the
-   endpoint is down, the client starts the server in its local backend process.
+   endpoint is down, the connector starts the runtime executable for the client.
 ```
 
 Both clients are untrusted with respect to privileged operations. A client may
@@ -299,7 +300,7 @@ $env:COGITO_MODEL = "claude-sonnet-4-6"
 cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
-For Gemini, set its runtime environment and start the same local RPC process:
+For Gemini, set its runtime environment and run the CLI normally:
 
 ```powershell
 $env:GEMINI_API_KEY = "<your-key>"
@@ -309,7 +310,7 @@ cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
 For OpenCode Zen or Go, set the shared key and the corresponding provider and
-namespaced model before starting the runtime:
+namespaced model before running the CLI:
 
 ```powershell
 $env:OPENCODE_API_KEY = "<your-key>"
@@ -330,6 +331,7 @@ runtime process and are never sent to the frontend.
 | `COGITO_MODEL_BASE_URL` | Provider API root; OpenCode defaults differ for Zen and Go, discovery uses `/models` | Provider API root |
 | `COGITO_MOCK_REPAIR` | Mock-only test hook; see [Testing the repair loop](#testing-the-repair-loop) | unset |
 | `COGITO_RPC_ADDRESS` | Optional fixed loopback endpoint used when `--rpc-address` is not supplied | automatic per-user discovery; OS-assigned loopback port when starting |
+| `COGITO_RUNTIME_BINARY` | Optional absolute path override for the managed runtime executable | searched beside the client and in application resources |
 | `RUST_LOG` | Runtime log level for the RPC runtime | `info` |
 
 The key is read from the environment only. It is never returned by the settings
@@ -507,6 +509,13 @@ through `src/lib/tokens.ts` rather than keeping a second copy of the palette.
 
 ## Running the CLI
 
+Before running it from a source checkout, build the workspace once so the
+runtime executable is available beside the CLI:
+
+```bash
+cargo build --workspace
+```
+
 Inspect a workspace without running any project code:
 
 ```bash
@@ -540,6 +549,7 @@ cargo run -p harness-cli -- resume <session-id> "Continue the remaining work"
 cargo run -p harness-cli -- status
 cargo run -p harness-cli -- diff
 cargo run -p harness-cli -- undo
+cargo run -p harness-cli -- runtime shutdown
 ```
 
 `inspect` reports the repository root, Git state, detected languages, manifests,
@@ -557,10 +567,18 @@ Global options: `--workspace` (default `.`), `--session-root` (default
 commands.
 
 Agent runs discover a loopback runtime automatically through per-user runtime
-metadata. The CLI requests an OS-assigned loopback port when it starts a server;
-set `--rpc-address` or `COGITO_RPC_ADDRESS` to connect to a fixed loopback
-endpoint. A connected runtime must already serve the requested workspace and use
-the same session root.
+metadata. The shared connector starts the runtime binary when necessary; no
+separate server command is needed. It searches beside the CLI executable and in
+standard application resource directories, independently of the current working
+directory. Set `COGITO_RUNTIME_BINARY` only when you need to override discovery.
+The CLI requests an OS-assigned loopback port when it starts a server; set
+`--rpc-address` or `COGITO_RPC_ADDRESS` to use a fixed loopback endpoint. A
+connected runtime must already serve the requested workspace and use the same
+session root.
+
+The runtime stays available after a CLI or desktop window closes. Stop it for
+development or troubleshooting with `harness runtime shutdown` (or add
+`--workspace <path>` to select a different workspace runtime).
 
 `--yes` auto-approves policy prompts. Use it only in a disposable workspace or in
 CI.
@@ -626,10 +644,12 @@ pnpm install
 pnpm tauri dev
 ```
 
-`pnpm tauri dev` starts the Vite dev server and compiles the Rust shell. In the
+`pnpm tauri dev` builds the local runtime executable, starts the Vite dev server,
+and compiles the Rust shell. In the
 app, enter a repository path and select Connect. The default `auto` endpoint
 discovers the runtime through the same per-user metadata as the CLI. The desktop
-reuses a healthy Harness runtime or starts one in its local backend process.
+reuses a healthy Harness runtime or starts its local runtime executable; packaged
+builds include it as a sidecar.
 Enter a fixed address such as `127.0.0.1:4545` to connect to a manually managed
 endpoint. The server is tied to its startup workspace; select a workspace
 inside that root or choose another endpoint for a different runtime. RPC has no
@@ -642,17 +662,16 @@ checkpointed harness change, and open settings. `Ctrl/Cmd+N` starts a task,
 `Ctrl/Cmd+P` focuses project and session search, `Ctrl/Cmd+Enter` submits the
 composer, and `Ctrl/Cmd+\`` toggles the terminal. `Escape` closes open overlays.
 
-To build the desktop binary without bundling installers:
+To build the desktop application and bundle its runtime sidecar:
 
 ```bash
 cd apps/desktop
 pnpm tauri build --debug
 ```
 
-Installer bundling is disabled in `tauri.conf.json` (`bundle.active` is `false`),
-so this produces an executable under `<repo-root>/target/debug/`
-(`cogitoai-desktop.exe` on Windows) rather than a packaged installer. The
-interactive terminal requires a real terminal emulator to answer the console
+The packaged application includes a target-specific
+`cogito-harness-runtime` sidecar, so runtime discovery does not depend on the
+user's working directory. The interactive terminal requires a real terminal emulator to answer the console
 host's cursor-position query, which xterm.js does; the CLI's non-interactive shell
 tool does not.
 
@@ -886,14 +905,12 @@ should be read as promising them:
   third-party extension loading. Providers and tools are registered in Rust at
   build time. The `@tauri-apps/plugin-dialog` dependency is Tauri's own native
   file dialog, not a CogitoAI extension point.
-- **No remote execution.** The runtime runs in-process on the local machine. There
-  is no container sandbox, no SSH or remote host execution, and no distributed
-  scheduling.
+- **No remote execution.** The runtime runs as a local process on the machine.
+  There is no container sandbox, no SSH or remote host execution, and no
+  distributed scheduling.
 - **No authentication.** The RPC protocol is unauthenticated and grants full
   control of the opened workspace. It binds to loopback and must not be exposed to
   a network.
-- **No installer bundles.** Tauri bundling is disabled; only the executable is
-  produced.
 - **Configured policy rules are CLI-only in v0.** The CLI loads mode and rules
   from `.agent/config.toml` and enforces both. The desktop enforces the execution
   mode but lists rules without loading them into the engine that authorises tool

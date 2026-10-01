@@ -66,7 +66,9 @@ pub enum ServerMessage {
 }
 
 pub const METHODS: &[&str] = &[
+    "health/check",
     "rpc.initialize",
+    "rpc.shutdown",
     "workspace.open",
     "workspace.inspect",
     "config.inspect",

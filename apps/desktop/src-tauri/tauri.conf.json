@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.cogitoai.desktop",
   "build": {
-    "beforeDevCommand": "pnpm dev:web",
+    "beforeDevCommand": "pnpm build:sidecar:dev && pnpm dev:web",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build:sidecar && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -26,7 +26,8 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all"
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/cogito-harness-runtime"]
   }
 }

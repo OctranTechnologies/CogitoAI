@@ -18,11 +18,12 @@ use crate::metadata::{
     process_exists, MetadataSnapshot, RuntimeMetadata, RuntimeMetadataStore,
     RPC_TRANSPORT_TCP_LOOPBACK, RUNTIME_METADATA_FORMAT_VERSION,
 };
-use crate::{EmbeddedRuntimeLauncher, RuntimeLaunchConfig, RuntimeLauncher};
+use crate::{ProcessRuntimeLauncher, RuntimeLaunchConfig, RuntimeLauncher};
 use crate::{RpcClient, RpcClientError, RpcResponse};
 
 const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_millis(80);
+const MAX_READINESS_BACKOFF: Duration = Duration::from_millis(500);
 // OS file locks coordinate separate CLI/desktop processes. Windows locks are
 // process-scoped, so also serialize competing connector threads per lock path.
 static PROCESS_STARTUP_LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Arc<AtomicBool>>>> =
@@ -111,7 +112,7 @@ struct ConnectorInner {
 
 impl Default for RuntimeConnector {
     fn default() -> Self {
-        Self::new(Arc::new(EmbeddedRuntimeLauncher))
+        Self::new(Arc::new(ProcessRuntimeLauncher::default()))
     }
 }
 
@@ -201,7 +202,7 @@ impl RuntimeConnector {
     }
 
     /// Connects to a healthy runtime, or serializes startup and launches the
-    /// shared embedded RPC runtime when the endpoint is not serving Harness RPC.
+    /// shared RPC runtime process when the endpoint is not serving Harness RPC.
     pub fn connect_or_start(
         &self,
         config: &RuntimeLaunchConfig,
@@ -218,7 +219,7 @@ impl RuntimeConnector {
                 Err(error) => return self.failed(error),
             }
         } else {
-            match probe(&config, None) {
+            match probe(&config, None, None, Duration::from_secs(1)) {
                 Ok(client) => return self.connected(client, false),
                 Err(error) if is_runtime_absent(&error) => {}
                 Err(error) => return self.failed(error),
@@ -258,7 +259,7 @@ impl RuntimeConnector {
                     let existing = if config.address.port() == 0 {
                         self.try_connect_from_metadata(&config, false)
                     } else {
-                        match probe(&config, None) {
+                        match probe(&config, None, None, Duration::from_secs(1)) {
                             Ok(client) => Ok(Some(client)),
                             Err(error) if is_runtime_absent(&error) => Ok(None),
                             Err(error) => Err(error),
@@ -289,7 +290,7 @@ impl RuntimeConnector {
         let existing = if config.address.port() == 0 {
             self.try_connect_from_metadata(&config, true)
         } else {
-            match probe(&config, None) {
+            match probe(&config, None, None, Duration::from_secs(1)) {
                 Ok(client) => Ok(Some(client)),
                 Err(error) if is_runtime_absent(&error) => Ok(None),
                 Err(error) => Err(error),
@@ -311,37 +312,58 @@ impl RuntimeConnector {
         let launch = match launch {
             Ok(launch) => launch,
             Err(error) if is_address_in_use(&error) && config.address.port() != 0 => {
-                return self.wait_until_ready_normalized(&config, None);
+                return self.wait_until_ready_normalized(&config, None, None);
             }
             Err(error) => return self.failed(RuntimeConnectError::Startup(error)),
         };
         if !launch.endpoint.ip().is_loopback() || launch.endpoint.port() == 0 {
+            self.inner.launcher.startup_failed(&instance_id);
             return self.failed(RuntimeConnectError::Startup(
                 "runtime launcher returned a non-loopback or unassigned endpoint".to_owned(),
             ));
         }
         if launch.instance_id != instance_id {
+            self.inner.launcher.startup_failed(&instance_id);
             return self.failed(RuntimeConnectError::Startup(
                 "runtime launcher returned an unexpected instance ID".to_owned(),
             ));
         }
-        if config.address.port() == 0 {
-            let metadata = RuntimeMetadata::new(launch.endpoint, launch.instance_id.clone());
-            if let Err(error) = self
-                .inner
-                .metadata_store
-                .write(&config.workspace_root, &metadata)
-            {
-                return self.failed(RuntimeConnectError::Startup(format!(
-                    "could not write runtime metadata: {error}"
-                )));
-            }
+        let metadata = RuntimeMetadata::new_for_process(
+            launch.endpoint,
+            launch.instance_id.clone(),
+            launch.pid,
+            launch.runtime_version.clone(),
+        );
+        if let Err(error) = self
+            .inner
+            .metadata_store
+            .write(&config.workspace_root, &metadata)
+        {
+            self.inner.launcher.startup_failed(&instance_id);
+            return self.failed(RuntimeConnectError::Startup(format!(
+                "could not write runtime metadata: {error}"
+            )));
         }
         config.address = launch.endpoint;
         self.set_endpoint(launch.endpoint);
         self.set_started_runtime(true);
         let _startup_lock = startup_lock.take();
-        self.wait_until_ready_normalized(&config, Some(&launch.instance_id))
+        let result =
+            self.wait_until_ready_normalized(&config, Some(&launch.instance_id), Some(launch.pid));
+        match result {
+            Ok(client) => {
+                self.inner.launcher.startup_succeeded(&launch.instance_id);
+                Ok(client)
+            }
+            Err(error) => {
+                self.inner.launcher.startup_failed(&launch.instance_id);
+                let _ = self.inner.metadata_store.remove_if_unchanged(
+                    &config.workspace_root,
+                    &serde_json::to_vec_pretty(&metadata).unwrap_or_default(),
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Connects only to an already-running healthy Harness RPC endpoint.
@@ -358,12 +380,12 @@ impl RuntimeConnector {
             match self.try_connect_from_metadata(&config, false)? {
                 Some(client) => self.connected(client, false),
                 None => self.failed(RuntimeConnectError::Rejected {
-                    method: "rpc.initialize".to_owned(),
+                    method: "health/check".to_owned(),
                     message: "no healthy runtime is registered for this workspace".to_owned(),
                 }),
             }
         } else {
-            match probe(&config, None) {
+            match probe(&config, None, None, Duration::from_secs(1)) {
                 Ok(client) => self.connected(client, false),
                 Err(error) => self.failed(error),
             }
@@ -413,7 +435,12 @@ impl RuntimeConnector {
         }
         let mut candidate = config.clone();
         candidate.address = endpoint.expect("compatible metadata has an endpoint");
-        match probe(&candidate, Some(&metadata.instance_id)) {
+        match probe(
+            &candidate,
+            Some(&metadata.instance_id),
+            Some(metadata.pid),
+            Duration::from_secs(1),
+        ) {
             Ok(client) => {
                 self.set_endpoint(candidate.address);
                 Ok(Some(client))
@@ -465,7 +492,7 @@ impl RuntimeConnector {
             }
             _ => {}
         }
-        self.wait_until_ready_normalized(&config, None)
+        self.wait_until_ready_normalized(&config, None, None)
     }
 
     /// Re-establishes a connection, starting the runtime if it has stopped.
@@ -497,27 +524,34 @@ impl RuntimeConnector {
         &self,
         config: &RuntimeLaunchConfig,
         expected_instance_id: Option<&str>,
+        expected_pid: Option<u32>,
     ) -> Result<RpcClient, RuntimeConnectError> {
         let deadline = Instant::now() + self.inner.readiness_timeout;
         self.transition(ConnectionState::Connecting, None)?;
+        let mut backoff = Duration::from_millis(50);
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.failed(RuntimeConnectError::ReadinessTimeout {
+                    endpoint: config.address,
+                });
+            }
+            // Bound one health exchange by the remaining overall startup
+            // deadline so a slow or unresponsive endpoint cannot stall retries.
+            let request_timeout = remaining.min(Duration::from_secs(4));
             if config.address.port() == 0 {
                 if let Some(client) = self.try_connect_from_metadata(config, false)? {
                     return self.connected(client, self.status().started_runtime);
                 }
             } else {
-                match probe(config, expected_instance_id) {
+                match probe(config, expected_instance_id, expected_pid, request_timeout) {
                     Ok(client) => return self.connected(client, self.status().started_runtime),
                     Err(error) if is_runtime_absent(&error) => {}
                     Err(error) => return self.failed(error),
                 }
             }
-            if Instant::now() >= deadline {
-                return self.failed(RuntimeConnectError::ReadinessTimeout {
-                    endpoint: config.address,
-                });
-            }
-            thread::sleep(self.inner.retry_interval);
+            thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
+            backoff = backoff.saturating_mul(2).min(MAX_READINESS_BACKOFF);
         }
     }
 
@@ -611,42 +645,70 @@ fn validate_endpoint(endpoint: SocketAddr) -> Result<(), RuntimeConnectError> {
 fn probe(
     config: &RuntimeLaunchConfig,
     expected_instance_id: Option<&str>,
+    expected_pid: Option<u32>,
+    timeout: Duration,
 ) -> Result<RpcClient, RuntimeConnectError> {
-    let mut client = RpcClient::connect_timeout(config.address, Duration::from_secs(1))
+    let mut client = RpcClient::connect_timeout(config.address, timeout)
         .map_err(|error| RuntimeConnectError::Transport(error.to_string()))?;
-    let initialized = response_result(
-        client.request("rpc.initialize", json!({}))?,
-        "rpc.initialize",
-    )?;
-    if initialized
-        .get("version")
+    let health = response_result(client.request("health/check", json!({}))?, "health/check")?;
+    if health.get("status").and_then(serde_json::Value::as_str) != Some("ready") {
+        return Err(RuntimeConnectError::Rejected {
+            method: "health/check".to_owned(),
+            message: "server is not ready".to_owned(),
+        });
+    }
+    if health
+        .get("protocolVersion")
         .and_then(serde_json::Value::as_u64)
         != Some(u64::from(crate::RPC_PROTOCOL_VERSION))
     {
         return Err(RuntimeConnectError::Rejected {
-            method: "rpc.initialize".to_owned(),
+            method: "health/check".to_owned(),
             message: "server reports an incompatible RPC protocol version".to_owned(),
         });
     }
-    let instance_id = initialized
+    if health
+        .get("runtimeVersion")
+        .and_then(serde_json::Value::as_str)
+        .map_or(true, str::is_empty)
+    {
+        return Err(RuntimeConnectError::Rejected {
+            method: "health/check".to_owned(),
+            message: "server did not report its runtime version".to_owned(),
+        });
+    }
+    let instance_id = health
         .get("instanceId")
         .and_then(serde_json::Value::as_str)
         .filter(|id| !id.is_empty())
         .ok_or_else(|| RuntimeConnectError::Rejected {
-            method: "rpc.initialize".to_owned(),
+            method: "health/check".to_owned(),
             message: "server did not report its runtime instance ID".to_owned(),
         })?;
     if expected_instance_id.is_some_and(|expected| expected != instance_id) {
         return Err(RuntimeConnectError::Rejected {
-            method: "rpc.initialize".to_owned(),
+            method: "health/check".to_owned(),
             message: "server instance does not match runtime metadata".to_owned(),
         });
     }
-    let workspace = config.workspace_root.to_string_lossy();
-    response_result(
-        client.request("workspace.open", json!({"path": workspace}))?,
-        "workspace.open",
-    )?;
+    let pid = health
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| RuntimeConnectError::Rejected {
+            method: "health/check".to_owned(),
+            message: "server did not report a valid process ID".to_owned(),
+        })?;
+    if expected_pid.is_some_and(|expected| expected != pid) {
+        return Err(RuntimeConnectError::Rejected {
+            method: "health/check".to_owned(),
+            message: "server process does not match runtime metadata".to_owned(),
+        });
+    }
+    // Readiness is deliberately defined by health/check. Opening a workspace
+    // may perform Git and filesystem discovery, which can be slow and is a
+    // client operation rather than a server-process readiness signal.
     client.clear_timeouts()?;
     Ok(client)
 }
@@ -870,6 +932,8 @@ mod tests {
             Ok(RuntimeLaunchInfo {
                 endpoint,
                 instance_id,
+                pid: std::process::id(),
+                runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
             })
         }
     }
@@ -944,6 +1008,8 @@ mod tests {
             Ok(RuntimeLaunchInfo {
                 endpoint,
                 instance_id,
+                pid: std::process::id(),
+                runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
             })
         }
     }
@@ -978,6 +1044,8 @@ mod tests {
             Ok(RuntimeLaunchInfo {
                 endpoint,
                 instance_id,
+                pid: std::process::id(),
+                runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
             })
         }
     }
@@ -1037,6 +1105,8 @@ mod tests {
             Ok(RuntimeLaunchInfo {
                 endpoint,
                 instance_id,
+                pid: std::process::id(),
+                runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
             })
         }
     }
@@ -1063,6 +1133,13 @@ mod tests {
                 break;
             };
             let result = match request.method.as_str() {
+                "health/check" => Some(json!({
+                    "status": "ready",
+                    "protocolVersion": RPC_PROTOCOL_VERSION,
+                    "runtimeVersion": env!("CARGO_PKG_VERSION"),
+                    "instanceId": instance_id.clone(),
+                    "pid": std::process::id(),
+                })),
                 "rpc.initialize" => Some(json!({
                     "version": RPC_PROTOCOL_VERSION,
                     "instanceId": instance_id.clone(),

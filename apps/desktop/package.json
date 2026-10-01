@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "vite",
     "dev:web": "vite",
+    "build:runtime": "cargo build --manifest-path ../../Cargo.toml -p harness-rpc --bin cogito-harness-runtime",
+    "build:sidecar:dev": "node scripts/build-runtime-sidecar.mjs --dev",
+    "build:sidecar": "node scripts/build-runtime-sidecar.mjs",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint .",

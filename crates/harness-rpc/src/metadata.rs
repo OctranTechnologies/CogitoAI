@@ -27,9 +27,23 @@ pub struct RuntimeMetadata {
 
 impl RuntimeMetadata {
     pub fn new(endpoint: std::net::SocketAddr, instance_id: impl Into<String>) -> Self {
+        Self::new_for_process(
+            endpoint,
+            instance_id,
+            std::process::id(),
+            env!("CARGO_PKG_VERSION").to_owned(),
+        )
+    }
+
+    pub fn new_for_process(
+        endpoint: std::net::SocketAddr,
+        instance_id: impl Into<String>,
+        pid: u32,
+        runtime_version: impl Into<String>,
+    ) -> Self {
         Self {
             metadata_version: RUNTIME_METADATA_FORMAT_VERSION,
-            pid: std::process::id(),
+            pid,
             protocol_version: crate::RPC_PROTOCOL_VERSION,
             transport: RPC_TRANSPORT_TCP_LOOPBACK.to_owned(),
             endpoint: endpoint.to_string(),
@@ -37,7 +51,7 @@ impl RuntimeMetadata {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
+            runtime_version: runtime_version.into(),
             instance_id: instance_id.into(),
         }
     }

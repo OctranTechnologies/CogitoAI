@@ -2,7 +2,31 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use tempfile::tempdir;
+use tempfile::TempDir;
+
+struct TestTempDir(TempDir);
+
+impl TestTempDir {
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        let _ = Command::new(env!("CARGO_BIN_EXE_harness-cli"))
+            .arg("--workspace")
+            .arg(self.path())
+            .arg("--session-root")
+            .arg(self.path().join("sessions"))
+            .args(["--json", "runtime", "shutdown"])
+            .output();
+    }
+}
+
+fn tempdir() -> Result<TestTempDir, std::io::Error> {
+    tempfile::tempdir().map(TestTempDir)
+}
 
 fn cli(root: &Path, arguments: &[&str]) -> Output {
     let session_root = root.join("sessions");

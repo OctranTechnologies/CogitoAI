@@ -24,7 +24,7 @@ the crates above it in this table and never the reverse.
 | `harness-verification` | `VerificationPlan`, `VerificationStep`, `VerificationReport`, `Verifier` trait, `CommandVerifier` | `harness-core`, `harness-session`, `harness-tools` |
 | `harness-pty` | `PtyManager`, human terminal sessions over `portable-pty` | `harness-core` |
 | `harness-agent` | `AgentRunner`, `AgentTask`, `AgentOutcome`, `ApprovalHandler`, `AgentLimits`, the tool-calling loop, checkpointing, verification feedback | most of the above |
-| `harness-rpc` | `Runtime`, `RpcServer`, `RuntimeConnector`, embedded runtime composition, `ApprovalBroker`, `AgentRunnerFactory`, protocol types, `settings` module, `cogito-rpc-dev` binary | `harness-agent` and the rest |
+| `harness-rpc` | `Runtime`, `RpcServer`, `RuntimeConnector`, `ProcessRuntimeLauncher`, runtime process composition, `ApprovalBroker`, `AgentRunnerFactory`, protocol types, `settings` module, runtime and `cogito-rpc-dev` binaries | `harness-agent` and the rest |
 | `harness-cli` | The `harness-cli` binary: RPC client for agent runs plus focused command helpers | `harness-agent` and the rest |
 
 Non-crate directories:
@@ -75,11 +75,39 @@ If the selected application-data directory cannot be created, the connector
 falls back to a per-user subdirectory under the system temporary directory.
 
 Discovery checks metadata compatibility, performs a best-effort PID existence
-check, then calls `rpc.initialize` and compares the live instance ID. Never use
-PID existence as proof of identity. Stale cleanup compares the original file
+check, then calls `health/check` and compares the live PID and instance ID. Never
+use PID existence as proof of identity. Stale cleanup compares the original file
 bytes before unlinking so one client cannot remove metadata another client has
-just replaced. Tests should use a temporary metadata directory via
+just replaced. Readiness uses bounded exponential backoff. Tests should use a
+temporary metadata directory via
 `RuntimeConnector::with_timing_and_runtime_directory`.
+
+### Runtime process lifecycle
+
+Clients never compose or run the agent loop themselves. The shared
+`ProcessRuntimeLauncher` locates `cogito-harness-runtime` beside the CLI binary,
+in Tauri resource directories, or at the optional `COGITO_RUNTIME_BINARY`
+override. It does not resolve the executable from the caller's working
+directory. From a source checkout, build the workspace (`cargo build --workspace`)
+to place the development binary under `target/debug` beside `harness`. The
+desktop's `beforeDevCommand` builds that target before launching the UI. Tauri
+release builds run `apps/desktop/scripts/build-runtime-sidecar.mjs`; the script
+creates the target-suffixed file expected by `bundle.externalBin` and packages it
+with the application.
+
+The process launcher starts a detached child and sends serialized launch options
+through stdin. Provider credentials remain in the inherited environment or OS
+credential store and are not placed in the child command line. Child stdout and
+stderr are appended to `runtime-<instance-id>.log` in the same per-user runtime
+directory as the metadata. After readiness succeeds, the parent releases its
+process handle without terminating the child. The runtime remains available when
+the CLI or desktop closes. For controlled local shutdown, use
+`harness runtime shutdown`; the RPC operation requires the live instance ID.
+On Windows, the launcher temporarily prevents inheritance of the client's
+standard handles so a persistent runtime cannot keep a parent shell's captured
+input or output pipes open.
+Healthy runtimes started manually are reused by the same health check and are not
+automatically stopped by clients.
 
 ## Invariants
 

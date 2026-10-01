@@ -65,7 +65,7 @@ below the line depends on anything above it.
 
 `harness-rpc` is the composition root for capability crates and owns the versioned
 loopback JSON-lines transport. Its `RuntimeConnector` handles endpoint discovery,
-health checks, cross-process startup locking, embedded server startup, readiness,
+health checks, cross-process startup locking, managed process startup, readiness,
 reconnection, and connection state. The CLI routes agent runs through that shared
 RPC runtime; its inspection and configuration commands retain their focused CLI
 helpers. The Tauri shell links only `harness-rpc`, so it cannot reach a tool,
@@ -73,16 +73,26 @@ provider, or policy implementation except through the runtime boundary.
 
 With no explicit endpoint override, the connector reads a per-user metadata
 record keyed by a hash of the canonical workspace path. It validates the
-metadata/protocol versions, checks the PID where the OS permits, then health
-checks `rpc.initialize` and matches the response's instance ID. PID presence
-alone never establishes identity. Invalid or stale records are removed only if
-their bytes have not changed since they were read. If no matching runtime is
-healthy, a per-workspace startup lock serializes the launch; the server binds an
-OS-assigned loopback port, then publishes its endpoint and instance identity.
-The current JSON-lines client uses `TcpStream`, so transport remains loopback
-TCP; the RPC server rejects non-loopback bind addresses. A healthy runtime is
-reused, and dropping a client closes its socket but leaves the runtime available
-to other local clients.
+metadata/protocol versions, checks the PID where the OS permits, then calls
+`health/check` and matches the process ID and instance ID. PID presence alone
+never establishes identity. Invalid or stale records are removed only if their
+bytes have not changed since they were read. If no matching runtime is healthy,
+a per-workspace startup lock serializes the launch. `ProcessRuntimeLauncher`
+locates the packaged sidecar or local workspace build independently of the
+client's working directory, starts it detached, and sends non-secret startup
+configuration over stdin. The child announces the bound endpoint and identity in
+a private, atomically written readiness file. The connector writes per-user
+metadata and polls health with bounded exponential backoff. The current JSON-lines
+client uses `TcpStream`, so transport remains loopback TCP; the RPC server rejects
+non-loopback bind addresses. A healthy runtime is reused, and dropping a client
+closes its socket but leaves the runtime available to other local clients.
+
+The runtime process is intentionally persistent across client lifetimes. It
+inherits the launch environment for provider credentials, receives no credential
+on its command line, and writes stdout/stderr to a per-instance log next to the
+runtime metadata. A successful client disconnect does not stop it. The explicit
+`rpc.shutdown` admin call checks the runtime's instance ID; the CLI exposes this
+as `harness runtime shutdown` for development and troubleshooting.
 
 Runtime metadata contains only PID, metadata and RPC protocol versions,
 transport, endpoint, startup timestamp, runtime version, and instance ID. It

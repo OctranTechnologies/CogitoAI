@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -76,9 +76,11 @@ impl RpcServer {
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let credential_store = runtime.credential_store();
+        let shutdown = Arc::new(AtomicBool::new(false));
         let state = Arc::new(
             ServerState::new(approvals, credential_store)
-                .with_session_root(session_root(runtime.as_ref())),
+                .with_session_root(session_root(runtime.as_ref()))
+                .with_shutdown(Arc::clone(&shutdown)),
         );
         let event_subscription = runtime.agent_event_bus().map(|bus| {
             let state = Arc::clone(&state);
@@ -96,7 +98,7 @@ impl RpcServer {
             listener,
             runtime,
             state,
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown,
             _event_subscription: event_subscription,
         })
     }
@@ -110,7 +112,7 @@ impl RpcServer {
     }
 
     pub fn serve(self) -> Result<(), RpcServerError> {
-        while !self.shutdown.load(Ordering::Relaxed) {
+        while !self.shutdown.load(Ordering::Acquire) {
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false)?;
@@ -155,6 +157,8 @@ struct ServerState {
     secret_store: Arc<dyn harness_models::CredentialStore>,
     /// Where sessions are written, reported by the Runtime settings screen.
     session_root: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    shutdown_responses: Mutex<HashSet<(u64, String)>>,
 }
 
 struct ActiveRun {
@@ -177,6 +181,8 @@ impl ServerState {
             client_terminals: Mutex::new(HashMap::new()),
             secret_store,
             session_root: PathBuf::from("."),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_responses: Mutex::new(HashSet::new()),
         }
     }
 
@@ -189,6 +195,25 @@ impl ServerState {
     fn with_session_root(mut self, session_root: PathBuf) -> Self {
         self.session_root = session_root;
         self
+    }
+
+    fn with_shutdown(mut self, shutdown: Arc<AtomicBool>) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    fn schedule_shutdown_response(&self, client_id: u64, response_id: String) {
+        self.shutdown_responses
+            .lock()
+            .expect("RPC shutdown lock poisoned")
+            .insert((client_id, response_id));
+    }
+
+    fn take_shutdown_response(&self, client_id: u64, response_id: &str) -> bool {
+        self.shutdown_responses
+            .lock()
+            .expect("RPC shutdown lock poisoned")
+            .remove(&(client_id, response_id.to_owned()))
     }
 
     /// Where the runtime persists sessions, reported by the Runtime screen.
@@ -635,10 +660,21 @@ fn write_messages(
     client_id: u64,
 ) {
     for message in receiver {
+        let response_id = match &message {
+            ServerMessage::Response(response) => response.id.clone(),
+            ServerMessage::Notification(_) => None,
+        };
         if serde_json::to_writer(&mut stream, &message).is_err()
             || stream.write_all(b"\n").is_err()
             || stream.flush().is_err()
         {
+            break;
+        }
+        if response_id
+            .as_deref()
+            .is_some_and(|id| state.take_shutdown_response(client_id, id))
+        {
+            state.shutdown.store(true, Ordering::Release);
             break;
         }
     }
@@ -664,12 +700,40 @@ fn dispatch(
         return error_response(request.id, "missing_id", "RPC requests require an id");
     }
     let result = match request.method.as_str() {
+        "health/check" => Ok(json!({
+            "status": "ready",
+            "protocolVersion": RPC_PROTOCOL_VERSION,
+            "runtimeVersion": env!("CARGO_PKG_VERSION"),
+            "instanceId": runtime.instance_id(),
+            "pid": std::process::id(),
+        })),
         "rpc.initialize" => Ok(json!({
             "version": RPC_PROTOCOL_VERSION,
             "server": "cogito-harness",
             "instanceId": runtime.instance_id(),
             "methods": METHODS,
         })),
+        "rpc.shutdown" => {
+            let requested_instance = request
+                .params
+                .get("instanceId")
+                .or_else(|| request.params.get("instance_id"))
+                .and_then(Value::as_str);
+            if requested_instance != Some(runtime.instance_id()) {
+                Err(RpcServerError::Runtime(
+                    "shutdown request did not match this runtime instance".to_owned(),
+                ))
+            } else {
+                state.schedule_shutdown_response(
+                    client_id,
+                    request
+                        .id
+                        .clone()
+                        .expect("request IDs are validated before dispatch"),
+                );
+                Ok(json!({"status": "shutting_down"}))
+            }
+        }
         "workspace.open" | "workspace.inspect" => workspace(runtime, &request.params),
         "config.inspect" => config_inspect(runtime, &request.params),
         "config.update" => config_update(runtime, &request.params),

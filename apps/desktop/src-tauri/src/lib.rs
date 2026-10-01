@@ -5,7 +5,8 @@ mod rpc_bridge {
     use std::thread;
 
     use harness_rpc::{
-        ConnectionStatus, RpcClientWriter, RuntimeConnector, RuntimeLaunchConfig, ServerMessage,
+        ConnectionStatus, ProcessRuntimeLauncher, RpcClientWriter, RuntimeConnector,
+        RuntimeLaunchConfig, ServerMessage,
     };
     use serde_json::Value;
     use tauri::State;
@@ -15,13 +16,25 @@ mod rpc_bridge {
         connector: RuntimeConnector,
     }
 
-    impl Default for RpcBridgeState {
-        fn default() -> Self {
+    impl RpcBridgeState {
+        pub fn new(connector: RuntimeConnector) -> Self {
             Self {
                 connections: Mutex::new(HashMap::new()),
-                connector: RuntimeConnector::default(),
+                connector,
             }
         }
+    }
+
+    pub fn connector_with_resources(resource_dir: Option<std::path::PathBuf>) -> RuntimeConnector {
+        let mut launcher = ProcessRuntimeLauncher::default();
+        if let Some(resource_dir) = resource_dir {
+            // Tauri places externalBin sidecars in the application resource
+            // tree; search both that root and the configured `binaries/` path.
+            launcher = launcher
+                .with_search_directory(resource_dir.clone())
+                .with_search_directory(resource_dir.join("binaries"));
+        }
+        RuntimeConnector::new(Arc::new(launcher))
     }
 
     struct Connection {
@@ -204,7 +217,14 @@ mod rpc_bridge {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(rpc_bridge::RpcBridgeState::default())
+        .setup(|app| {
+            use tauri::Manager;
+            let resource_dir = app.path().resource_dir().ok();
+            app.manage(rpc_bridge::RpcBridgeState::new(
+                rpc_bridge::connector_with_resources(resource_dir),
+            ));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             rpc_bridge::rpc_connect,
             rpc_bridge::rpc_request,

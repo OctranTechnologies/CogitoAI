@@ -1,9 +1,11 @@
-//! Shared runtime composition for embedded RPC clients.
+//! Shared runtime composition used by the standalone RPC process.
 //!
 //! The CLI and desktop shell both start the same RPC-backed runtime through
 //! [`RuntimeConnector`]. This module owns the server-side composition so the
 //! clients do not build agent runners themselves.
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,12 +23,14 @@ use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{EventBus, JsonlSessionStore, SessionStore};
 use harness_tools::{LocalProcessRunner, ToolRegistry};
 use harness_verification::CommandVerifier;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::metadata::{set_private_file_mode, RuntimeMetadataStore};
 use crate::{AgentRunnerFactory, ApprovalBroker, RpcApprovalHandler, RpcServer, Runtime};
 
 /// Options used when a client needs to bring up a local runtime.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RuntimeLaunchConfig {
     pub address: SocketAddr,
     /// The expected instance identity is set by `RuntimeConnector` before the
@@ -62,15 +66,24 @@ impl RuntimeLaunchConfig {
 /// Starts a local RPC server for the supplied runtime configuration.
 pub trait RuntimeLauncher: Send + Sync {
     fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<RuntimeLaunchInfo, String>;
+
+    /// Called after readiness succeeds so a process launcher can relinquish
+    /// its startup handle without stopping the persistent runtime.
+    fn startup_succeeded(&self, _instance_id: &str) {}
+
+    /// Stops only a process launched by this client when it failed readiness.
+    fn startup_failed(&self, _instance_id: &str) {}
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeLaunchInfo {
     pub endpoint: SocketAddr,
     pub instance_id: String,
+    pub pid: u32,
+    pub runtime_version: String,
 }
 
-/// Default launcher shared by the CLI and desktop application.
+/// In-process launcher retained for runtime unit tests and local harnesses.
 #[derive(Default)]
 pub struct EmbeddedRuntimeLauncher;
 
@@ -91,8 +104,62 @@ impl RuntimeLauncher for EmbeddedRuntimeLauncher {
         Ok(RuntimeLaunchInfo {
             endpoint,
             instance_id,
+            pid: std::process::id(),
+            runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
         })
     }
+}
+
+/// Entry point used by the detached runtime binary. The private readiness file
+/// avoids inheriting a long-lived stdout pipe into client process trees.
+pub fn serve_runtime_process(config: RuntimeLaunchConfig) -> Result<(), String> {
+    let approvals = Arc::new(ApprovalBroker::new());
+    let runtime = build_runtime(&config, Arc::clone(&approvals))?;
+    let instance_id = runtime.instance_id().to_owned();
+    let server = RpcServer::bind_with_approvals(config.address, runtime, approvals)
+        .map_err(|error| error.to_string())?;
+    let launch = RuntimeLaunchInfo {
+        endpoint: server.local_addr().map_err(|error| error.to_string())?,
+        instance_id,
+        pid: std::process::id(),
+        runtime_version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    let ready_path = std::env::var_os("COGITO_RUNTIME_READY_FILE")
+        .map(PathBuf::from)
+        .ok_or_else(|| "runtime readiness file path is not configured".to_owned())?;
+    write_runtime_readiness(&ready_path, &launch)?;
+    server.serve().map_err(|error| error.to_string())
+}
+
+fn write_runtime_readiness(
+    path: &std::path::Path,
+    launch: &RuntimeLaunchInfo,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "runtime readiness path has no parent directory".to_owned())?;
+    RuntimeMetadataStore::new(parent)
+        .ensure_private_directory()
+        .map_err(|error| format!("could not prepare runtime readiness directory: {error}"))?;
+    let temporary = path.with_extension("ready.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    set_private_file_mode(&mut options);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("could not create runtime readiness file: {error}"))?;
+    let payload = serde_json::to_vec(launch).map_err(|error| error.to_string())?;
+    if let Err(error) = file.write_all(&payload).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("could not write runtime readiness file: {error}"));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("could not publish runtime readiness file: {error}"));
+    }
+    Ok(())
 }
 
 struct UnavailableAgent;

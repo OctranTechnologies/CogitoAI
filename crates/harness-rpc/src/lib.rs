@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod client;
 pub mod host;
 pub mod metadata;
+pub mod process;
 pub mod protocol;
 pub mod server;
 pub mod settings;
@@ -12,8 +13,12 @@ pub use harness_pty::{
     ExitReason, PtyError, PtyInfo, PtyManager, PtyRequest, SessionOrigin, TerminalEvent,
     TerminalSink,
 };
-pub use host::{EmbeddedRuntimeLauncher, RuntimeLaunchConfig, RuntimeLaunchInfo, RuntimeLauncher};
+pub use host::{
+    serve_runtime_process, EmbeddedRuntimeLauncher, RuntimeLaunchConfig, RuntimeLaunchInfo,
+    RuntimeLauncher,
+};
 pub use metadata::{default_runtime_directory, RuntimeMetadata, RuntimeMetadataStore};
+pub use process::ProcessRuntimeLauncher;
 pub use protocol::{
     RpcError, RpcNotification, RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION,
 };

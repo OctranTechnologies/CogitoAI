@@ -25,7 +25,7 @@ use harness_models::{
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_rpc::{
-    EmbeddedRuntimeLauncher, RpcResponse, RuntimeConnector, RuntimeLaunchConfig, ServerMessage,
+    ProcessRuntimeLauncher, RpcResponse, RuntimeConnector, RuntimeLaunchConfig, ServerMessage,
 };
 use harness_session::{
     EventId, EventPayload, HarnessEvent, JsonlSessionStore, Session, SessionStore,
@@ -318,7 +318,17 @@ enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
     Tui,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum RuntimeCommand {
+    /// Stop the persistent per-user runtime cleanly.
+    Shutdown,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -417,6 +427,7 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::Session { command }) => session_command(cli, command),
         Some(Command::Auth { command }) => auth_command(cli, command),
+        Some(Command::Runtime { command }) => runtime_command(cli, command),
         Some(Command::Tui) => interactive(cli),
         None => {
             if cli.json {
@@ -1577,7 +1588,7 @@ fn run_agent_with_ui(
     launch.compaction_threshold_tokens = cli.compaction_threshold;
     launch.mock_responses = mock_runtime_responses(&model_config)?;
     launch.apply_saved_preferences = false;
-    let connector = RuntimeConnector::new(Arc::new(EmbeddedRuntimeLauncher));
+    let connector = RuntimeConnector::new(Arc::new(ProcessRuntimeLauncher::default()));
     let mut client = connector.connect_or_start(&launch)?;
 
     let runtime_settings = rpc_result(client.request("settings.inspect", json!({}))?)?;
@@ -1788,6 +1799,34 @@ fn cli_rpc_address(cli: &Cli, workspace: &Path) -> Result<SocketAddr, Box<dyn st
         workspace,
         cli.rpc_address.as_deref(),
     )?)
+}
+
+fn runtime_command(cli: &Cli, command: &RuntimeCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        RuntimeCommand::Shutdown => {
+            let workspace = std::fs::canonicalize(&cli.workspace)?;
+            let address = cli_rpc_address(cli, &workspace)?;
+            let connector = RuntimeConnector::new(Arc::new(ProcessRuntimeLauncher::default()));
+            let mut client =
+                connector.connect_existing(&RuntimeLaunchConfig::new(address, &workspace))?;
+            let health = rpc_result(client.request("health/check", json!({}))?)?;
+            let instance_id = health
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .ok_or("runtime health response did not include an instance ID")?;
+            let result =
+                rpc_result(client.request("rpc.shutdown", json!({"instanceId": instance_id}))?)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({"type":"runtime","result":result,"instanceId":instance_id})
+                );
+            } else {
+                println!("Harness runtime shutdown requested ({instance_id}).");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn auth_command(cli: &Cli, command: &AuthCommand) -> Result<(), Box<dyn std::error::Error>> {

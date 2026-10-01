@@ -1876,6 +1876,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml 0.8.2",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
