@@ -1758,6 +1758,7 @@ dependencies = [
  "harness-git",
  "harness-models",
  "harness-policy",
+ "harness-rpc",
  "harness-session",
  "harness-tools",
  "harness-verification",

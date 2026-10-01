@@ -13,6 +13,7 @@ harness-core.workspace = true
 harness-git.workspace = true
 harness-models.workspace = true
 harness-policy.workspace = true
+harness-rpc.workspace = true
 harness-session.workspace = true
 harness-tools.workspace = true
 harness-verification.workspace = true

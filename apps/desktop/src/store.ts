@@ -301,7 +301,7 @@ export const useDesktopStore = create<DesktopStore>()(
   persist(
     (set, get) => ({
       status: "unavailable",
-      address: "127.0.0.1:4545",
+      address: "auto",
       clientId: null,
       workspacePath: "",
       workspace: null,
@@ -345,7 +345,7 @@ export const useDesktopStore = create<DesktopStore>()(
         if (get().clientId) await get().disconnect();
         set({ status: "connecting", address, workspacePath, lastError: null, isLoadingWorkspace: true, modelCatalog: null });
         try {
-          const clientId = await connectRuntime(address);
+          const clientId = await connectRuntime(address, workspacePath);
           set({ clientId });
           expectResult(await requestRuntime(clientId, "rpc.initialize"));
           const workspace = await requestRuntime<WorkspaceSummary>(clientId, "workspace.open", { path: workspacePath });

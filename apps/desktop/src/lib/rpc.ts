@@ -136,9 +136,9 @@ export class RpcTransportError extends Error {
   }
 }
 
-export async function connectRuntime(address: string): Promise<string> {
+export async function connectRuntime(address: string, workspacePath: string): Promise<string> {
   try {
-    return await invoke<string>("rpc_connect", { address });
+    return await invoke<string>("rpc_connect", { address, workspacePath });
   } catch (error) {
     throw new RpcTransportError(String(error), "runtime_unavailable");
   }

@@ -54,7 +54,7 @@ import {
 
 
 function App() {
-  const [address, setAddress] = useState("127.0.0.1:4545");
+  const [address, setAddress] = useState("auto");
   // The inspector is closed by default so the conversation keeps the full
   // width; it is opened deliberately when detail is wanted.
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -592,7 +592,7 @@ function WorkspaceTopBar({
           className="min-w-0 flex-1 bg-transparent py-1.5 font-mono text-xs text-secondary outline-none placeholder:text-faint"
           value={address}
           onChange={(event) => onAddressChange(event.target.value)}
-          placeholder="127.0.0.1:4545"
+          placeholder="auto (workspace-specific) or 127.0.0.1:4545"
         />
         <StatusIndicator status={status} />
       </div>

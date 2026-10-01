@@ -72,7 +72,7 @@ export function LandingView({
     <ComposerNotice
       tone="warning"
       title="No runtime connected."
-      detail="Start cogito-rpc-dev, then enter its address in the bar above."
+      detail="Choose a workspace and connect. Harness will start its local runtime if needed."
     />
   ) : null;
 

@@ -22,6 +22,7 @@ fn execute(
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace.as_ref(),
+        cancellation: None,
         event_bus: None,
         session_id: None,
         correlation_id: None,
@@ -204,6 +205,7 @@ fn records_tool_arguments_as_the_model_wrote_them() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
         correlation_id: None,
@@ -246,6 +248,7 @@ fn records_non_string_tool_arguments_as_json() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
         correlation_id: None,
@@ -283,6 +286,7 @@ fn emits_tool_lifecycle_events_through_the_common_registry() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
         correlation_id: Some(&Id::new("correlation-1").unwrap()),
@@ -323,6 +327,7 @@ fn emits_file_change_lifecycle_events() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
         correlation_id: None,
@@ -364,6 +369,7 @@ fn emits_denied_event_without_executing_a_tool() {
     let context = ToolContext {
         policy: &DenyAllPolicy,
         working_directory: workspace,
+        cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
         correlation_id: None,
@@ -406,6 +412,7 @@ fn safe_mode_asks_before_mutation_and_auto_mode_denies_secret_paths() {
     let context = ToolContext {
         policy: &safe,
         working_directory: workspace,
+        cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
         correlation_id: None,
@@ -428,6 +435,7 @@ fn safe_mode_asks_before_mutation_and_auto_mode_denies_secret_paths() {
     let context = ToolContext {
         policy: &auto,
         working_directory: workspace,
+        cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
         correlation_id: None,
@@ -448,6 +456,7 @@ fn every_mutable_tool_is_checked_by_policy() {
     let context = ToolContext {
         policy: &DenyAllPolicy,
         working_directory: workspace,
+        cancellation: None,
         event_bus: None,
         session_id: None,
         correlation_id: None,

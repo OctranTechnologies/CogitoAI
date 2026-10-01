@@ -42,12 +42,11 @@ timeout and an output cap, and a cancelled or failed run still closes its sessio
 cleanly. The same task produces the same event stream whether a person or a script
 is watching.
 
-**CLI and desktop over one runtime.** Both clients drive the same agent core, the
-same policy engine, and the same session store. The CLI composes them in-process;
-the desktop reaches them across a versioned JSONL RPC protocol. Neither client
-contains agent logic, so a capability added to the runtime is available to both,
-and the desktop cannot obtain a privileged capability the CLI could not, because
-`harness-rpc` is the only thing the shell links.
+**CLI and desktop over one runtime.** Both clients use the shared loopback RPC
+bootstrap for agent runs and drive the same agent core, policy engine, and session
+store. They reuse a healthy runtime or start the embedded RPC server when none is
+available. Neither client contains the agent loop, and a startup lock prevents
+simultaneous clients from launching duplicate servers on one endpoint.
 
 **Event-sourced sessions.** A session is a JSONL file with one schema-versioned
 event per line. Nothing is mutated in place: tool calls, approvals, verification
@@ -65,19 +64,20 @@ with your dirty working tree rather than requiring a clean one.
 ## Architecture
 
 ```text
-        CLI (harness-cli) ──────────────┐
-                                       ├── agent core (harness-agent)
-        Desktop (Tauri/React) ── RPC ──┘        │
-        (harness-rpc, versioned JSONL           │
-         over loopback TCP)                     ▼
+        CLI (harness-cli) ──────┐
+                                ├── RPC runtime (harness-rpc)
+        Desktop (Tauri/React) ──┘     │
+          versioned JSONL over       ▼
+          loopback TCP        agent core (harness-agent)
+                                      │
                               ┌──────────────────────────────┐
                               │ tools · policy · models ·    │
                               │ session · git · context ·    │
                               │ pty · verification · core    │
                               └──────────────────────────────┘
 
-   The CLI composes these crates in-process; the desktop reaches them only
-   through the RPC runtime. Neither client contains agent logic.
+   Both clients use the same connector and RPC runtime for agent runs. If the
+   endpoint is down, the client starts the server in its local backend process.
 ```
 
 Both clients are untrusted with respect to privileged operations. A client may
@@ -285,14 +285,15 @@ The runtime provides `credentials.list`, `credentials.validate`,
 RPC method for reading a stored secret.
 
 Environment variables are an alternative to connecting in the desktop settings;
-they are useful for headless runtime launches and always take precedence over an
-OS-stored key. To start a runtime with an environment-managed Anthropic key:
+they are useful for headless launches and always take precedence over an
+OS-stored key. Set the values before starting the CLI or desktop application. The
+desktop starts its local runtime after you select a workspace and connect.
 
 ```powershell
 $env:ANTHROPIC_API_KEY = "<your-key>"
 $env:COGITO_MODEL_PROVIDER = "anthropic"
 $env:COGITO_MODEL = "claude-sonnet-4-6"
-cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
 For Gemini, set its runtime environment and start the same local RPC process:
@@ -301,7 +302,7 @@ For Gemini, set its runtime environment and start the same local RPC process:
 $env:GEMINI_API_KEY = "<your-key>"
 $env:COGITO_MODEL_PROVIDER = "gemini"
 $env:COGITO_MODEL = "gemini-3.8-flash"
-cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
 For OpenCode Zen or Go, set the shared key and the corresponding provider and
@@ -311,12 +312,12 @@ namespaced model before starting the runtime:
 $env:OPENCODE_API_KEY = "<your-key>"
 $env:COGITO_MODEL_PROVIDER = "opencode-zen" # use opencode-go for a Go subscription
 $env:COGITO_MODEL = "opencode-zen/gpt-5.6-sol" # choose an ID from the model picker
-cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
-Then start the desktop in another terminal using the [desktop development
-instructions](apps/desktop/README.md#development). API keys are never sent to
-the desktop client.
+For desktop use, start the app with the environment configured and connect to a
+workspace; it starts the RPC runtime automatically. API keys stay in the local
+runtime process and are never sent to the frontend.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
@@ -325,6 +326,7 @@ the desktop client.
 | `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | Provider-specific; both OpenCode services use `OPENCODE_API_KEY` |
 | `COGITO_MODEL_BASE_URL` | Provider API root; OpenCode defaults differ for Zen and Go, discovery uses `/models` | Provider API root |
 | `COGITO_MOCK_REPAIR` | Mock-only test hook; see [Testing the repair loop](#testing-the-repair-loop) | unset |
+| `COGITO_RPC_ADDRESS` | Loopback RPC endpoint used by CLI agent runs when `--rpc-address` is not supplied | workspace-derived endpoint |
 | `RUST_LOG` | Runtime log level for the RPC runtime | `info` |
 
 The key is read from the environment only. It is never returned by the settings
@@ -546,10 +548,15 @@ cargo run -p harness-cli -- inspect --json
 ```
 
 Global options: `--workspace` (default `.`), `--session-root` (default
-`.cogito/sessions`), `--model-provider`, `--model`, `--json`, `--yes`,
-`--log-level`, `--compaction-threshold`. Agent runs are interruptible with
+`.cogito/sessions`), `--model-provider`, `--model`, `--rpc-address`, `--json`,
+`--yes`, `--log-level`, `--compaction-threshold`. Agent runs are interruptible with
 `Ctrl+C`; the cancellation token is shared with tool execution and verification
 commands.
+
+Agent runs discover a loopback runtime automatically. The CLI chooses a stable
+workspace-specific endpoint by default; set `--rpc-address` or
+`COGITO_RPC_ADDRESS` to reuse a particular runtime. A connected runtime must
+already serve the requested workspace and use the same session root.
 
 `--yes` auto-approves policy prompts. Use it only in a disposable workspace or in
 CI.
@@ -607,17 +614,7 @@ Prerequisites are Rust 1.78+, Node.js 20+, pnpm 10+, and the Tauri 2 platform
 dependencies: WebView2 on Windows, Xcode command-line tools on macOS, or
 WebKitGTK development packages on Linux.
 
-The desktop is a client: it does not start or own the runtime, so run the
-development runtime first. In one terminal, from the repository root:
-
-```bash
-cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
-```
-
-The first argument is the workspace to open and the second is the listen address;
-both have defaults, so `cargo run -p harness-rpc --bin cogito-rpc-dev` alone is
-equivalent to the line above. Sessions and checkpoints for that workspace are
-written under its `.cogito/` directory. In a second terminal:
+Start the desktop shell from `apps/desktop`:
 
 ```bash
 cd apps/desktop
@@ -625,11 +622,14 @@ pnpm install
 pnpm tauri dev
 ```
 
-`pnpm tauri dev` starts the Vite dev server itself and compiles the Rust shell. In
-the app, enter the runtime address and a repository path, then select Connect.
-The v0 client connects to one local runtime at a time; the runtime and desktop
-communicate over an unauthenticated loopback RPC endpoint. Keep that endpoint on
-the local machine.
+`pnpm tauri dev` starts the Vite dev server and compiles the Rust shell. In the
+app, enter a repository path and select Connect. The default `auto` endpoint
+selects the same stable workspace-specific loopback address as the CLI. The
+desktop reuses a healthy Harness runtime or starts one in its local backend
+process. Enter a fixed address such as `127.0.0.1:4545` to connect to a manually
+managed endpoint. The server is tied to its startup workspace; select a workspace
+inside that root or choose another endpoint for a different runtime. RPC has no
+authentication, so keep it on the local machine.
 
 The desktop command palette opens with `Ctrl+K` or `Ctrl+Shift+P` (use `Cmd` on
 macOS). It can create a task, open a project, resume a session, switch model or

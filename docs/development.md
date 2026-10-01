@@ -24,8 +24,8 @@ the crates above it in this table and never the reverse.
 | `harness-verification` | `VerificationPlan`, `VerificationStep`, `VerificationReport`, `Verifier` trait, `CommandVerifier` | `harness-core`, `harness-session`, `harness-tools` |
 | `harness-pty` | `PtyManager`, human terminal sessions over `portable-pty` | `harness-core` |
 | `harness-agent` | `AgentRunner`, `AgentTask`, `AgentOutcome`, `ApprovalHandler`, `AgentLimits`, the tool-calling loop, checkpointing, verification feedback | most of the above |
-| `harness-rpc` | `Runtime`, `RpcServer`, `ApprovalBroker`, `AgentRunnerFactory`, protocol types, `settings` module, `cogito-rpc-dev` binary | `harness-agent` and the rest |
-| `harness-cli` | The `harness-cli` binary: a thin client over the same capabilities | `harness-agent` and the rest |
+| `harness-rpc` | `Runtime`, `RpcServer`, `RuntimeConnector`, embedded runtime composition, `ApprovalBroker`, `AgentRunnerFactory`, protocol types, `settings` module, `cogito-rpc-dev` binary | `harness-agent` and the rest |
+| `harness-cli` | The `harness-cli` binary: RPC client for agent runs plus focused command helpers | `harness-agent` and the rest |
 
 Non-crate directories:
 

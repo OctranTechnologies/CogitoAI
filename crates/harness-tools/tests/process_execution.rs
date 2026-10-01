@@ -5,8 +5,8 @@ use std::time::Duration;
 use harness_policy::{AllowAllPolicy, DenyAllPolicy};
 use harness_session::{EventBus, EventType};
 use harness_tools::{
-    CancellationToken, LocalProcessRunner, ProcessEvent, ProcessRequest, ProcessRunner, ShellTool,
-    Tool, ToolContext, ToolRegistry, ToolRequest,
+    CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
+    ProcessResult, ProcessRunner, ShellTool, Tool, ToolContext, ToolRegistry, ToolRequest,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -43,6 +43,7 @@ fn shell_context<'a>(
     ToolContext {
         policy,
         working_directory: workspace,
+        cancellation: None,
         event_bus: None,
         session_id: None,
         correlation_id: None,
@@ -167,6 +168,70 @@ fn cancellation_stops_a_running_process_and_returns_control() {
 }
 
 #[test]
+fn agent_run_cancellation_from_tool_context_interrupts_a_reused_registry() {
+    let temporary = tempdir().unwrap();
+    let cancellation = CancellationToken::new();
+    let cancel = cancellation.clone();
+    let workspace = temporary.path().to_path_buf();
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ShellTool::new(
+        Arc::new(ContextCancellationRunner),
+        CancellationToken::new(),
+    )));
+    let handle = thread::spawn(move || {
+        let policy = AllowAllPolicy;
+        let context = ToolContext {
+            policy: &policy,
+            working_directory: &workspace,
+            cancellation: Some(&cancellation),
+            event_bus: None,
+            session_id: None,
+            correlation_id: None,
+        };
+        registry.execute(
+            &context,
+            request("shell", json!({ "command": "sleep for cancellation" })),
+        )
+    });
+    thread::sleep(Duration::from_millis(150));
+    cancel.cancel();
+    let result = handle.join().unwrap().unwrap();
+
+    assert_eq!(result.metadata["cancelled"], true);
+    assert!(result.metadata["duration_ms"].as_u64().unwrap() < 5_000);
+}
+
+struct ContextCancellationRunner;
+
+impl ProcessRunner for ContextCancellationRunner {
+    fn execute(
+        &self,
+        _request: ProcessRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProcessEvent) -> Result<(), ProcessError>,
+    ) -> Result<ProcessResult, ProcessError> {
+        on_event(ProcessEvent::Started { pid: None })?;
+        let started = std::time::Instant::now();
+        while !cancellation.is_cancelled() && started.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let result = ProcessResult {
+            exit_code: None,
+            success: false,
+            timed_out: false,
+            cancelled: cancellation.is_cancelled(),
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+        on_event(ProcessEvent::Exited {
+            result: result.clone(),
+        })?;
+        Ok(result)
+    }
+}
+
+#[test]
 fn invalid_working_directory_and_denied_shell_are_rejected() {
     let temporary = tempdir().unwrap();
     let registry = ToolRegistry::with_workspace_tools();
@@ -206,6 +271,7 @@ fn process_events_are_emitted_alongside_tool_events() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: temporary.path(),
+        cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
         correlation_id: None,

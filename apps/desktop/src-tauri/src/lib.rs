@@ -1,16 +1,27 @@
 mod rpc_bridge {
     use std::collections::{HashMap, VecDeque};
-    use std::net::SocketAddr;
+    use std::path::Path;
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
 
-    use harness_rpc::{RpcClient, RpcClientWriter, ServerMessage};
+    use harness_rpc::{
+        ConnectionStatus, RpcClientWriter, RuntimeConnector, RuntimeLaunchConfig, ServerMessage,
+    };
     use serde_json::Value;
     use tauri::State;
 
-    #[derive(Default)]
     pub struct RpcBridgeState {
         connections: Mutex<HashMap<String, Connection>>,
+        connector: RuntimeConnector,
+    }
+
+    impl Default for RpcBridgeState {
+        fn default() -> Self {
+            Self {
+                connections: Mutex::new(HashMap::new()),
+                connector: RuntimeConnector::default(),
+            }
+        }
     }
 
     struct Connection {
@@ -88,11 +99,16 @@ mod rpc_bridge {
     pub fn rpc_connect(
         state: State<'_, RpcBridgeState>,
         address: String,
+        workspace_path: String,
     ) -> Result<String, String> {
-        let address = address
-            .parse::<SocketAddr>()
-            .map_err(|error| format!("invalid runtime address: {error}"))?;
-        let client = RpcClient::connect(address).map_err(|error| error.to_string())?;
+        let address =
+            RuntimeConnector::resolve_endpoint(Path::new(&workspace_path), Some(&address))
+                .map_err(|error| error.to_string())?;
+        let config = RuntimeLaunchConfig::new(address, workspace_path);
+        let client = state
+            .connector
+            .connect_or_start(&config)
+            .map_err(|error| error.to_string())?;
         let (reader, writer) = client.split();
         let inbox = Inbox::new();
         let reader_inbox = Arc::clone(&inbox);
@@ -105,7 +121,7 @@ mod rpc_bridge {
                 }
             }
         });
-        let id = format!("rpc-{}", address.port());
+        let id = format!("rpc-{address}");
         state
             .connections
             .lock()
@@ -172,7 +188,16 @@ mod rpc_bridge {
             connection.writer.shutdown();
             connection.inbox.close();
         }
+        state
+            .connector
+            .disconnect()
+            .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    #[tauri::command]
+    pub fn rpc_connection_status(state: State<'_, RpcBridgeState>) -> ConnectionStatus {
+        state.connector.status()
     }
 }
 
@@ -184,7 +209,8 @@ pub fn run() {
             rpc_bridge::rpc_connect,
             rpc_bridge::rpc_request,
             rpc_bridge::rpc_receive,
-            rpc_bridge::rpc_disconnect
+            rpc_bridge::rpc_disconnect,
+            rpc_bridge::rpc_connection_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running CogitoAI desktop application");

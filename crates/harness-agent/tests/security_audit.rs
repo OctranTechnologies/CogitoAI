@@ -63,6 +63,7 @@ fn attempt(
     let context = ToolContext {
         policy: &policy,
         working_directory: root,
+        cancellation: None,
         event_bus: None,
         session_id: None,
         correlation_id: None,

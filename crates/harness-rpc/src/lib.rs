@@ -1,13 +1,17 @@
+pub mod bootstrap;
 pub mod client;
+pub mod host;
 pub mod protocol;
 pub mod server;
 pub mod settings;
 
+pub use bootstrap::{ConnectionState, ConnectionStatus, RuntimeConnectError, RuntimeConnector};
 pub use client::{RpcClient, RpcClientError, RpcClientReader, RpcClientWriter};
 pub use harness_pty::{
     ExitReason, PtyError, PtyInfo, PtyManager, PtyRequest, SessionOrigin, TerminalEvent,
     TerminalSink,
 };
+pub use host::{EmbeddedRuntimeLauncher, RuntimeLaunchConfig, RuntimeLauncher};
 pub use protocol::{
     RpcError, RpcNotification, RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION,
 };
@@ -55,6 +59,7 @@ pub struct Runtime {
     /// take effect without restarting the process.
     runner_factory: RwLock<Option<Arc<dyn AgentRunnerFactory>>>,
     workspace_root: Option<PathBuf>,
+    session_root: Option<PathBuf>,
     /// Human-operated terminals.
     ///
     /// These are deliberately separate from `tools`: the agent reaches shell
@@ -111,6 +116,7 @@ impl Runtime {
             agent_runner: RwLock::new(None),
             runner_factory: RwLock::new(None),
             workspace_root: None,
+            session_root: None,
             // Retargeted by `with_workspace_root`; the placeholder root is
             // replaced before any terminal can be opened.
             ptys: Arc::new(Mutex::new(PtyManager::new("."))),
@@ -195,6 +201,16 @@ impl Runtime {
             .set_cache_path(workspace_root.join(".cogito/model-catalog.json"));
         self.workspace_root = Some(workspace_root);
         self
+    }
+
+    /// Overrides the durable session directory reported to RPC clients.
+    pub fn with_session_root(mut self, session_root: PathBuf) -> Self {
+        self.session_root = Some(session_root);
+        self
+    }
+
+    pub fn session_root(&self) -> Option<&std::path::Path> {
+        self.session_root.as_deref()
     }
 
     /// Shared model catalog. Clients request list/refresh through RPC; they
@@ -347,6 +363,7 @@ impl Runtime {
         let context = ToolContext {
             policy: policy.as_ref(),
             working_directory,
+            cancellation: None,
             event_bus: None,
             session_id: None,
             correlation_id: None,

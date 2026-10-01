@@ -21,13 +21,7 @@ The terminal panel has the extra requirements listed under
 
 ## Development
 
-Start a local development RPC runtime from the repository root:
-
-```text
-cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
-```
-
-Then start the desktop shell:
+Start the desktop shell:
 
 ```text
 cd apps/desktop
@@ -35,8 +29,12 @@ pnpm install
 pnpm tauri dev
 ```
 
-Enter the runtime address and workspace path in the shell, then select
-Connect. The conversation panel shows prompts, streamed assistant output, and
+Enter a workspace path in the shell and select Connect. The default `auto`
+endpoint selects a stable loopback address for that workspace; Tauri reuses a
+healthy Harness runtime there or starts one in the desktop backend process. You
+can enter a fixed address such as `127.0.0.1:4545` to connect to a manually
+managed endpoint. No separate RPC server command is normally needed. The
+conversation panel shows prompts, streamed assistant output, and
 run phase. The context panel shows expandable tool cards, verification results,
 a checkpoint timeline, and a chronological session timeline. Approval requests
 are explicitly allow-once or deny-once; no permanent policy change is inferred
@@ -137,18 +135,19 @@ API keys are read from the runtime process environment and are never sent to the
 desktop. The Models screen shows only whether a credential is configured and
 which environment variable holds it; the value is never displayed, editable, or
 logged. The runtime keeps no key in its configuration and does not implement any
-home-grown encryption. To run against Anthropic, set the key and model on the
-runtime process before starting it, then connect the desktop shell as usual:
+home-grown encryption. You can enter a key in **Settings → Models → Provider
+connections**, or start the desktop process with a provider key in its environment.
+For Anthropic, for example:
 
 ```powershell
 $env:ANTHROPIC_API_KEY = "<your-key>"
 $env:COGITO_MODEL_PROVIDER = "anthropic"
 $env:COGITO_MODEL = "claude-sonnet-4-6"
-cargo run -p harness-rpc --bin cogito-rpc-dev -- . 127.0.0.1:4545
+pnpm tauri dev
 ```
 
-For OpenAI, use `OPENAI_API_KEY` and `COGITO_MODEL_PROVIDER=openai`. Start the
-desktop from a second terminal with the commands under [Development](#development).
+For OpenAI, use `OPENAI_API_KEY` and `COGITO_MODEL_PROVIDER=openai` before
+launching the app.
 The runtime defaults Anthropic requests to `https://api.anthropic.com/v1` and
 reads `ANTHROPIC_API_KEY`; `COGITO_MODEL_BASE_URL` and
 `COGITO_MODEL_API_KEY_ENV` override those defaults.

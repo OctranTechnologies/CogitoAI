@@ -49,6 +49,14 @@ pub struct VerificationReport {
 
 pub trait Verifier: Send + Sync {
     fn verify(&self, request: &VerificationRequest) -> Result<Vec<VerificationReport>, Error>;
+
+    fn verify_cancellable(
+        &self,
+        request: &VerificationRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<Vec<VerificationReport>, Error> {
+        self.verify(request)
+    }
 }
 
 #[derive(Clone)]
@@ -80,6 +88,24 @@ impl CommandVerifier {
 
 impl Verifier for CommandVerifier {
     fn verify(&self, request: &VerificationRequest) -> Result<Vec<VerificationReport>, Error> {
+        self.verify_with_cancellation(request, &self.cancellation)
+    }
+
+    fn verify_cancellable(
+        &self,
+        request: &VerificationRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<VerificationReport>, Error> {
+        self.verify_with_cancellation(request, cancellation)
+    }
+}
+
+impl CommandVerifier {
+    fn verify_with_cancellation(
+        &self,
+        request: &VerificationRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<VerificationReport>, Error> {
         let mut reports = Vec::new();
         for step in &request.plan.steps {
             let started_at = Instant::now();
@@ -94,21 +120,17 @@ impl Verifier for CommandVerifier {
             let mut stderr = String::new();
             let result = self
                 .runner
-                .execute(
-                    process_request,
-                    &self.cancellation,
-                    &mut |event| match event {
-                        ProcessEvent::Stdout { chunk } => {
-                            append_bounded(&mut stdout, &chunk, self.max_output_bytes);
-                            Ok(())
-                        }
-                        ProcessEvent::Stderr { chunk } => {
-                            append_bounded(&mut stderr, &chunk, self.max_output_bytes);
-                            Ok(())
-                        }
-                        ProcessEvent::Started { .. } | ProcessEvent::Exited { .. } => Ok(()),
-                    },
-                )
+                .execute(process_request, cancellation, &mut |event| match event {
+                    ProcessEvent::Stdout { chunk } => {
+                        append_bounded(&mut stdout, &chunk, self.max_output_bytes);
+                        Ok(())
+                    }
+                    ProcessEvent::Stderr { chunk } => {
+                        append_bounded(&mut stderr, &chunk, self.max_output_bytes);
+                        Ok(())
+                    }
+                    ProcessEvent::Started { .. } | ProcessEvent::Exited { .. } => Ok(()),
+                })
                 .map_err(|error| Error::Verification {
                     message: error.to_string(),
                 })?;

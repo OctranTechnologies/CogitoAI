@@ -43,18 +43,19 @@ provider implementation.
                              | the agent loop   |
                              +-----------------+
                                       ^
-                    +-----------------+------------------+
-                    |                                    |
-            +-------+--------+                  +--------+--------+
-            | harness-rpc    |                  | harness-cli      |
-            | runtime + RPC  |                  | CLI client       |
-            +-------+--------+                  +-----------------+
-                    ^
-                    |
-          +---------+---------+
-          | cogitoai-desktop  |
-          | Tauri shell       |
-          +-------------------+
+                                      |
+            +------------------------+
+            | harness-rpc            |
+            | runtime + RPC +        |
+            | RuntimeConnector       |
+            +-----------+------------+
+                        ^
+              +---------+---------+
+              |                   |
+      +-------+--------+   +------+-----------+
+      | harness-cli    |   | cogitoai-desktop |
+      | CLI client     |   | Tauri shell      |
+      +----------------+   +------------------+
 ```
 
 The manifest graph is slightly wider than this conceptual picture, and
@@ -63,10 +64,21 @@ The manifest graph is slightly wider than this conceptual picture, and
 below the line depends on anything above it.
 
 `harness-rpc` is the composition root for capability crates and owns the versioned
-loopback JSON-lines transport. `harness-cli` is a presentation client that composes
-the same runtime services in-process for its single-process commands. The Tauri
-shell links only `harness-rpc`, so it cannot reach a tool, provider, or policy
-implementation except through the runtime boundary.
+loopback JSON-lines transport. Its `RuntimeConnector` handles endpoint discovery,
+health checks, cross-process startup locking, embedded server startup, readiness,
+reconnection, and connection state. The CLI routes agent runs through that shared
+RPC runtime; its inspection and configuration commands retain their focused CLI
+helpers. The Tauri shell links only `harness-rpc`, so it cannot reach a tool,
+provider, or policy implementation except through the runtime boundary.
+
+When either client connects, it first checks that the endpoint is a healthy
+Harness RPC server and that the requested workspace is inside the server's open
+workspace. If none is available, the connector serializes startup on a per-
+endpoint lock, checks again, then builds the runtime and runs `RpcServer` on a
+background thread in the local backend process. A healthy runtime is reused;
+agent and tool execution remain inside `harness-rpc`/`harness-agent` in either
+case. Dropping a client closes its socket but leaves the local runtime available
+for the rest of that client process.
 
 ## Crate responsibilities
 
@@ -82,8 +94,8 @@ implementation except through the runtime boundary.
 | `harness-verification` | Test, lint, and typecheck verification contracts | Agent orchestration |
 | `harness-pty` | Human terminal sessions over a native pseudo-terminal | Any `Tool` implementation, so the agent cannot reach it |
 | `harness-agent` | The agent loop, approvals, checkpoint recording, verification feedback | Transport, UI concerns |
-| `harness-rpc` | Runtime composition and the client-facing runtime boundary | UI code or direct UI access to privileged implementations |
-| `harness-cli` | Command-line parsing and client presentation | Direct filesystem, shell, Git, or provider implementations |
+| `harness-rpc` | Runtime composition, connector lifecycle, and client-facing RPC boundary | UI code or direct UI access to privileged implementations |
+| `harness-cli` | Command-line parsing, RPC client presentation, and focused read/config commands | The agent loop and direct shell execution for agent tasks |
 
 ## Model provider boundary
 
@@ -179,9 +191,9 @@ authentication or encryption; hosts must not bind it to a public interface.
 
 The desktop shell is under `apps/desktop`. It is implemented with Tauri 2,
 React, TypeScript, Vite, Tailwind, and Zustand. Its Tauri commands own only
-RPC connection plumbing; they do not implement agent logic. The shell connects
-to a running loopback runtime, and session durability remains in the Rust
-JSONL store.
+RPC connection plumbing; they do not implement agent logic. The shell uses the
+shared connector to reuse or start a loopback runtime, and session durability
+remains in the Rust JSONL store.
 
 ## Privileged operations and UI clients
 

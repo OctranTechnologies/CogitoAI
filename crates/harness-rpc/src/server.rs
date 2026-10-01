@@ -1117,10 +1117,15 @@ fn workspace_path(runtime: &Runtime, params: &Value) -> Result<PathBuf, RpcServe
 
 /// Reports where the runtime keeps its durable state, for the Runtime screen.
 fn session_root(runtime: &Runtime) -> PathBuf {
-    runtime
-        .workspace_root()
-        .map(|root| root.join(".cogito/sessions"))
-        .unwrap_or_else(|| PathBuf::from(".cogito/sessions"))
+    runtime.session_root().map_or_else(
+        || {
+            runtime
+                .workspace_root()
+                .map(|root| root.join(".cogito/sessions"))
+                .unwrap_or_else(|| PathBuf::from(".cogito/sessions"))
+        },
+        PathBuf::from,
+    )
 }
 
 /// Assembles the full settings snapshot for the desktop settings surfaces.

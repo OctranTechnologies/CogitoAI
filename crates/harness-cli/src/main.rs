@@ -1,12 +1,15 @@
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use harness_agent::{AgentLimits, AgentRunner, AgentTask, ApprovalHandler, CompactionConfig};
-use harness_context::{ContextBuilder, WorkspaceMetadata};
+use harness_agent::AgentTask;
+use harness_context::WorkspaceMetadata;
 use harness_core::{
     discover_workspace, init_logging, CheckpointId, HarnessConfig, SessionId, WorkingTreeState,
 };
@@ -16,17 +19,19 @@ use harness_models::{
     provider_from_config_with_store, save_project_model_preference, save_user_model_preference,
     validate_provider_credential, ContentBlock, CredentialSecret, CredentialSource,
     CredentialStatus, CredentialStore, FinishReason, Message, ModelConfig, ModelPreference,
-    ModelPreferenceError, ModelProvider, ModelRegistry, ModelRegistryFilter, ModelRequest,
-    ModelResponse, ModelStreamEvent, ProviderError, ProviderKind, ReasoningEffort,
-    ScriptedMockProvider, SystemCredentialStore, ToolCall, Usage,
+    ModelPreferenceError, ModelRegistry, ModelRegistryFilter, ModelRequest, ModelResponse,
+    ModelStreamEvent, ProviderError, ProviderKind, ReasoningEffort, SystemCredentialStore,
+    ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
-use harness_session::{
-    EventBus, EventId, EventPayload, EventSubscription, HarnessEvent, JsonlSessionStore, Session,
-    SessionStore,
+use harness_rpc::{
+    EmbeddedRuntimeLauncher, RpcResponse, RuntimeConnector, RuntimeLaunchConfig, ServerMessage,
 };
-use harness_tools::{CancellationToken, LocalProcessRunner, ToolRegistry};
-use harness_verification::{CommandVerifier, VerificationPlan};
+use harness_session::{
+    EventId, EventPayload, HarnessEvent, JsonlSessionStore, Session, SessionStore,
+};
+use harness_tools::CancellationToken;
+use harness_verification::VerificationPlan;
 use serde_json::{json, Value};
 use tui::{StartupInfo, Tui, TuiSender};
 
@@ -228,6 +233,8 @@ struct Cli {
     json: bool,
     #[arg(long, global = true)]
     yes: bool,
+    #[arg(long, global = true)]
+    rpc_address: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -1507,26 +1514,12 @@ fn run_agent_with_ui(
     let path = std::fs::canonicalize(&path)?;
     let description = discover_workspace(&path)?;
     let model_config = model_config(cli)?;
-    let provider = provider_for_agent(&model_config)?;
     let project_root = description
         .repository_root
         .clone()
         .unwrap_or_else(|| description.current_directory.clone());
     let policy = policy_for_workspace(&project_root)?;
     let execution_mode = execution_mode_name(policy.mode()).to_owned();
-    let event_bus = EventBus::new();
-    let sessions = Arc::new(JsonlSessionStore::with_event_bus(
-        &cli.session_root,
-        event_bus.clone(),
-    )?);
-    let checkpoints: Option<Arc<dyn CheckpointStore>> = if GitClient::open(&path).is_ok() {
-        Some(Arc::new(ShadowCheckpointStore::with_event_bus(
-            path.join(".cogito/checkpoints"),
-            Some(event_bus.clone()),
-        )?))
-    } else {
-        None
-    };
     let git_status = GitClient::open(&path)
         .ok()
         .and_then(|client| client.status().ok());
@@ -1559,7 +1552,7 @@ fn run_agent_with_ui(
     // verifies nothing.
     let verification_plan = Some(VerificationPlan::all(&description));
     let agent_task = AgentTask {
-        workspace_root: path,
+        workspace_root: path.clone(),
         user_task: task,
         system_instructions:
             "You are the CogitoAI coding agent. Follow project instructions and use tools safely."
@@ -1571,43 +1564,182 @@ fn run_agent_with_ui(
         resume_session,
         ..AgentTask::default()
     };
-    let event_output = Arc::new(EventOutput::new(cli.json, tui.clone()));
-    let _subscription = event_output.subscribe(&event_bus);
     let cancellation = cancellation.unwrap_or_default();
     if tui.is_none() {
         let handler_token = cancellation.clone();
         ctrlc::set_handler(move || handler_token.cancel())?;
     }
-    let reasoning_config = model_config.reasoning_config();
-    let runner = AgentRunner::new(
-        provider,
-        model_config.model,
-        ToolRegistry::with_workspace_tools_cancellation(cancellation.clone()),
-        policy,
-        sessions,
-        ContextBuilder::default(),
-        AgentLimits::default(),
-        Arc::new(CliApproval {
-            auto_approve: cli.yes,
-            tui: tui.clone(),
-        }),
-    )
-    .with_event_bus(event_bus)
-    .with_reasoning_config(reasoning_config)
-    .with_compaction_config(CompactionConfig {
-        threshold_tokens: cli
-            .compaction_threshold
-            .unwrap_or_else(|| CompactionConfig::default().threshold_tokens),
-        ..CompactionConfig::default()
-    })
-    .with_verifier(Arc::new(
-        CommandVerifier::new(Arc::new(LocalProcessRunner)).with_cancellation(cancellation.clone()),
-    ));
-    let mut runner = runner;
-    if let Some(checkpoints) = checkpoints {
-        runner = runner.with_checkpoints(checkpoints);
+
+    let address = cli_rpc_address(cli, &path)?;
+    let mut launch = RuntimeLaunchConfig::new(address, &path);
+    launch.model = Some(model_config.clone());
+    launch.session_root = Some(cli.session_root.clone());
+    launch.compaction_threshold_tokens = cli.compaction_threshold;
+    launch.mock_responses = mock_runtime_responses(&model_config)?;
+    launch.apply_saved_preferences = false;
+    let connector = RuntimeConnector::new(Arc::new(EmbeddedRuntimeLauncher));
+    let mut client = connector.connect_or_start(&launch)?;
+
+    let runtime_settings = rpc_result(client.request("settings.inspect", json!({}))?)?;
+    let runtime_session_root = runtime_settings
+        .get("runtime")
+        .and_then(|runtime| runtime.get("session_storage_path"))
+        .and_then(Value::as_str)
+        .ok_or("runtime did not report its session storage path")?;
+    if normalized_existing_path(&cli.session_root)
+        != normalized_existing_path(Path::new(runtime_session_root))
+    {
+        return Err(format!(
+            "CLI session root does not match the connected runtime ({}); use the same --session-root or a different --rpc-address",
+            runtime_session_root
+        )
+        .into());
     }
-    let outcome = runner.run(&agent_task, &cancellation);
+
+    // CLI flags and preferences remain authoritative for this run, including
+    // when the CLI attaches to a runtime that was started by another client.
+    let model_update = client.request(
+        "settings.update_model",
+        json!({
+            "provider": provider_id(model_config.provider),
+            "model": model_config.model,
+            "base_url": model_config.base_url,
+            "api_key_env": model_config.api_key_env,
+            "reasoning_effort": model_config.reasoning_effort.and_then(|effort| {
+                serde_json::to_value(effort)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+            }),
+            "preference_scope": "none",
+            "record_session_event": false
+        }),
+    )?;
+    ensure_rpc_success(model_update)?;
+    let run_response = client.request("agent.run", json!({"task": agent_task}))?;
+    let run = rpc_result(run_response)?;
+    let run_id = run
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or("RPC response did not include a run ID")?
+        .to_owned();
+    let event_output = EventOutput::new(cli.json, tui.clone());
+    let (reader, writer) = client.split();
+    let (message_sender, message_receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("harness-rpc-cli-reader".to_owned())
+        .spawn(move || loop {
+            match reader.receive() {
+                Ok(message) => {
+                    if message_sender.send(Ok(message)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = message_sender.send(Err(error.to_string()));
+                    break;
+                }
+            }
+        })?;
+
+    let mut cancelled = false;
+    let outcome = loop {
+        if cancellation.is_cancelled() && !cancelled {
+            let _ = writer.request("agent.cancel", json!({"run_id": run_id}));
+            cancelled = true;
+        }
+        match message_receiver.recv_timeout(Duration::from_millis(60)) {
+            Ok(Ok(ServerMessage::Notification(notification))) => match notification.method.as_str()
+            {
+                "agent.event" => {
+                    let Some(event_value) = notification.params.get("event") else {
+                        continue;
+                    };
+                    let event: HarnessEvent = serde_json::from_value(event_value.clone())?;
+                    if matches!(event.payload, EventPayload::SessionStarted { .. }) {
+                        if let Some(tui) = &tui {
+                            tui.active_session(&event.session_id.to_string());
+                        }
+                    }
+                    event_output.print(&event);
+                }
+                "approval.request" => {
+                    let approval_id = notification
+                        .params
+                        .get("approval_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let tool = notification
+                        .params
+                        .get("tool")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let tool_name = tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned();
+                    let writer = writer.clone();
+                    let tui = tui.clone();
+                    let auto_approve = cli.yes;
+                    std::thread::spawn(move || {
+                        let approved = if auto_approve {
+                            true
+                        } else if let Some(tui) = tui {
+                            tui.request_approval(&tool_name)
+                        } else {
+                            eprint!("Approve tool {tool_name}? [y/N] ");
+                            let _ = io::stderr().flush();
+                            let mut answer = String::new();
+                            io::stdin().read_line(&mut answer).is_ok()
+                                && matches!(
+                                    answer.trim().to_ascii_lowercase().as_str(),
+                                    "y" | "yes"
+                                )
+                        };
+                        let method = if approved {
+                            "agent.approve"
+                        } else {
+                            "agent.deny"
+                        };
+                        let _ = writer.request(method, json!({"approval_id": approval_id}));
+                    });
+                }
+                "agent.completed"
+                    if notification.params.get("run_id").and_then(Value::as_str)
+                        == Some(&run_id) =>
+                {
+                    let outcome = notification
+                        .params
+                        .get("outcome")
+                        .cloned()
+                        .ok_or("completed RPC event did not include an outcome")?;
+                    break serde_json::from_value::<harness_agent::AgentOutcome>(outcome)?;
+                }
+                "agent.failed"
+                    if notification.params.get("run_id").and_then(Value::as_str)
+                        == Some(&run_id) =>
+                {
+                    let message = notification
+                        .params
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("agent run failed");
+                    return Err(message.to_owned().into());
+                }
+                _ => {}
+            },
+            Ok(Ok(ServerMessage::Response(_))) => {}
+            Ok(Err(error)) => return Err(format!("runtime connection failed: {error}").into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("runtime connection closed before the run completed".into())
+            }
+        }
+    };
+    writer.shutdown();
+    connector.disconnect()?;
     if let Some(tui) = &tui {
         let final_git_status = GitClient::open(&project_root)
             .ok()
@@ -1620,9 +1752,42 @@ fn run_agent_with_ui(
             final_git_status.as_ref().map(|status| !status.is_clean),
         );
     }
-    let outcome = outcome?;
     print_completion(cli, &outcome, tui.as_ref());
     Ok(())
+}
+
+fn rpc_result(response: RpcResponse) -> Result<Value, Box<dyn std::error::Error>> {
+    if response.ok {
+        Ok(response.result.unwrap_or(Value::Null))
+    } else {
+        Err(response
+            .error
+            .map_or_else(
+                || "runtime RPC request failed".to_owned(),
+                |error| error.message,
+            )
+            .into())
+    }
+}
+
+fn ensure_rpc_success(response: RpcResponse) -> Result<(), Box<dyn std::error::Error>> {
+    rpc_result(response).map(|_| ())
+}
+
+fn normalized_existing_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |current| current.join(path))
+    };
+    std::fs::canonicalize(&absolute).unwrap_or(absolute)
+}
+
+fn cli_rpc_address(cli: &Cli, workspace: &Path) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    Ok(RuntimeConnector::resolve_endpoint(
+        workspace,
+        cli.rpc_address.as_deref(),
+    )?)
 }
 
 fn auth_command(cli: &Cli, command: &AuthCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -1845,44 +2010,37 @@ fn print_credential_status(
     Ok(())
 }
 
-fn provider_for_agent(config: &ModelConfig) -> Result<Arc<dyn ModelProvider>, ProviderError> {
-    if config.provider == ProviderKind::Mock {
-        if let Some(repair) = mock_repair_script()? {
-            return Ok(Arc::new(ScriptedMockProvider::new(
-                config.model.clone(),
-                vec![
-                    tool_response("read_file", json!({ "path": repair.path })),
-                    tool_response(
-                        "write_file",
-                        json!({ "path": repair.path, "content": repair.broken }),
-                    ),
-                    tool_response(
-                        "write_file",
-                        json!({ "path": repair.path, "content": repair.fixed }),
-                    ),
-                    text_response("Mock repair workflow completed."),
-                ],
-            )));
-        }
-        return Ok(Arc::new(ScriptedMockProvider::new(
-            config.model.clone(),
-            vec![
-                tool_response("list_directory", json!({"path": "."})),
-                tool_response(
-                    "write_file",
-                    json!({
-                        "path": "mock-output.txt",
-                        "content": "Generated by the CLI mock workflow."
-                    }),
-                ),
-                text_response("Mock coding workflow completed."),
-            ],
-        )));
+fn mock_runtime_responses(
+    config: &ModelConfig,
+) -> Result<Option<Vec<ModelResponse>>, ProviderError> {
+    if config.provider != ProviderKind::Mock {
+        return Ok(None);
     }
-    Ok(Arc::from(provider_from_config_with_store(
-        config,
-        &SystemCredentialStore::new(),
-    )?))
+    if let Some(repair) = mock_repair_script()? {
+        return Ok(Some(vec![
+            tool_response("read_file", json!({ "path": repair.path })),
+            tool_response(
+                "write_file",
+                json!({ "path": repair.path, "content": repair.broken }),
+            ),
+            tool_response(
+                "write_file",
+                json!({ "path": repair.path, "content": repair.fixed }),
+            ),
+            text_response("Mock repair workflow completed."),
+        ]));
+    }
+    Ok(Some(vec![
+        tool_response("list_directory", json!({"path": "."})),
+        tool_response(
+            "write_file",
+            json!({
+                "path": "mock-output.txt",
+                "content": "Generated by the CLI mock workflow."
+            }),
+        ),
+        text_response("Mock coding workflow completed."),
+    ]))
 }
 
 /// A deliberately broken edit followed by a corrective one, so the mock can
@@ -1985,11 +2143,6 @@ impl EventOutput {
             tui,
             seen: Mutex::new(HashSet::new()),
         }
-    }
-
-    fn subscribe(self: &Arc<Self>, bus: &EventBus) -> EventSubscription {
-        let output = Arc::clone(self);
-        bus.subscribe(Arc::new(move |event: &HarnessEvent| output.print(event)))
     }
 
     fn print(&self, event: &HarnessEvent) {
@@ -2185,34 +2338,6 @@ fn concise(value: &str, limit: usize) -> String {
     }
 }
 
-struct CliApproval {
-    auto_approve: bool,
-    tui: Option<TuiSender>,
-}
-
-impl ApprovalHandler for CliApproval {
-    fn request(
-        &self,
-        request: &harness_tools::ToolRequest,
-    ) -> Result<bool, harness_agent::AgentError> {
-        if self.auto_approve {
-            return Ok(true);
-        }
-        if let Some(tui) = &self.tui {
-            return Ok(tui.request_approval(&request.name));
-        }
-        eprint!("Approve tool {}? [y/N] ", request.name);
-        let mut answer = String::new();
-        io::stdin()
-            .read_line(&mut answer)
-            .map_err(|error| harness_agent::AgentError::Core(error.to_string()))?;
-        Ok(matches!(
-            answer.trim().to_ascii_lowercase().as_str(),
-            "y" | "yes"
-        ))
-    }
-}
-
 fn print_sessions(
     sessions: &[harness_session::SessionSummary],
     json: bool,
@@ -2369,6 +2494,7 @@ mod interactive_command_tests {
             model_provider: None,
             model: None,
             model_effort: None,
+            rpc_address: None,
             session_root: directory.path().join("sessions"),
             compaction_threshold: None,
             json: false,

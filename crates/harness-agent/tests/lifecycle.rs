@@ -487,6 +487,7 @@ fn a_denied_edit_never_reaches_the_filesystem() {
     let context = harness_tools::ToolContext {
         policy: &harness_policy::DenyAllPolicy,
         working_directory: root,
+        cancellation: None,
         event_bus: None,
         session_id: None,
         correlation_id: None,

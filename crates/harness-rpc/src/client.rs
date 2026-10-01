@@ -42,6 +42,20 @@ pub struct RpcClientWriter {
 impl RpcClient {
     pub fn connect(address: SocketAddr) -> Result<Self, RpcClientError> {
         let stream = TcpStream::connect(address)?;
+        Self::from_stream(stream)
+    }
+
+    pub fn connect_timeout(
+        address: SocketAddr,
+        timeout: std::time::Duration,
+    ) -> Result<Self, RpcClientError> {
+        let stream = TcpStream::connect_timeout(&address, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        Self::from_stream(stream)
+    }
+
+    fn from_stream(stream: TcpStream) -> Result<Self, RpcClientError> {
         let writer = BufWriter::new(stream.try_clone()?);
         Ok(Self {
             reader: BufReader::new(stream),
@@ -49,6 +63,12 @@ impl RpcClient {
             next_id: 0,
             pending: Vec::new(),
         })
+    }
+
+    pub(crate) fn clear_timeouts(&self) -> Result<(), RpcClientError> {
+        self.reader.get_ref().set_read_timeout(None)?;
+        self.writer.get_ref().set_write_timeout(None)?;
+        Ok(())
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<RpcResponse, RpcClientError> {

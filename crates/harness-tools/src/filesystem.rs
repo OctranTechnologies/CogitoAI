@@ -100,9 +100,10 @@ impl Tool for ShellTool {
             timeout: Duration::from_millis(timeout_ms),
             max_output_bytes,
         };
+        let cancellation = context.cancellation.unwrap_or(&self.cancellation);
         let result = self
             .runner
-            .execute(request, &self.cancellation, &mut |event| {
+            .execute(request, cancellation, &mut |event| {
                 emit_process_event(
                     context,
                     &event,

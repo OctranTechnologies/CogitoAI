@@ -194,6 +194,15 @@ pub struct AgentRunner {
     reasoning: Option<ReasoningConfig>,
 }
 
+struct ToolExecutionContext<'a> {
+    session_id: &'a SessionId,
+    workspace_root: &'a std::path::Path,
+    policy: &'a ApprovedPolicy,
+    approved: &'a Arc<Mutex<HashSet<String>>>,
+    collector: &'a Arc<Mutex<Vec<HarnessEvent>>>,
+    cancellation: &'a CancellationToken,
+}
+
 impl AgentRunner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -534,14 +543,15 @@ impl AgentRunner {
                 tool_calls += 1;
                 let is_shell = tool_call.name == "shell";
                 let request = ToolRequest::new(tool_call.name.clone(), tool_call.arguments.clone());
-                let mut result = match self.execute_tool(
-                    &session_id,
-                    &task.workspace_root,
-                    &approval_policy,
-                    &approved,
-                    request,
-                    &collector,
-                ) {
+                let execution = ToolExecutionContext {
+                    session_id: &session_id,
+                    workspace_root: &task.workspace_root,
+                    policy: &approval_policy,
+                    approved: &approved,
+                    collector: &collector,
+                    cancellation,
+                };
+                let mut result = match self.execute_tool(&execution, request) {
                     Ok(result) => result,
                     Err(error) => return self.fail(session_id, collector, error),
                 };
@@ -577,6 +587,7 @@ impl AgentRunner {
                     &changed_files,
                     &mut context_input,
                     &collector,
+                    cancellation,
                 )?;
             }
             model_history = next_model_history;
@@ -632,6 +643,7 @@ impl AgentRunner {
         changed_files: &[PathBuf],
         context_input: &mut ContextInput,
         collector: &Arc<Mutex<Vec<HarnessEvent>>>,
+        cancellation: &CancellationToken,
     ) -> Result<(), AgentError> {
         if changed_files.is_empty() {
             return Ok(());
@@ -659,7 +671,7 @@ impl AgentRunner {
             plan,
             max_output_bytes: 64 * 1024,
         };
-        match verifier.verify(&request) {
+        match verifier.verify_cancellable(&request, cancellation) {
             Ok(reports) => {
                 for report in reports {
                     self.emit(
@@ -713,22 +725,19 @@ impl AgentRunner {
 
     fn execute_tool(
         &self,
-        session_id: &SessionId,
-        workspace_root: &std::path::Path,
-        policy: &ApprovedPolicy,
-        approved: &Arc<Mutex<HashSet<String>>>,
+        execution: &ToolExecutionContext<'_>,
         request: ToolRequest,
-        collector: &Arc<Mutex<Vec<HarnessEvent>>>,
     ) -> Result<ToolResult, AgentError> {
         let context = ToolContext {
-            policy,
-            working_directory: workspace_root,
+            policy: execution.policy,
+            working_directory: execution.workspace_root,
+            cancellation: Some(execution.cancellation),
             event_bus: Some(&self.event_bus),
-            session_id: Some(session_id),
+            session_id: Some(execution.session_id),
             correlation_id: None,
         };
         let result = self.tools.execute(&context, request.clone());
-        self.flush(session_id, collector)?;
+        self.flush(execution.session_id, execution.collector)?;
         match result {
             Ok(result) => Ok(result),
             Err(Error::PermissionRequired { .. }) => {
@@ -736,12 +745,13 @@ impl AgentRunner {
                 if !approved_by_user {
                     return Err(AgentError::ApprovalDenied { tool: request.name });
                 }
-                approved
+                execution
+                    .approved
                     .lock()
                     .expect("agent approval lock poisoned")
                     .insert(approval_key(&request));
                 let result = self.tools.execute(&context, request);
-                self.flush(session_id, collector)?;
+                self.flush(execution.session_id, execution.collector)?;
                 match result {
                     Ok(result) => Ok(result),
                     Err(Error::Tool { tool, message }) => Ok(tool_error_result(tool, message)),

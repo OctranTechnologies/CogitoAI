@@ -88,7 +88,7 @@ describe("desktop keyboard workflow", () => {
     fireEvent.keyDown(input, { key: "Enter" });
 
     await waitFor(() => {
-      expect(useDesktopStore.getState().connect).toHaveBeenCalledWith("127.0.0.1:4545", "D:/work/new-repo");
+      expect(useDesktopStore.getState().connect).toHaveBeenCalledWith("auto", "D:/work/new-repo");
     });
     expect(useDesktopStore.getState().workspacePath).toBe("D:/work/new-repo");
   });

@@ -95,6 +95,9 @@ pub enum ToolError {
 pub struct ToolContext<'a> {
     pub policy: &'a dyn Policy,
     pub working_directory: &'a std::path::Path,
+    /// Per-run cancellation supplied by the agent loop. Tools which support
+    /// interruption should prefer it over their standalone default token.
+    pub cancellation: Option<&'a CancellationToken>,
     pub event_bus: Option<&'a EventBus>,
     pub session_id: Option<&'a SessionId>,
     pub correlation_id: Option<&'a Id>,
