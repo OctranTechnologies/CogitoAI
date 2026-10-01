@@ -30,11 +30,11 @@ pnpm tauri dev
 ```
 
 Enter a workspace path in the shell and select Connect. The default `auto`
-endpoint selects a stable loopback address for that workspace; Tauri reuses a
-healthy Harness runtime there or starts one in the desktop backend process. You
-can enter a fixed address such as `127.0.0.1:4545` to connect to a manually
-managed endpoint. No separate RPC server command is normally needed. The
-conversation panel shows prompts, streamed assistant output, and
+endpoint discovers a runtime through per-user metadata; Tauri reuses a healthy
+Harness runtime or starts one on an OS-assigned loopback port in the desktop
+backend process. You can enter a fixed address such as `127.0.0.1:4545` to
+connect to a manually managed endpoint. No separate RPC server command is
+normally needed. The conversation panel shows prompts, streamed assistant output, and
 run phase. The context panel shows expandable tool cards, verification results,
 a checkpoint timeline, and a chronological session timeline. Approval requests
 are explicitly allow-once or deny-once; no permanent policy change is inferred

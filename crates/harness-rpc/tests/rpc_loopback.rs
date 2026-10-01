@@ -307,6 +307,24 @@ fn start_server(
     (client, address, shutdown, handle)
 }
 
+#[test]
+fn rpc_server_rejects_non_loopback_bind_addresses() {
+    let temporary = tempdir().unwrap();
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
+    let (runtime, _sessions) = setup(
+        temporary.path(),
+        ExecutionMode::Normal,
+        provider,
+        Arc::clone(&approvals),
+    );
+
+    assert!(matches!(
+        RpcServer::bind_with_approvals("0.0.0.0:0".parse().unwrap(), runtime, approvals,),
+        Err(harness_rpc::RpcServerError::NonLoopbackAddress)
+    ));
+}
+
 fn task(root: &Path, session: Option<SessionId>) -> AgentTask {
     AgentTask {
         workspace_root: root.to_path_buf(),
@@ -692,6 +710,9 @@ fn exposes_typed_settings_and_never_returns_a_credential() {
     assert_ok(&client.request("rpc.initialize", json!({})).unwrap());
     let initialized = client.request("rpc.initialize", json!({})).unwrap();
     let advertised = initialized.result.unwrap();
+    assert!(advertised["instanceId"]
+        .as_str()
+        .is_some_and(|instance_id| !instance_id.is_empty()));
     let methods: Vec<String> = advertised["methods"]
         .as_array()
         .unwrap()

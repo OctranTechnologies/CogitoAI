@@ -45,8 +45,11 @@ is watching.
 **CLI and desktop over one runtime.** Both clients use the shared loopback RPC
 bootstrap for agent runs and drive the same agent core, policy engine, and session
 store. They reuse a healthy runtime or start the embedded RPC server when none is
-available. Neither client contains the agent loop, and a startup lock prevents
-simultaneous clients from launching duplicate servers on one endpoint.
+available. The server binds an OS-assigned loopback port and publishes a small
+per-user metadata record so the other client can find it. The connector verifies
+the RPC protocol and runtime instance ID before reuse; a startup lock prevents
+simultaneous clients from launching duplicate servers for one workspace. Neither
+client contains the agent loop.
 
 **Event-sourced sessions.** A session is a JSONL file with one schema-versioned
 event per line. Nothing is mutated in place: tool calls, approvals, verification
@@ -326,7 +329,7 @@ runtime process and are never sent to the frontend.
 | `COGITO_MODEL_API_KEY_ENV` | Name of the variable holding the key | Provider-specific; both OpenCode services use `OPENCODE_API_KEY` |
 | `COGITO_MODEL_BASE_URL` | Provider API root; OpenCode defaults differ for Zen and Go, discovery uses `/models` | Provider API root |
 | `COGITO_MOCK_REPAIR` | Mock-only test hook; see [Testing the repair loop](#testing-the-repair-loop) | unset |
-| `COGITO_RPC_ADDRESS` | Loopback RPC endpoint used by CLI agent runs when `--rpc-address` is not supplied | workspace-derived endpoint |
+| `COGITO_RPC_ADDRESS` | Optional fixed loopback endpoint used when `--rpc-address` is not supplied | automatic per-user discovery; OS-assigned loopback port when starting |
 | `RUST_LOG` | Runtime log level for the RPC runtime | `info` |
 
 The key is read from the environment only. It is never returned by the settings
@@ -553,10 +556,11 @@ Global options: `--workspace` (default `.`), `--session-root` (default
 `Ctrl+C`; the cancellation token is shared with tool execution and verification
 commands.
 
-Agent runs discover a loopback runtime automatically. The CLI chooses a stable
-workspace-specific endpoint by default; set `--rpc-address` or
-`COGITO_RPC_ADDRESS` to reuse a particular runtime. A connected runtime must
-already serve the requested workspace and use the same session root.
+Agent runs discover a loopback runtime automatically through per-user runtime
+metadata. The CLI requests an OS-assigned loopback port when it starts a server;
+set `--rpc-address` or `COGITO_RPC_ADDRESS` to connect to a fixed loopback
+endpoint. A connected runtime must already serve the requested workspace and use
+the same session root.
 
 `--yes` auto-approves policy prompts. Use it only in a disposable workspace or in
 CI.
@@ -624,10 +628,10 @@ pnpm tauri dev
 
 `pnpm tauri dev` starts the Vite dev server and compiles the Rust shell. In the
 app, enter a repository path and select Connect. The default `auto` endpoint
-selects the same stable workspace-specific loopback address as the CLI. The
-desktop reuses a healthy Harness runtime or starts one in its local backend
-process. Enter a fixed address such as `127.0.0.1:4545` to connect to a manually
-managed endpoint. The server is tied to its startup workspace; select a workspace
+discovers the runtime through the same per-user metadata as the CLI. The desktop
+reuses a healthy Harness runtime or starts one in its local backend process.
+Enter a fixed address such as `127.0.0.1:4545` to connect to a manually managed
+endpoint. The server is tied to its startup workspace; select a workspace
 inside that root or choose another endpoint for a different runtime. RPC has no
 authentication, so keep it on the local machine.
 

@@ -71,14 +71,30 @@ RPC runtime; its inspection and configuration commands retain their focused CLI
 helpers. The Tauri shell links only `harness-rpc`, so it cannot reach a tool,
 provider, or policy implementation except through the runtime boundary.
 
-When either client connects, it first checks that the endpoint is a healthy
-Harness RPC server and that the requested workspace is inside the server's open
-workspace. If none is available, the connector serializes startup on a per-
-endpoint lock, checks again, then builds the runtime and runs `RpcServer` on a
-background thread in the local backend process. A healthy runtime is reused;
-agent and tool execution remain inside `harness-rpc`/`harness-agent` in either
-case. Dropping a client closes its socket but leaves the local runtime available
-for the rest of that client process.
+With no explicit endpoint override, the connector reads a per-user metadata
+record keyed by a hash of the canonical workspace path. It validates the
+metadata/protocol versions, checks the PID where the OS permits, then health
+checks `rpc.initialize` and matches the response's instance ID. PID presence
+alone never establishes identity. Invalid or stale records are removed only if
+their bytes have not changed since they were read. If no matching runtime is
+healthy, a per-workspace startup lock serializes the launch; the server binds an
+OS-assigned loopback port, then publishes its endpoint and instance identity.
+The current JSON-lines client uses `TcpStream`, so transport remains loopback
+TCP; the RPC server rejects non-loopback bind addresses. A healthy runtime is
+reused, and dropping a client closes its socket but leaves the runtime available
+to other local clients.
+
+Runtime metadata contains only PID, metadata and RPC protocol versions,
+transport, endpoint, startup timestamp, runtime version, and instance ID. It
+does not contain the workspace path, credentials, or session data. The default
+directory is `%LOCALAPPDATA%\\CogitoAI\\runtime` on Windows,
+`~/Library/Application Support/CogitoAI/runtime` on macOS, and
+`$XDG_RUNTIME_DIR/cogitoai` on Linux when available (otherwise
+`$XDG_STATE_HOME/cogitoai/runtime` or `~/.local/state/cogitoai/runtime`). Unix
+directories and files are restricted to the current user. A workspace-hash
+startup lock sits beside the metadata file. If the platform application-data
+directory cannot be created, the connector falls back to a per-user directory
+under the system temporary directory.
 
 ## Crate responsibilities
 

@@ -29,6 +29,9 @@ use crate::{AgentRunnerFactory, ApprovalBroker, RpcApprovalHandler, RpcServer, R
 #[derive(Clone)]
 pub struct RuntimeLaunchConfig {
     pub address: SocketAddr,
+    /// The expected instance identity is set by `RuntimeConnector` before the
+    /// runtime starts so the metadata and health response agree.
+    pub instance_id: Option<String>,
     pub workspace_root: PathBuf,
     /// If absent, provider environment configuration and saved preferences are
     /// used. CLI invocations pass their resolved config to preserve flags.
@@ -45,6 +48,7 @@ impl RuntimeLaunchConfig {
     pub fn new(address: SocketAddr, workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             address,
+            instance_id: None,
             workspace_root: workspace_root.into(),
             model: None,
             session_root: None,
@@ -57,7 +61,13 @@ impl RuntimeLaunchConfig {
 
 /// Starts a local RPC server for the supplied runtime configuration.
 pub trait RuntimeLauncher: Send + Sync {
-    fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<(), String>;
+    fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<RuntimeLaunchInfo, String>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeLaunchInfo {
+    pub endpoint: SocketAddr,
+    pub instance_id: String,
 }
 
 /// Default launcher shared by the CLI and desktop application.
@@ -65,18 +75,23 @@ pub trait RuntimeLauncher: Send + Sync {
 pub struct EmbeddedRuntimeLauncher;
 
 impl RuntimeLauncher for EmbeddedRuntimeLauncher {
-    fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<(), String> {
+    fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<RuntimeLaunchInfo, String> {
         let approvals = Arc::new(ApprovalBroker::new());
         let runtime = build_runtime(config, Arc::clone(&approvals))?;
+        let instance_id = runtime.instance_id().to_owned();
         let server = RpcServer::bind_with_approvals(config.address, runtime, approvals)
             .map_err(|error| error.to_string())?;
+        let endpoint = server.local_addr().map_err(|error| error.to_string())?;
         std::thread::Builder::new()
             .name("cogito-rpc-runtime".to_owned())
             .spawn(move || {
                 let _ = server.serve();
             })
             .map_err(|error| format!("could not start the RPC server: {error}"))?;
-        Ok(())
+        Ok(RuntimeLaunchInfo {
+            endpoint,
+            instance_id,
+        })
     }
 }
 
@@ -211,6 +226,12 @@ fn build_runtime(
         sessions,
         checkpoints,
         Vec::new(),
+    )
+    .with_instance_id(
+        config
+            .instance_id
+            .clone()
+            .unwrap_or_else(crate::metadata::new_instance_id),
     )
     .with_agent_runner(runner)
     .with_runner_factory(runner_factory)

@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod client;
 pub mod host;
+pub mod metadata;
 pub mod protocol;
 pub mod server;
 pub mod settings;
@@ -11,7 +12,8 @@ pub use harness_pty::{
     ExitReason, PtyError, PtyInfo, PtyManager, PtyRequest, SessionOrigin, TerminalEvent,
     TerminalSink,
 };
-pub use host::{EmbeddedRuntimeLauncher, RuntimeLaunchConfig, RuntimeLauncher};
+pub use host::{EmbeddedRuntimeLauncher, RuntimeLaunchConfig, RuntimeLaunchInfo, RuntimeLauncher};
+pub use metadata::{default_runtime_directory, RuntimeMetadata, RuntimeMetadataStore};
 pub use protocol::{
     RpcError, RpcNotification, RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION,
 };
@@ -44,6 +46,7 @@ use harness_tools::{ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{VerificationReport, VerificationRequest, Verifier};
 
 pub struct Runtime {
+    instance_id: String,
     agent: Arc<dyn AgentRuntime>,
     providers: Vec<Box<dyn ModelProvider>>,
     tools: ToolRegistry,
@@ -106,6 +109,7 @@ impl Runtime {
             credential_store.as_ref(),
         ));
         Self {
+            instance_id: metadata::new_instance_id(),
             agent,
             providers,
             tools,
@@ -124,6 +128,17 @@ impl Runtime {
             model_registry,
             credential_store,
         }
+    }
+
+    /// Unique to this runtime process instance, used by local discovery to
+    /// distinguish it from a stale record whose PID may have been reused.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn with_instance_id(mut self, instance_id: String) -> Self {
+        self.instance_id = instance_id;
+        self
     }
 
     pub fn with_agent_runner(self, agent_runner: Arc<AgentRunner>) -> Self {

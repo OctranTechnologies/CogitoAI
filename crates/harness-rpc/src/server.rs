@@ -48,6 +48,8 @@ pub enum RpcServerError {
     Settings(#[from] crate::settings::SettingsError),
     #[error("agent runtime is not configured")]
     AgentUnavailable,
+    #[error("RPC server must bind to a loopback address")]
+    NonLoopbackAddress,
 }
 
 pub struct RpcServer {
@@ -68,6 +70,9 @@ impl RpcServer {
         runtime: Arc<Runtime>,
         approvals: Arc<ApprovalBroker>,
     ) -> Result<Self, RpcServerError> {
+        if !address.ip().is_loopback() {
+            return Err(RpcServerError::NonLoopbackAddress);
+        }
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let credential_store = runtime.credential_store();
@@ -662,6 +667,7 @@ fn dispatch(
         "rpc.initialize" => Ok(json!({
             "version": RPC_PROTOCOL_VERSION,
             "server": "cogito-harness",
+            "instanceId": runtime.instance_id(),
             "methods": METHODS,
         })),
         "workspace.open" | "workspace.inspect" => workspace(runtime, &request.params),

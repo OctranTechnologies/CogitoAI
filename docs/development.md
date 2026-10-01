@@ -35,6 +35,33 @@ Non-crate directories:
   commands to the transport.
 - `docs/` — this guide and the architecture document.
 
+## Local RPC runtime discovery
+
+`harness-rpc::RuntimeConnector` uses a per-user metadata directory to let the
+CLI and desktop reuse one runtime without guessing a port. The runtime binds to
+an OS-assigned loopback TCP port because the current RPC client uses
+`TcpStream`; the server refuses non-loopback binds. The metadata file is named
+`runtime-<workspace-hash>.json` and stores only process/transport/version/endpoint
+fields plus a random instance ID. Startup locks use a sibling
+`runtime-<workspace-hash>.lock` file.
+
+Default locations:
+
+- Windows: `%LOCALAPPDATA%\\CogitoAI\\runtime`
+- macOS: `~/Library/Application Support/CogitoAI/runtime`
+- Linux: `$XDG_RUNTIME_DIR/cogitoai`, falling back to
+  `$XDG_STATE_HOME/cogitoai/runtime` and then `~/.local/state/cogitoai/runtime`
+
+If the selected application-data directory cannot be created, the connector
+falls back to a per-user subdirectory under the system temporary directory.
+
+Discovery checks metadata compatibility, performs a best-effort PID existence
+check, then calls `rpc.initialize` and compares the live instance ID. Never use
+PID existence as proof of identity. Stale cleanup compares the original file
+bytes before unlinking so one client cannot remove metadata another client has
+just replaced. Tests should use a temporary metadata directory via
+`RuntimeConnector::with_timing_and_runtime_directory`.
+
 ## Invariants
 
 These are the rules the rest of the design assumes. Breaking one is a design
