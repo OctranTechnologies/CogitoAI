@@ -44,6 +44,7 @@ enum UiMessage {
         branch: Option<String>,
         workspace_dirty: Option<bool>,
     },
+    RuntimeStatus(Option<String>),
     Approval {
         tool: String,
         response: SyncSender<bool>,
@@ -77,6 +78,12 @@ impl TuiSender {
             branch,
             workspace_dirty,
         });
+    }
+
+    pub fn runtime_status(&self, status: Option<&str>) {
+        let _ = self
+            .sender
+            .send(UiMessage::RuntimeStatus(status.map(str::to_owned)));
     }
 
     pub fn request_approval(&self, tool: &str) -> bool {
@@ -131,6 +138,7 @@ struct AppState {
     history_scratch: String,
     scroll_from_bottom: usize,
     status: String,
+    runtime_status: Option<String>,
     running: bool,
     cancellation: Option<CancellationToken>,
     pending_approval: Option<(String, SyncSender<bool>)>,
@@ -160,6 +168,7 @@ impl AppState {
             history_scratch: String::new(),
             scroll_from_bottom: 0,
             status: "Ready  |  Enter a task or type /help".to_owned(),
+            runtime_status: None,
             running: false,
             cancellation: None,
             pending_approval: None,
@@ -648,6 +657,17 @@ impl Tui {
         self.state.active_session_id = session_id;
     }
 
+    pub fn show_runtime_status(&mut self, status: &str) -> io::Result<()> {
+        self.state.runtime_status = Some(status.to_owned());
+        self.dirty = true;
+        self.draw()
+    }
+
+    pub fn set_runtime_status(&mut self, status: Option<&str>) {
+        self.state.runtime_status = status.map(str::to_owned);
+        self.dirty = true;
+    }
+
     pub fn start_run(&mut self, label: &str, cancellation: CancellationToken) -> bool {
         if self.state.running {
             return false;
@@ -801,6 +821,7 @@ impl Tui {
                     self.state.branch = branch;
                     self.state.workspace_dirty = workspace_dirty;
                 }
+                UiMessage::RuntimeStatus(status) => self.state.runtime_status = status,
                 UiMessage::Approval { tool, response } => {
                     self.state.pending_approval = Some((tool.clone(), response));
                     self.state.current_action = Some("Waiting for approval".to_owned());
@@ -1208,6 +1229,11 @@ fn status_detail(state: &AppState) -> String {
     if let Some((tool, _)) = &state.pending_approval {
         return format!("Approval: {tool} · Y approve · N deny · Ctrl+C cancel");
     }
+    if let Some(runtime_status) = &state.runtime_status {
+        if runtime_status != "Connected" {
+            return runtime_status.clone();
+        }
+    }
     if state.running {
         let action = if let Some(process) = &state.active_process {
             format!("Process · {process}")
@@ -1221,10 +1247,12 @@ fn status_detail(state: &AppState) -> String {
         return format!("{action} · Ctrl+C cancel · PgUp/PgDn scroll");
     }
     if state.status != "Ready  |  Enter a task or type /help" {
-        state.status.clone()
-    } else {
-        "Enter run · ↑/↓ history · /help · Ctrl+C exit".to_owned()
+        return state.status.clone();
     }
+    if state.runtime_status.as_deref() == Some("Connected") {
+        return "Connected · Enter run · ↑/↓ history · /help".to_owned();
+    }
+    "Enter run · ↑/↓ history · /help · Ctrl+C exit".to_owned()
 }
 
 fn truncate_path(value: &str, max_chars: usize) -> String {
@@ -1472,6 +1500,27 @@ mod tests {
         state.status = "Input cleared".to_owned();
 
         assert_eq!(status_detail(&state), "Input cleared");
+    }
+
+    #[test]
+    fn footer_prioritizes_runtime_connection_state_until_connected() {
+        let mut state = AppState::new(startup(), false);
+        for (connection, expected) in [
+            ("Connecting...", "Connecting..."),
+            ("Starting runtime...", "Starting runtime..."),
+            ("Reconnecting...", "Reconnecting..."),
+            ("Runtime unavailable", "Runtime unavailable"),
+        ] {
+            state.runtime_status = Some(connection.to_owned());
+            assert_eq!(status_detail(&state), expected);
+        }
+        state.runtime_status = Some("Connected".to_owned());
+        assert_eq!(
+            status_detail(&state),
+            "Connected · Enter run · ↑/↓ history · /help"
+        );
+        state.status = "Task failed · see activity".to_owned();
+        assert_eq!(status_detail(&state), "Task failed · see activity");
     }
 
     fn status_text(state: &AppState, width: u16) -> String {

@@ -8,6 +8,9 @@ pub mod server;
 pub mod settings;
 
 pub use bootstrap::{ConnectionState, ConnectionStatus, RuntimeConnectError, RuntimeConnector};
+/// Name emphasizing the client-facing lifecycle manager role of the shared
+/// runtime connector. Kept as an alias so existing embedders remain compatible.
+pub type HarnessConnectionManager = RuntimeConnector;
 pub use client::{RpcClient, RpcClientError, RpcClientReader, RpcClientWriter};
 pub use harness_pty::{
     ExitReason, PtyError, PtyInfo, PtyManager, PtyRequest, SessionOrigin, TerminalEvent,

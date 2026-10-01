@@ -47,6 +47,8 @@ pub struct ConnectionStatus {
     pub endpoint: Option<SocketAddr>,
     pub workspace_root: Option<PathBuf>,
     pub started_runtime: bool,
+    /// Number of failed readiness exchanges since the last connection attempt.
+    pub retry_count: u32,
     pub last_error: Option<String>,
 }
 
@@ -57,6 +59,7 @@ impl Default for ConnectionStatus {
             endpoint: None,
             workspace_root: None,
             started_runtime: false,
+            retry_count: 0,
             last_error: None,
         }
     }
@@ -550,6 +553,7 @@ impl RuntimeConnector {
                     Err(error) => return self.failed(error),
                 }
             }
+            self.record_retry();
             thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
             backoff = backoff.saturating_mul(2).min(MAX_READINESS_BACKOFF);
         }
@@ -566,7 +570,17 @@ impl RuntimeConnector {
         }
         status.endpoint = Some(config.address);
         status.workspace_root = Some(config.workspace_root);
+        status.retry_count = 0;
         status.last_error = None;
+    }
+
+    fn record_retry(&self) {
+        let mut status = self
+            .inner
+            .status
+            .lock()
+            .expect("runtime connection status lock poisoned");
+        status.retry_count = status.retry_count.saturating_add(1);
     }
 
     fn set_endpoint(&self, endpoint: SocketAddr) {
@@ -1671,7 +1685,11 @@ mod tests {
                     .env(READY_DIR_ENV, &ready_directory)
                     .env(
                         SERVER_HOLD_MS_ENV,
-                        if client_count == 2 { "700" } else { "5000" },
+                        // The mock runtime is hosted by the client process in
+                        // this fixture. Keep that process alive long enough
+                        // for every lock waiter to finish its health probe,
+                        // even on heavily loaded CI workers.
+                        "5000",
                     )
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());

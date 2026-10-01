@@ -24,9 +24,7 @@ use harness_models::{
     ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
-use harness_rpc::{
-    ProcessRuntimeLauncher, RpcResponse, RuntimeConnector, RuntimeLaunchConfig, ServerMessage,
-};
+use harness_rpc::{HarnessConnectionManager, RpcResponse, RuntimeLaunchConfig, ServerMessage};
 use harness_session::{
     EventId, EventPayload, HarnessEvent, JsonlSessionStore, Session, SessionStore,
 };
@@ -327,8 +325,13 @@ enum Command {
 
 #[derive(Clone, Debug, Subcommand)]
 enum RuntimeCommand {
+    /// Show whether a healthy runtime is available without starting one.
+    Status,
+    /// Restart the persistent per-user runtime cleanly.
+    Restart,
     /// Stop the persistent per-user runtime cleanly.
-    Shutdown,
+    #[command(alias = "shutdown")]
+    Stop,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -380,7 +383,15 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     config.validate()?;
     init_logging(&config.log_level)?;
     match &cli.command {
-        Some(Command::Workspace { path }) => inspect(cli, &effective_path(cli, path)),
+        Some(Command::Workspace { path }) => {
+            if !cli.json && io::stdin().is_terminal() && io::stdout().is_terminal() {
+                let mut interactive_cli = cli.clone();
+                interactive_cli.workspace = effective_path(cli, path);
+                interactive(&interactive_cli)
+            } else {
+                inspect(cli, &effective_path(cli, path))
+            }
+        }
         Some(Command::Run { task, path }) => {
             run_agent(cli, task.clone(), effective_path(cli, path), None)
         }
@@ -430,7 +441,9 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Runtime { command }) => runtime_command(cli, command),
         Some(Command::Tui) => interactive(cli),
         None => {
-            if cli.json {
+            if !cli.json && io::stdin().is_terminal() && io::stdout().is_terminal() {
+                return interactive(cli);
+            } else if cli.json {
                 println!("{}", json!({"type": "workspace", "path": cli.workspace}));
             } else {
                 println!("CogitoAI harness workspace: {}", cli.workspace.display());
@@ -457,8 +470,9 @@ fn interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("the interactive TUI needs a terminal on stdin and stdout; use `harness run` for scripts and pipes".into());
     }
+    let connector = HarnessConnectionManager::default();
     if std::env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb")) {
-        return plain_interactive(cli);
+        return plain_interactive(cli, connector);
     }
 
     let workspace_path = std::fs::canonicalize(effective_path(cli, Path::new(".")))?;
@@ -495,9 +509,31 @@ fn interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             .working_tree
             .map(|state| matches!(state, WorkingTreeState::Dirty)),
     };
+    let mut tui = Tui::new(startup, model.clone())?;
+    tui.show_runtime_status("Connecting to harness...")?;
+    let launch = runtime_launch_config(cli, &workspace_path, &model)?;
+    let startup_connection = match connector.connect_existing(&launch) {
+        Ok(client) => Ok(client),
+        Err(_) => {
+            tui.show_runtime_status("Starting runtime...")?;
+            connector.connect_or_start(&launch)
+        }
+    };
+    match startup_connection {
+        Ok(mut client) => {
+            report_connected_runtime(cli, &connector, &mut client, Some(&tui.sender()));
+            tui.set_runtime_status(Some("Connected"));
+        }
+        Err(error) => {
+            tui.set_runtime_status(Some("Runtime unavailable"));
+            if is_verbose(cli) {
+                tui.add_activity(format!("Runtime startup failed · {error}"));
+            }
+        }
+    }
     let cli = cli.clone();
-    let mut tui = Tui::new(startup, model)?;
-    tui.run(move |line, tui| dispatch_interactive(&cli, line, tui))?;
+    let run_connector = connector.clone();
+    tui.run(move |line, tui| dispatch_interactive(&cli, line, tui, &run_connector))?;
     Ok(())
 }
 
@@ -541,7 +577,10 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
 }
 
 /// A line-oriented fallback for terminals that report `TERM=dumb`.
-fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn plain_interactive(
+    cli: &Cli,
+    connector: HarnessConnectionManager,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut session_cli = cli.clone();
     let workspace = std::fs::canonicalize(effective_path(&session_cli, Path::new(".")))?;
     let model = model_config(&session_cli)?;
@@ -559,6 +598,24 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!("Enter a task or type /help. Ctrl+D exits.");
+    let launch = runtime_launch_config(&session_cli, &workspace, &model)?;
+    eprint!("Connecting to harness...");
+    let startup_connection = match connector.connect_existing(&launch) {
+        Ok(client) => Ok(client),
+        Err(_) => connector.connect_or_start(&launch),
+    };
+    match startup_connection {
+        Ok(mut client) => {
+            report_connected_runtime(cli, &connector, &mut client, None);
+            eprintln!(" connected.");
+        }
+        Err(error) => {
+            eprintln!(" unavailable.");
+            if is_verbose(cli) {
+                eprintln!("runtime startup failed: {error}");
+            }
+        }
+    }
     loop {
         print!("harness> ");
         io::stdout().flush()?;
@@ -584,11 +641,12 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if arguments.is_empty() {
                         eprintln!("usage: /run <task>");
                     } else {
-                        run_agent(
+                        run_agent_with_connector(
                             &session_cli,
                             arguments.to_owned(),
                             effective_path(&session_cli, Path::new(".")),
                             None,
+                            connector.clone(),
                         )?;
                         break;
                     }
@@ -604,7 +662,13 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                             .map(str::to_owned);
-                        resume_session(&session_cli, id, task, None)?;
+                        resume_session_with_connector(
+                            &session_cli,
+                            id,
+                            task,
+                            None,
+                            connector.clone(),
+                        )?;
                         break;
                     }
                 }
@@ -673,11 +737,12 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             continue;
         }
-        run_agent(
+        run_agent_with_connector(
             &session_cli,
             line.to_owned(),
             effective_path(&session_cli, Path::new(".")),
             None,
+            connector.clone(),
         )?;
         // The line-oriented fallback has no persistent event loop for signal
         // registration. Exit after a run so its one-shot Ctrl+C handler is not
@@ -687,9 +752,21 @@ fn plain_interactive(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), String> {
+fn dispatch_interactive(
+    cli: &Cli,
+    line: String,
+    tui: &mut Tui,
+    connector: &HarnessConnectionManager,
+) -> Result<(), String> {
     if !line.starts_with('/') {
-        return start_interactive_run(cli, line, effective_path(cli, Path::new(".")), None, tui);
+        return start_interactive_run(
+            cli,
+            line,
+            effective_path(cli, Path::new(".")),
+            None,
+            tui,
+            connector,
+        );
     }
     let Some((command, arguments)) = parse_interactive_command(&line) else {
         let command = line.split_whitespace().next().unwrap_or(&line);
@@ -712,6 +789,7 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
                     effective_path(cli, Path::new(".")),
                     None,
                     tui,
+                    connector,
                 )
             }
         }
@@ -740,7 +818,14 @@ fn dispatch_interactive(cli: &Cli, line: String, tui: &mut Tui) -> Result<(), St
                 )
                 .to_owned();
             tui.set_active_session_id(Some(session_id.to_string()));
-            start_interactive_run(cli, task, existing.workspace_root, Some(session_id), tui)
+            start_interactive_run(
+                cli,
+                task,
+                existing.workspace_root,
+                Some(session_id),
+                tui,
+                connector,
+            )
         }
         InteractiveCommand::Clear => {
             tui.clear_activity();
@@ -829,6 +914,7 @@ fn start_interactive_run(
     workspace: PathBuf,
     resume_session: Option<SessionId>,
     tui: &mut Tui,
+    connector: &HarnessConnectionManager,
 ) -> Result<(), String> {
     tui.set_active_session_id(resume_session.as_ref().map(ToString::to_string));
     let selected_model = tui.model_config();
@@ -839,6 +925,7 @@ fn start_interactive_run(
         return Err("a task is already running".to_owned());
     }
     let sender = tui.sender();
+    let run_connector = connector.clone();
     let failed_sender = sender.clone();
     let spawn = std::thread::Builder::new()
         .name("harness-agent-tui".to_owned())
@@ -850,6 +937,7 @@ fn start_interactive_run(
                 resume_session,
                 Some(sender.clone()),
                 Some(cancellation),
+                run_connector,
             )
             .map_err(|error| error.to_string());
             sender.run_finished(result);
@@ -1291,6 +1379,16 @@ fn resume_session(
     task: Option<String>,
     path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    resume_session_with_connector(cli, id, task, path, HarnessConnectionManager::default())
+}
+
+fn resume_session_with_connector(
+    cli: &Cli,
+    id: &str,
+    task: Option<String>,
+    path: Option<PathBuf>,
+    connector: HarnessConnectionManager,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session_id = SessionId::new(id.to_owned())?;
     let store = JsonlSessionStore::new(&cli.session_root)?;
     let existing = store.load(&session_id)?;
@@ -1313,7 +1411,7 @@ fn resume_session(
     let task = task.unwrap_or_else(|| {
         "Continue from the compacted session state and finish the remaining work.".to_owned()
     });
-    run_agent(&effective_cli, task, path, Some(session_id))
+    run_agent_with_connector(&effective_cli, task, path, Some(session_id), connector)
 }
 
 fn apply_session_model_preference(
@@ -1511,7 +1609,23 @@ fn run_agent(
     path: PathBuf,
     resume_session: Option<SessionId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_agent_with_ui(cli, task, path, resume_session, None, None)
+    run_agent_with_connector(
+        cli,
+        task,
+        path,
+        resume_session,
+        HarnessConnectionManager::default(),
+    )
+}
+
+fn run_agent_with_connector(
+    cli: &Cli,
+    task: String,
+    path: PathBuf,
+    resume_session: Option<SessionId>,
+    connector: HarnessConnectionManager,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_agent_with_ui(cli, task, path, resume_session, None, None, connector)
 }
 
 fn run_agent_with_ui(
@@ -1521,8 +1635,10 @@ fn run_agent_with_ui(
     resume_session: Option<SessionId>,
     tui: Option<TuiSender>,
     cancellation: Option<CancellationToken>,
+    connector: HarnessConnectionManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(&path)?;
+    let mut current_session_id = resume_session.as_ref().map(ToString::to_string);
     let description = discover_workspace(&path)?;
     let model_config = model_config(cli)?;
     let project_root = description
@@ -1581,15 +1697,8 @@ fn run_agent_with_ui(
         ctrlc::set_handler(move || handler_token.cancel())?;
     }
 
-    let address = cli_rpc_address(cli, &path)?;
-    let mut launch = RuntimeLaunchConfig::new(address, &path);
-    launch.model = Some(model_config.clone());
-    launch.session_root = Some(cli.session_root.clone());
-    launch.compaction_threshold_tokens = cli.compaction_threshold;
-    launch.mock_responses = mock_runtime_responses(&model_config)?;
-    launch.apply_saved_preferences = false;
-    let connector = RuntimeConnector::new(Arc::new(ProcessRuntimeLauncher::default()));
-    let mut client = connector.connect_or_start(&launch)?;
+    let launch = runtime_launch_config(cli, &path, &model_config)?;
+    let mut client = connect_runtime_for_cli(&connector, &launch, cli, tui.as_ref())?;
 
     let runtime_settings = rpc_result(client.request("settings.inspect", json!({}))?)?;
     let runtime_session_root = runtime_settings
@@ -1667,6 +1776,7 @@ fn run_agent_with_ui(
                     };
                     let event: HarnessEvent = serde_json::from_value(event_value.clone())?;
                     if matches!(event.payload, EventPayload::SessionStarted { .. }) {
+                        current_session_id = Some(event.session_id.to_string());
                         if let Some(tui) = &tui {
                             tui.active_session(&event.session_id.to_string());
                         }
@@ -1742,15 +1852,35 @@ fn run_agent_with_ui(
                 _ => {}
             },
             Ok(Ok(ServerMessage::Response(_))) => {}
-            Ok(Err(error)) => return Err(format!("runtime connection failed: {error}").into()),
+            Ok(Err(error)) => {
+                writer.shutdown();
+                let recovery = recover_after_run_disconnect(
+                    &connector,
+                    &launch,
+                    current_session_id.as_deref(),
+                    tui.as_ref(),
+                    cli,
+                );
+                return Err(format!("runtime connection failed: {error}; {recovery}").into());
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("runtime connection closed before the run completed".into())
+                writer.shutdown();
+                let recovery = recover_after_run_disconnect(
+                    &connector,
+                    &launch,
+                    current_session_id.as_deref(),
+                    tui.as_ref(),
+                    cli,
+                );
+                return Err(format!(
+                    "runtime connection closed before the run completed; {recovery}"
+                )
+                .into());
             }
         }
     };
     writer.shutdown();
-    connector.disconnect()?;
     if let Some(tui) = &tui {
         let final_git_status = GitClient::open(&project_root)
             .ok()
@@ -1795,38 +1925,282 @@ fn normalized_existing_path(path: &Path) -> PathBuf {
 }
 
 fn cli_rpc_address(cli: &Cli, workspace: &Path) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    Ok(RuntimeConnector::resolve_endpoint(
+    Ok(HarnessConnectionManager::resolve_endpoint(
         workspace,
         cli.rpc_address.as_deref(),
     )?)
 }
 
+fn runtime_launch_config(
+    cli: &Cli,
+    workspace: &Path,
+    model: &ModelConfig,
+) -> Result<RuntimeLaunchConfig, Box<dyn std::error::Error>> {
+    let mut launch = RuntimeLaunchConfig::new(cli_rpc_address(cli, workspace)?, workspace);
+    launch.model = Some(model.clone());
+    launch.session_root = Some(cli.session_root.clone());
+    launch.compaction_threshold_tokens = cli.compaction_threshold;
+    launch.mock_responses = mock_runtime_responses(model)?;
+    launch.apply_saved_preferences = false;
+    Ok(launch)
+}
+
+fn is_verbose(cli: &Cli) -> bool {
+    matches!(
+        cli.log_level.to_ascii_lowercase().as_str(),
+        "debug" | "trace"
+    )
+}
+
+fn connect_runtime_for_cli(
+    connector: &HarnessConnectionManager,
+    launch: &RuntimeLaunchConfig,
+    cli: &Cli,
+    tui: Option<&TuiSender>,
+) -> Result<harness_rpc::RpcClient, Box<dyn std::error::Error>> {
+    let show_progress = tui.is_none() && !cli.json && io::stderr().is_terminal();
+    if let Some(tui) = tui {
+        tui.runtime_status(Some("Connecting..."));
+    } else if show_progress {
+        eprint!("Connecting to harness...");
+        let _ = io::stderr().flush();
+    }
+
+    match connector.connect_or_start(launch) {
+        Ok(mut client) => {
+            if let Some(tui) = tui {
+                tui.runtime_status(Some("Connected"));
+            } else if show_progress {
+                eprintln!(" connected.");
+            }
+            report_connected_runtime(cli, connector, &mut client, tui);
+            Ok(client)
+        }
+        Err(error) => {
+            if let Some(tui) = tui {
+                tui.runtime_status(Some("Runtime unavailable"));
+            } else if show_progress {
+                eprintln!(" unavailable.");
+            }
+            if is_verbose(cli) {
+                if let Some(tui) = tui {
+                    tui.activity(format!("Runtime connection failed · {error}"));
+                } else {
+                    eprintln!("runtime connection failed: {error}");
+                }
+            }
+            if is_verbose(cli) {
+                Err(error.into())
+            } else {
+                Err("Harness runtime unavailable. Check `harness runtime status` or enable --log-level debug for diagnostics.".into())
+            }
+        }
+    }
+}
+
+fn report_connected_runtime(
+    cli: &Cli,
+    connector: &HarnessConnectionManager,
+    client: &mut harness_rpc::RpcClient,
+    tui: Option<&TuiSender>,
+) {
+    if !is_verbose(cli) {
+        return;
+    }
+    let status = connector.status();
+    let health = client
+        .request("health/check", json!({}))
+        .ok()
+        .and_then(|response| rpc_result(response).ok());
+    let pid = health
+        .as_ref()
+        .and_then(|health| health.get("pid"))
+        .and_then(Value::as_u64)
+        .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+    let runtime_version = health
+        .as_ref()
+        .and_then(|health| health.get("runtimeVersion"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let protocol_version = health
+        .as_ref()
+        .and_then(|health| health.get("protocolVersion"))
+        .and_then(Value::as_u64)
+        .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+    let endpoint = status
+        .endpoint
+        .map_or_else(|| "unknown".to_owned(), |endpoint| endpoint.to_string());
+    let disposition = if status.started_runtime {
+        "started"
+    } else {
+        "reused"
+    };
+    let diagnostic = format!(
+        "runtime: endpoint={endpoint} pid={pid} disposition={disposition} protocol={protocol_version} version={runtime_version} readiness-retries={} backoff=50-500ms",
+        status.retry_count
+    );
+    if let Some(tui) = tui {
+        tui.activity(diagnostic);
+    } else {
+        eprintln!("{diagnostic}");
+    }
+}
+
+fn recover_after_run_disconnect(
+    connector: &HarnessConnectionManager,
+    launch: &RuntimeLaunchConfig,
+    session_id: Option<&str>,
+    tui: Option<&TuiSender>,
+    cli: &Cli,
+) -> String {
+    if let Some(tui) = tui {
+        tui.runtime_status(Some("Reconnecting..."));
+    } else if !cli.json && io::stderr().is_terminal() {
+        eprintln!("Runtime connection lost; reconnecting...");
+    }
+    match connector.reconnect(launch) {
+        Ok(mut client) => {
+            if let Some(tui) = tui {
+                tui.runtime_status(Some("Connected"));
+            }
+            report_connected_runtime(cli, connector, &mut client, tui);
+            let refreshed = session_id.is_some_and(|session_id| {
+                client
+                    .request("session.state", json!({"session_id": session_id}))
+                    .ok()
+                    .is_some_and(|response| response.ok)
+            });
+            let message = if refreshed {
+                "runtime reconnected and the saved session state was refreshed; the interrupted task was not replayed. Use /resume or `harness resume` to continue."
+            } else {
+                "runtime reconnected; the interrupted task was not replayed. Check the session list before continuing."
+            };
+            if let Some(tui) = tui {
+                tui.activity(message);
+            }
+            message.to_owned()
+        }
+        Err(error) => {
+            if let Some(tui) = tui {
+                tui.runtime_status(Some("Runtime unavailable"));
+                if is_verbose(cli) {
+                    tui.activity(format!("Reconnect failed · {error}"));
+                }
+            }
+            if is_verbose(cli) {
+                format!("runtime reconnect failed: {error}; the task was not replayed")
+            } else {
+                "runtime reconnect failed; the task was not replayed".to_owned()
+            }
+        }
+    }
+}
+
 fn runtime_command(cli: &Cli, command: &RuntimeCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = std::fs::canonicalize(&cli.workspace)?;
+    let launch = RuntimeLaunchConfig::new(cli_rpc_address(cli, &workspace)?, &workspace);
+    let connector = HarnessConnectionManager::default();
     match command {
-        RuntimeCommand::Shutdown => {
-            let workspace = std::fs::canonicalize(&cli.workspace)?;
-            let address = cli_rpc_address(cli, &workspace)?;
-            let connector = RuntimeConnector::new(Arc::new(ProcessRuntimeLauncher::default()));
-            let mut client =
-                connector.connect_existing(&RuntimeLaunchConfig::new(address, &workspace))?;
-            let health = rpc_result(client.request("health/check", json!({}))?)?;
-            let instance_id = health
-                .get("instanceId")
-                .and_then(Value::as_str)
-                .ok_or("runtime health response did not include an instance ID")?;
-            let result =
-                rpc_result(client.request("rpc.shutdown", json!({"instanceId": instance_id}))?)?;
+        RuntimeCommand::Status => match connector.connect_existing(&launch) {
+            Ok(mut client) => {
+                let health = health_summary(&mut client)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        json!({"type":"runtime","status":"connected","runtime":health})
+                    );
+                } else {
+                    println!(
+                        "Harness runtime connected · pid {} · protocol {} · v{}",
+                        health["pid"], health["protocolVersion"], health["runtimeVersion"]
+                    );
+                }
+                Ok(())
+            }
+            Err(_) => {
+                if cli.json {
+                    println!("{}", json!({"type":"runtime","status":"unavailable"}));
+                } else {
+                    println!("Harness runtime unavailable.");
+                }
+                Ok(())
+            }
+        },
+        RuntimeCommand::Stop => stop_runtime(cli, &connector, &launch),
+        RuntimeCommand::Restart => {
+            let model = model_config(cli)?;
+            let launch = runtime_launch_config(cli, &workspace, &model)?;
+            if let Ok(mut client) = connector.connect_existing(&launch) {
+                let _ = request_runtime_shutdown(&mut client)?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                let mut stopped = false;
+                while std::time::Instant::now() < deadline {
+                    if connector.connect_existing(&launch).is_err() {
+                        stopped = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if !stopped {
+                    return Err("timed out waiting for the Harness runtime to stop".into());
+                }
+            }
+            let mut client = connector.connect_or_start(&launch)?;
+            let health = health_summary(&mut client)?;
             if cli.json {
                 println!(
                     "{}",
-                    json!({"type":"runtime","result":result,"instanceId":instance_id})
+                    json!({"type":"runtime","status":"restarted","runtime":health})
                 );
             } else {
-                println!("Harness runtime shutdown requested ({instance_id}).");
+                println!(
+                    "Harness runtime restarted · pid {} · v{}",
+                    health["pid"], health["runtimeVersion"]
+                );
             }
             Ok(())
         }
     }
+}
+
+fn stop_runtime(
+    cli: &Cli,
+    connector: &HarnessConnectionManager,
+    launch: &RuntimeLaunchConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match connector.connect_existing(launch) {
+        Ok(mut client) => {
+            let result = request_runtime_shutdown(&mut client)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({"type":"runtime","status":"stopping","result":result})
+                );
+            } else {
+                println!("Harness runtime shutdown requested.");
+            }
+        }
+        Err(_) if cli.json => println!("{}", json!({"type":"runtime","status":"not_running"})),
+        Err(_) => println!("Harness runtime is not running."),
+    }
+    Ok(())
+}
+
+fn health_summary(
+    client: &mut harness_rpc::RpcClient,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    rpc_result(client.request("health/check", json!({}))?)
+}
+
+fn request_runtime_shutdown(
+    client: &mut harness_rpc::RpcClient,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let health = health_summary(client)?;
+    let instance_id = health
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .ok_or("runtime health response did not include an instance ID")?;
+    rpc_result(client.request("rpc.shutdown", json!({"instanceId": instance_id}))?)
 }
 
 fn auth_command(cli: &Cli, command: &AuthCommand) -> Result<(), Box<dyn std::error::Error>> {

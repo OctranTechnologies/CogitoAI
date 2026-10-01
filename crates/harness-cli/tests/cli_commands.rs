@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -14,13 +16,29 @@ impl TestTempDir {
 
 impl Drop for TestTempDir {
     fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_harness-cli"))
+        let binary = env!("CARGO_BIN_EXE_harness-cli");
+        let _ = Command::new(binary)
             .arg("--workspace")
             .arg(self.path())
             .arg("--session-root")
             .arg(self.path().join("sessions"))
-            .args(["--json", "runtime", "shutdown"])
+            .args(["--json", "runtime", "stop"])
             .output();
+        for _ in 0..40 {
+            let output = Command::new(binary)
+                .arg("--workspace")
+                .arg(self.path())
+                .arg("--session-root")
+                .arg(self.path().join("sessions"))
+                .args(["--json", "runtime", "status"])
+                .output();
+            if output.as_ref().is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout).contains("\"status\":\"unavailable\"")
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -37,6 +55,19 @@ fn cli(root: &Path, arguments: &[&str]) -> Output {
         .args(["--workspace", &root, "--session-root", &session_root])
         .args(arguments);
     command.output().expect("CLI should start")
+}
+
+fn cli_child(root: &Path, arguments: &[&str]) -> std::process::Child {
+    let session_root = root.join("sessions");
+    let root = root.to_string_lossy();
+    let session_root = session_root.to_string_lossy();
+    Command::new(env!("CARGO_BIN_EXE_harness-cli"))
+        .args(["--workspace", &root, "--session-root", &session_root])
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("CLI should start")
 }
 
 fn assert_success(output: &Output) {
@@ -105,6 +136,197 @@ fn no_subcommand_keeps_the_legacy_workspace_summary() {
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("CogitoAI harness workspace:"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains('\u{1b}'));
+}
+
+#[test]
+fn runtime_status_json_does_not_start_a_missing_runtime() {
+    let temporary = tempdir().unwrap();
+    let output = cli(temporary.path(), &["--json", "runtime", "status"]);
+    assert_success(&output);
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "unavailable");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Connecting to harness"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Starting runtime"));
+}
+
+#[test]
+fn runtime_is_started_from_cold_and_shared_by_simultaneous_cli_clients() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let offline = cli(root, &["--json", "runtime", "status"]);
+    assert_success(&offline);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&offline.stdout).unwrap()["status"],
+        "unavailable"
+    );
+
+    let run = cli(
+        root,
+        &[
+            "--json",
+            "--yes",
+            "run",
+            "create a mock output",
+            &root.to_string_lossy(),
+        ],
+    );
+    assert_success(&run);
+    for line in String::from_utf8_lossy(&run.stdout).lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .expect("startup diagnostics must not pollute JSON event output");
+    }
+
+    let first = cli_child(root, &["--json", "runtime", "status"]);
+    let second = cli_child(root, &["--json", "runtime", "status"]);
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert_success(&first);
+    assert_success(&second);
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(first["status"], "connected");
+    assert_eq!(second["status"], "connected");
+    assert!(first["runtime"]["pid"].is_u64());
+    assert_eq!(first["runtime"]["pid"], second["runtime"]["pid"]);
+}
+
+#[test]
+fn runtime_restart_replaces_the_server_and_shutdown_remains_an_alias() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let run = cli(
+        root,
+        &[
+            "--json",
+            "--yes",
+            "run",
+            "create a mock output",
+            &root.to_string_lossy(),
+        ],
+    );
+    assert_success(&run);
+    let before = cli(root, &["--json", "runtime", "status"]);
+    assert_success(&before);
+    let before: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    let before_pid = before["runtime"]["pid"].as_u64().unwrap();
+
+    let restarted = cli(root, &["--json", "runtime", "restart"]);
+    assert_success(&restarted);
+    let restarted: serde_json::Value = serde_json::from_slice(&restarted.stdout).unwrap();
+    assert_eq!(restarted["status"], "restarted");
+    assert_ne!(restarted["runtime"]["pid"].as_u64().unwrap(), before_pid);
+
+    let stopped = cli(root, &["--json", "runtime", "shutdown"]);
+    assert_success(&stopped);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&stopped.stdout).unwrap()["status"],
+        "stopping"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn active_cli_run_reconnects_after_runtime_is_stopped_without_replaying_task() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::thread;
+
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    fs::create_dir_all(root.join(".agent")).unwrap();
+    fs::write(
+        root.join(".agent/config.toml"),
+        "[commands]\ntest = [\"cmd\", \"/C\", \"ping -n 12 127.0.0.1 > NUL\"]\n",
+    )
+    .unwrap();
+
+    let mut child = cli_child(
+        root,
+        &[
+            "--json",
+            "--yes",
+            "run",
+            "create a mock output",
+            &root.to_string_lossy(),
+        ],
+    );
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (event_sender, event_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if event_sender.send(line.unwrap_or_default()).is_err() {
+                break;
+            }
+        }
+    });
+    let (stderr_sender, stderr_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut text = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut text);
+        let _ = stderr_sender.send(text);
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    let mut session_id = None;
+    let mut reached_verification = false;
+    while std::time::Instant::now() < deadline {
+        let Ok(line) = event_receiver.recv_timeout(Duration::from_millis(250)) else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if event["event_type"] == "session.started" {
+            session_id = event["session_id"].as_str().map(str::to_owned);
+        }
+        if event["event_type"] == "verification.started" {
+            reached_verification = true;
+            break;
+        }
+    }
+    assert!(
+        reached_verification,
+        "mock run did not reach its delayed verification step"
+    );
+    assert!(
+        session_id.is_some(),
+        "the active session identity should be known before recovery"
+    );
+
+    let stopped = cli(root, &["--json", "runtime", "stop"]);
+    assert_success(&stopped);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&stopped.stdout).unwrap()["status"],
+        "stopping"
+    );
+
+    let (exit_sender, exit_receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = exit_sender.send(child.wait());
+    });
+    let status = exit_receiver
+        .recv_timeout(Duration::from_secs(25))
+        .expect("CLI should finish reconnecting without hanging")
+        .unwrap();
+    assert!(
+        !status.success(),
+        "an interrupted task must not be silently replayed"
+    );
+    let stderr = stderr_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("CLI stderr should close");
+    assert!(stderr.contains("runtime reconnected"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("session state was refreshed"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("task was not replayed"), "stderr: {stderr}");
+    let recovered = cli(root, &["--json", "runtime", "status"]);
+    assert_success(&recovered);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&recovered.stdout).unwrap()["status"],
+        "connected"
+    );
 }
 
 #[test]

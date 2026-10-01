@@ -519,7 +519,7 @@ cargo build --workspace
 Inspect a workspace without running any project code:
 
 ```bash
-cargo run -p harness-cli -- .
+cargo run -p harness-cli -- inspect .
 ```
 
 Run the deterministic mock workflow, which needs no credentials:
@@ -549,7 +549,9 @@ cargo run -p harness-cli -- resume <session-id> "Continue the remaining work"
 cargo run -p harness-cli -- status
 cargo run -p harness-cli -- diff
 cargo run -p harness-cli -- undo
-cargo run -p harness-cli -- runtime shutdown
+cargo run -p harness-cli -- runtime status
+cargo run -p harness-cli -- runtime restart
+cargo run -p harness-cli -- runtime stop
 ```
 
 `inspect` reports the repository root, Git state, detected languages, manifests,
@@ -566,19 +568,26 @@ Global options: `--workspace` (default `.`), `--session-root` (default
 `Ctrl+C`; the cancellation token is shared with tool execution and verification
 commands.
 
-Agent runs discover a loopback runtime automatically through per-user runtime
-metadata. The shared connector starts the runtime binary when necessary; no
-separate server command is needed. It searches beside the CLI executable and in
-standard application resource directories, independently of the current working
-directory. Set `COGITO_RUNTIME_BINARY` only when you need to override discovery.
+Runtime-backed CLI workflows discover a loopback server through per-user runtime
+metadata and start it automatically when needed; no separate server command is
+needed. In a terminal, `harness` and `harness .` open the interactive interface,
+which connects before showing the prompt. `harness run "..."` does the same
+bootstrap for a one-shot task. The runtime binary is located beside the CLI
+executable or in application resource directories, independently of the current
+working directory. Set `COGITO_RUNTIME_BINARY` only when you need to override
+discovery.
 The CLI requests an OS-assigned loopback port when it starts a server; set
 `--rpc-address` or `COGITO_RPC_ADDRESS` to use a fixed loopback endpoint. A
 connected runtime must already serve the requested workspace and use the same
 session root.
 
 The runtime stays available after a CLI or desktop window closes. Stop it for
-development or troubleshooting with `harness runtime shutdown` (or add
-`--workspace <path>` to select a different workspace runtime).
+development or troubleshooting with `harness runtime stop` (`shutdown` remains
+an alias), check it with `harness runtime status`, or replace it with
+`harness runtime restart`. Add `--workspace <path>` to select a different
+workspace runtime. Use `--log-level debug` to print connection diagnostics such
+as endpoint, PID, startup/reuse, protocol, and runtime version. Startup status is
+kept off `--json` stdout.
 
 `--yes` auto-approves policy prompts. Use it only in a disposable workspace or in
 CI.
@@ -588,6 +597,10 @@ CI.
 Start the full-screen terminal interface in a terminal:
 
 ```bash
+cargo run -p harness-cli
+# or explicitly select the current workspace
+cargo run -p harness-cli -- .
+# the explicit command remains available
 cargo run -p harness-cli -- tui
 ```
 
@@ -629,6 +642,11 @@ be combined with `--json`.
 The TUI runs one foreground task at a time. It does not keep tasks running in the
 background after the interface exits. Use the existing `run`, `resume`, and
 `--json` commands for scripts and automation.
+
+If the RPC runtime exits during an active task, the CLI reconnects and refreshes
+the saved session state without resubmitting the task. It reports the preserved
+session ID and leaves continuation to an explicit `/resume` or `harness resume`
+command, so a potentially mutating task is never replayed automatically.
 
 ## Running the desktop application
 
