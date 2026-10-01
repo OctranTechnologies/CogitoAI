@@ -1,13 +1,15 @@
 //! Shared local runtime discovery, startup, and RPC connection management.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -21,7 +23,10 @@ use crate::{RpcClient, RpcClientError, RpcResponse};
 
 const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_millis(80);
-const STALE_LOCK_AGE: Duration = Duration::from_secs(120);
+// OS file locks coordinate separate CLI/desktop processes. Windows locks are
+// process-scoped, so also serialize competing connector threads per lock path.
+static PROCESS_STARTUP_LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Arc<AtomicBool>>>> =
+    OnceLock::new();
 
 /// Current state of the shared runtime connection lifecycle.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -70,8 +75,14 @@ pub enum RuntimeConnectError {
     Startup(String),
     #[error("timed out waiting for the runtime at {endpoint}")]
     ReadinessTimeout { endpoint: SocketAddr },
-    #[error("timed out waiting for the runtime startup lock at {endpoint}")]
-    StartupLockTimeout { endpoint: SocketAddr },
+    #[error(
+        "timed out waiting for runtime startup lock for {endpoint}; lock file {lock_path}; recorded owner PID {owner_pid:?}"
+    )]
+    StartupLockTimeout {
+        endpoint: SocketAddr,
+        lock_path: PathBuf,
+        owner_pid: Option<u32>,
+    },
     #[error("invalid connection-state transition: {from:?} → {to:?}")]
     InvalidTransition {
         from: ConnectionState,
@@ -223,6 +234,23 @@ impl RuntimeConnector {
             .metadata_store
             .ensure_private_directory()
             .map_err(|error| RuntimeConnectError::Startup(error.to_string()))?;
+        let process_lock = process_startup_lock(&lock_path);
+        let _process_startup_guard = loop {
+            if process_lock
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break ProcessStartupGuard(Arc::clone(&process_lock));
+            }
+            if Instant::now() >= deadline {
+                return self.failed(RuntimeConnectError::StartupLockTimeout {
+                    endpoint: config.address,
+                    lock_path: lock_path.clone(),
+                    owner_pid: lock_owner_pid(&lock_path),
+                });
+            }
+            thread::sleep(self.inner.retry_interval);
+        };
         let mut startup_lock = loop {
             match try_startup_lock(&lock_path) {
                 Ok(Some(lock)) => break Some(lock),
@@ -246,6 +274,8 @@ impl RuntimeConnector {
                     if Instant::now() >= deadline {
                         return self.failed(RuntimeConnectError::StartupLockTimeout {
                             endpoint: config.address,
+                            lock_path: lock_path.clone(),
+                            owner_pid: lock_owner_pid(&lock_path),
                         });
                     }
                     thread::sleep(self.inner.retry_interval);
@@ -281,13 +311,7 @@ impl RuntimeConnector {
         let launch = match launch {
             Ok(launch) => launch,
             Err(error) if is_address_in_use(&error) && config.address.port() != 0 => {
-                match probe(&config, None) {
-                    Ok(client) => {
-                        drop(startup_lock.take());
-                        return self.connected(client, false);
-                    }
-                    Err(_) => return self.failed(RuntimeConnectError::Startup(error)),
-                }
+                return self.wait_until_ready_normalized(&config, None);
             }
             Err(error) => return self.failed(RuntimeConnectError::Startup(error)),
         };
@@ -672,66 +696,100 @@ fn try_startup_lock(path: &std::path::Path) -> Result<Option<StartupLock>, Runti
     fs::create_dir_all(lock_dir).map_err(|error| {
         RuntimeConnectError::Startup(format!("could not create startup-lock directory: {error}"))
     })?;
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            let write_result = (|| {
-                writeln!(file, "pid={}", std::process::id()).map_err(|error| {
-                    RuntimeConnectError::Startup(format!("could not write startup lock: {error}"))
-                })?;
-                file.sync_all().map_err(|error| {
-                    RuntimeConnectError::Startup(format!("could not flush startup lock: {error}"))
-                })
-            })();
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    crate::metadata::set_private_file_mode(&mut options);
+    let file = options.open(path).map_err(|error| {
+        RuntimeConnectError::Startup(format!(
+            "could not open runtime startup lock {}: {error}",
+            path.display()
+        ))
+    })?;
+
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let owner_path = lock_owner_path(path);
+            let mut owner_options = OpenOptions::new();
+            owner_options.write(true).create(true).truncate(true);
+            crate::metadata::set_private_file_mode(&mut owner_options);
+            let write_result = owner_options.open(&owner_path).and_then(|mut owner_file| {
+                writeln!(owner_file, "pid={}", std::process::id())?;
+                owner_file.sync_all()
+            });
             if let Err(error) = write_result {
-                drop(file);
-                let _ = fs::remove_file(path);
-                return Err(error);
+                let _ = FileExt::unlock(&file);
+                return Err(RuntimeConnectError::Startup(format!(
+                    "could not record runtime startup lock owner in {}: {error}",
+                    path.display()
+                )));
             }
-            Ok(Some(StartupLock {
-                path: path.to_path_buf(),
-                _file: file,
-            }))
+            Ok(Some(StartupLock { _file: file }))
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if stale_lock(path) {
-                let _ = fs::remove_file(path);
-            }
-            Ok(None)
-        }
+        Err(error) if is_lock_contention(&error) => Ok(None),
         Err(error) => Err(RuntimeConnectError::Startup(format!(
-            "could not acquire startup lock: {error}"
+            "could not acquire runtime startup lock {}: {error}",
+            path.display()
         ))),
     }
 }
 
-fn stale_lock(path: &std::path::Path) -> bool {
-    let age = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
-    let owner_pid = fs::read_to_string(path).ok().and_then(|contents| {
-        contents.lines().find_map(|line| {
-            line.strip_prefix("pid=")
-                .and_then(|pid| pid.parse::<u32>().ok())
-        })
-    });
-    if let Some(pid) = owner_pid {
-        if process_exists(pid) == Some(false) {
-            return true;
-        }
+fn is_lock_contention(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
     }
-    age.is_some_and(|age| age > STALE_LOCK_AGE)
+    match error.raw_os_error() {
+        #[cfg(windows)]
+        Some(32 | 33) => true, // sharing violation or lock violation
+        #[cfg(unix)]
+        Some(11 | 35) => true, // EAGAIN / EWOULDBLOCK
+        _ => false,
+    }
 }
 
-struct StartupLock {
-    path: PathBuf,
-    _file: File,
+fn lock_owner_pid(path: &std::path::Path) -> Option<u32> {
+    let mut file = File::open(lock_owner_path(path)).ok()?;
+    let mut contents = String::new();
+    Read::by_ref(&mut file)
+        .take(256)
+        .read_to_string(&mut contents)
+        .ok()?;
+    contents.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|pid| pid.parse::<u32>().ok())
+    })
 }
 
-impl Drop for StartupLock {
+fn lock_owner_path(path: &std::path::Path) -> PathBuf {
+    let mut owner_path = path.as_os_str().to_os_string();
+    owner_path.push(".owner");
+    PathBuf::from(owner_path)
+}
+
+fn process_startup_lock(path: &std::path::Path) -> Arc<AtomicBool> {
+    let locks = PROCESS_STARTUP_LOCKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+    )
+}
+
+struct ProcessStartupGuard(Arc<AtomicBool>);
+
+impl Drop for ProcessStartupGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        self.0.store(false, Ordering::Release);
     }
+}
+
+/// The kernel lock is released when its file handle closes, including when the
+/// owner process exits unexpectedly. Keep the lock file itself in place to
+/// avoid unlink/recreate races between waiters.
+struct StartupLock {
+    _file: File,
 }
 
 fn is_valid_transition(from: ConnectionState, to: ConnectionState) -> bool {
@@ -769,7 +827,8 @@ mod tests {
     };
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Barrier;
 
     struct TestLauncher {
         delay: Duration,
@@ -815,7 +874,179 @@ mod tests {
         }
     }
 
+    struct ConcurrentLauncher {
+        starts: Arc<AtomicUsize>,
+        shutdown: Arc<AtomicBool>,
+        server_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+        startup_delay: Duration,
+    }
+
+    impl ConcurrentLauncher {
+        fn new(startup_delay: Duration) -> Self {
+            Self {
+                starts: Arc::new(AtomicUsize::new(0)),
+                shutdown: Arc::new(AtomicBool::new(false)),
+                server_threads: Mutex::new(Vec::new()),
+                startup_delay,
+            }
+        }
+
+        fn stop(&self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            for server in self
+                .server_threads
+                .lock()
+                .expect("test server thread list lock")
+                .drain(..)
+            {
+                server.join().expect("test server stops cleanly");
+            }
+        }
+    }
+
+    impl RuntimeLauncher for ConcurrentLauncher {
+        fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<RuntimeLaunchInfo, String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let listener = TcpListener::bind(config.address).map_err(|error| error.to_string())?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|error| error.to_string())?;
+            let endpoint = listener.local_addr().map_err(|error| error.to_string())?;
+            let instance_id = config
+                .instance_id
+                .clone()
+                .ok_or_else(|| "test launch requires an instance ID".to_owned())?;
+            let server_instance_id = instance_id.clone();
+            let shutdown = Arc::clone(&self.shutdown);
+            let startup_delay = self.startup_delay;
+            let server = thread::spawn(move || {
+                thread::sleep(startup_delay);
+                while !shutdown.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let instance_id = server_instance_id.clone();
+                            thread::spawn(move || serve_test_connection(stream, instance_id));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => {
+                            eprintln!("concurrent test server accept failed: {error}");
+                            break;
+                        }
+                    }
+                }
+            });
+            self.server_threads
+                .lock()
+                .expect("test server thread list lock")
+                .push(server);
+            Ok(RuntimeLaunchInfo {
+                endpoint,
+                instance_id,
+            })
+        }
+    }
+
+    struct ReadinessFailLauncher {
+        starts: AtomicUsize,
+        listeners: Mutex<Vec<TcpListener>>,
+    }
+
+    impl ReadinessFailLauncher {
+        fn new() -> Self {
+            Self {
+                starts: AtomicUsize::new(0),
+                listeners: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RuntimeLauncher for ReadinessFailLauncher {
+        fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<RuntimeLaunchInfo, String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let listener = TcpListener::bind(config.address).map_err(|error| error.to_string())?;
+            let endpoint = listener.local_addr().map_err(|error| error.to_string())?;
+            let instance_id = config
+                .instance_id
+                .clone()
+                .ok_or_else(|| "test launch requires an instance ID".to_owned())?;
+            self.listeners
+                .lock()
+                .expect("test listener lock")
+                .push(listener);
+            Ok(RuntimeLaunchInfo {
+                endpoint,
+                instance_id,
+            })
+        }
+    }
+
+    struct ManualStartupRaceLauncher {
+        starts: AtomicUsize,
+        delay: Duration,
+    }
+
+    impl RuntimeLauncher for ManualStartupRaceLauncher {
+        fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<RuntimeLaunchInfo, String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            // Simulate a manually started server winning the port bind after
+            // the automatic client's initial health check.
+            let listener = TcpListener::bind(config.address).map_err(|error| error.to_string())?;
+            let instance_id = config
+                .instance_id
+                .clone()
+                .ok_or_else(|| "test launch requires an instance ID".to_owned())?;
+            let delay = self.delay;
+            thread::spawn(move || {
+                thread::sleep(delay);
+                if let Some(Ok(stream)) = listener.incoming().next() {
+                    serve_test_connection(stream, instance_id);
+                }
+            });
+            Err("address already in use".to_owned())
+        }
+    }
+
+    struct ProcessCountingLauncher {
+        launch_log: PathBuf,
+    }
+
+    impl RuntimeLauncher for ProcessCountingLauncher {
+        fn start_runtime(&self, config: &RuntimeLaunchConfig) -> Result<RuntimeLaunchInfo, String> {
+            let listener = TcpListener::bind(config.address).map_err(|error| error.to_string())?;
+            let endpoint = listener.local_addr().map_err(|error| error.to_string())?;
+            let instance_id = config
+                .instance_id
+                .clone()
+                .ok_or_else(|| "test launch requires an instance ID".to_owned())?;
+            let mut log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.launch_log)
+                .map_err(|error| error.to_string())?;
+            writeln!(log, "pid={}", std::process::id()).map_err(|error| error.to_string())?;
+            log.sync_all().map_err(|error| error.to_string())?;
+            let server_instance_id = instance_id.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let instance_id = server_instance_id.clone();
+                    thread::spawn(move || serve_test_connection(stream, instance_id));
+                }
+            });
+            Ok(RuntimeLaunchInfo {
+                endpoint,
+                instance_id,
+            })
+        }
+    }
+
     fn serve_test_connection(mut stream: TcpStream, instance_id: String) {
+        // On Windows a stream accepted from a nonblocking listener can retain
+        // that mode, unlike Unix. The test RPC handler requires blocking I/O.
+        if stream.set_nonblocking(false).is_err() {
+            return;
+        }
         let Ok(cloned) = stream.try_clone() else {
             return;
         };
@@ -823,8 +1054,10 @@ mod tests {
         let mut line = String::new();
         loop {
             line.clear();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                break;
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
             }
             let Ok(request) = serde_json::from_str::<RpcRequest>(&line) else {
                 break;
@@ -976,19 +1209,96 @@ mod tests {
     }
 
     #[test]
-    fn startup_lock_from_a_dead_process_is_recovered_immediately() {
+    fn startup_lock_releases_when_holder_process_exits_abruptly() {
+        const CRASH_LOCK_PATH: &str = "COGITO_TEST_STARTUP_LOCK_CRASH_PATH";
+        const HOLD_LOCK_PATH: &str = "COGITO_TEST_STARTUP_LOCK_HOLD_PATH";
+        if let Some(path) = std::env::var_os(CRASH_LOCK_PATH) {
+            let _lock = try_startup_lock(std::path::Path::new(&path))
+                .expect("child acquires startup lock")
+                .expect("startup lock is not already held");
+            // Exit without unwinding or running StartupLock destructors. The
+            // operating system must release the lock as it closes our handle.
+            std::process::exit(73);
+        }
+        if let Some(path) = std::env::var_os(HOLD_LOCK_PATH) {
+            let _lock = try_startup_lock(std::path::Path::new(&path))
+                .expect("child acquires startup lock")
+                .expect("startup lock is not already held");
+            thread::sleep(Duration::from_millis(700));
+            return;
+        }
+
         let directory = tempfile::tempdir().expect("runtime directory");
         let path = directory.path().join("runtime-test.lock");
-        fs::write(&path, "pid=2147483647\n").expect("write abandoned lock");
-        assert!(try_startup_lock(&path)
-            .expect("inspect abandoned lock")
-            .is_none());
+        let child = spawn_lock_test_process(CRASH_LOCK_PATH, &path)
+            .status()
+            .expect("start child lock holder");
+        assert_eq!(child.code(), Some(73));
+
         let lock = try_startup_lock(&path)
-            .expect("retry after removing abandoned lock")
-            .expect("dead owner lock should be replaced");
-        assert!(path.exists());
+            .expect("lock is recoverable after process exit")
+            .expect("OS released crashed process lock");
         drop(lock);
-        assert!(!path.exists());
+        assert!(path.exists(), "lock file remains but is not locked");
+    }
+
+    #[test]
+    fn startup_lock_wait_is_bounded_and_reports_owner_diagnostics() {
+        let directory = tempfile::tempdir().expect("runtime directory");
+        let config = auto_config();
+        let store = RuntimeMetadataStore::new(directory.path());
+        store.ensure_private_directory().unwrap();
+        let normalized = normalized_config(&config).unwrap();
+        let lock_path = store.startup_lock_path(&normalized.workspace_root);
+        let mut child = spawn_lock_test_process(HOLD_LOCK_PATH, &lock_path)
+            .spawn()
+            .expect("start lock holder");
+
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while lock_owner_pid(&lock_path).is_none() && Instant::now() < wait_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let owner_pid = lock_owner_pid(&lock_path).expect("lock owner diagnostic was written");
+        assert!(
+            try_startup_lock(&lock_path)
+                .expect("probe held startup lock")
+                .is_none(),
+            "child PID {owner_pid} should hold {}",
+            lock_path.display()
+        );
+        let connector = RuntimeConnector::with_timing_and_runtime_directory(
+            Arc::new(TestLauncher::new(Duration::ZERO, false)),
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            directory.path(),
+        );
+        let started = Instant::now();
+        let error = match connector.connect_or_start(&config) {
+            Ok(_) => panic!("held startup lock should time out"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let message = error.to_string();
+        assert!(message.contains(&lock_path.display().to_string()));
+        assert!(message.contains(&format!("Some({owner_pid})")));
+        assert_eq!(connector.status().state, ConnectionState::Failed);
+
+        assert!(child.wait().expect("lock holder exits").success());
+    }
+
+    const HOLD_LOCK_PATH: &str = "COGITO_TEST_STARTUP_LOCK_HOLD_PATH";
+
+    fn spawn_lock_test_process(variable: &str, path: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "bootstrap::tests::startup_lock_releases_when_holder_process_exits_abruptly",
+            ])
+            .env(variable, path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
     }
 
     #[test]
@@ -1017,6 +1327,62 @@ mod tests {
             .reconnect(&config)
             .expect("reconnect reuses the healthy endpoint");
         assert_eq!(connector.status().state, ConnectionState::Connected);
+    }
+
+    #[test]
+    fn manual_server_and_automatic_runtime_coexist_on_distinct_endpoints() {
+        let automatic_config = auto_config();
+        let manual_endpoint = free_address();
+        let _manual_server = run_fake_server(manual_endpoint, "manual-server-instance");
+        let directory = tempfile::tempdir().expect("runtime metadata directory");
+        let launcher = Arc::new(ConcurrentLauncher::new(Duration::ZERO));
+        let connector = RuntimeConnector::with_timing_and_runtime_directory(
+            launcher.clone(),
+            Duration::from_secs(3),
+            Duration::from_millis(10),
+            directory.path(),
+        );
+        let manual_config =
+            RuntimeLaunchConfig::new(manual_endpoint, automatic_config.workspace_root.clone());
+
+        let _manual_client = connector
+            .connect_or_start(&manual_config)
+            .expect("explicit manual endpoint is reused");
+        assert_eq!(launcher.starts.load(Ordering::SeqCst), 0);
+
+        let _automatic_client = connector
+            .connect_or_start(&automatic_config)
+            .expect("automatic runtime starts independently");
+        assert_ne!(connector.status().endpoint, Some(manual_endpoint));
+        assert_eq!(launcher.starts.load(Ordering::SeqCst), 1);
+
+        let _manual_again = connector
+            .connect_existing(&manual_config)
+            .expect("manual endpoint remains available");
+        assert_eq!(launcher.starts.load(Ordering::SeqCst), 1);
+        launcher.stop();
+    }
+
+    #[test]
+    fn automatic_start_waits_for_a_manual_server_that_wins_the_port_race() {
+        let config = test_config();
+        let launcher = Arc::new(ManualStartupRaceLauncher {
+            starts: AtomicUsize::new(0),
+            delay: Duration::from_millis(80),
+        });
+        let (connector, _directory) = test_connector(
+            launcher.clone(),
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        );
+
+        let client = connector
+            .connect_or_start(&config)
+            .expect("automatic client waits for the manual endpoint to become ready");
+        assert_eq!(connector.status().state, ConnectionState::Connected);
+        assert!(!connector.status().started_runtime);
+        assert_eq!(launcher.starts.load(Ordering::SeqCst), 1);
+        drop(client);
     }
 
     #[test]
@@ -1051,7 +1417,7 @@ mod tests {
     #[test]
     fn startup_failure_is_reported_and_moves_the_connector_to_failed() {
         let config = test_config();
-        let (connector, _directory) = test_connector(
+        let (connector, directory) = test_connector(
             Arc::new(TestLauncher::new(Duration::ZERO, true)),
             Duration::from_millis(200),
             Duration::from_millis(10),
@@ -1062,6 +1428,58 @@ mod tests {
             connector.status().last_error.as_deref(),
             Some("runtime startup failed: test startup failure")
         );
+        let lock_path = connector
+            .inner
+            .metadata_store
+            .startup_lock_path(&config.workspace_root);
+        let lock = try_startup_lock(&lock_path)
+            .expect("startup failure releases the kernel lock")
+            .expect("another client can retry after startup failure");
+        drop(lock);
+        drop(directory);
+    }
+
+    #[test]
+    fn readiness_failure_releases_the_lock_and_later_clients_can_retry() {
+        let config = auto_config();
+        let directory = tempfile::tempdir().expect("runtime metadata directory");
+        let failed_launcher = Arc::new(ReadinessFailLauncher::new());
+        let connector = RuntimeConnector::with_timing_and_runtime_directory(
+            failed_launcher.clone(),
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            directory.path(),
+        );
+        let error = match connector.connect_or_start(&config) {
+            Ok(_) => panic!("server that never responds should fail readiness"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RuntimeConnectError::ReadinessTimeout { .. }
+        ));
+        assert_eq!(failed_launcher.starts.load(Ordering::SeqCst), 1);
+
+        let lock_path = connector
+            .inner
+            .metadata_store
+            .startup_lock_path(&config.workspace_root);
+        let lock = try_startup_lock(&lock_path)
+            .expect("readiness failure releases the kernel lock")
+            .expect("another client can retry after readiness failure");
+        drop(lock);
+
+        let healthy_launcher = Arc::new(TestLauncher::new(Duration::ZERO, false));
+        let healthy_connector = RuntimeConnector::with_timing_and_runtime_directory(
+            healthy_launcher.clone(),
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            directory.path(),
+        );
+        let _client = healthy_connector
+            .connect_or_start(&config)
+            .expect("later client replaces stale failed runtime and starts");
+        assert!(healthy_launcher.started.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1096,36 +1514,183 @@ mod tests {
 
     #[test]
     fn concurrent_clients_serialize_startup_until_the_listener_is_ready() {
-        let first_launcher = Arc::new(TestLauncher::new(Duration::from_millis(180), false));
-        let second_launcher = Arc::new(TestLauncher::new(Duration::ZERO, false));
-        let directory = tempfile::tempdir().expect("shared runtime metadata directory");
-        let first = RuntimeConnector::with_timing_and_runtime_directory(
-            first_launcher.clone(),
-            Duration::from_secs(2),
-            Duration::from_millis(10),
-            directory.path(),
-        );
-        let second = RuntimeConnector::with_timing_and_runtime_directory(
-            second_launcher.clone(),
-            Duration::from_secs(2),
-            Duration::from_millis(10),
-            directory.path(),
-        );
+        for _ in 0..3 {
+            run_concurrent_start_case(2);
+            run_concurrent_start_case(10);
+        }
+    }
+
+    #[test]
+    fn separate_client_processes_start_only_one_runtime() {
+        const CLIENT_ENV: &str = "COGITO_TEST_CONCURRENT_CLIENT";
+        const RUNTIME_DIR_ENV: &str = "COGITO_TEST_RUNTIME_DIR";
+        const LAUNCH_LOG_ENV: &str = "COGITO_TEST_LAUNCH_LOG";
+        const WORKSPACE_ENV: &str = "COGITO_TEST_WORKSPACE";
+        const START_GATE_ENV: &str = "COGITO_TEST_START_GATE";
+        const READY_DIR_ENV: &str = "COGITO_TEST_READY_DIR";
+        const SERVER_HOLD_MS_ENV: &str = "COGITO_TEST_SERVER_HOLD_MS";
+
+        if std::env::var_os(CLIENT_ENV).is_some() {
+            let runtime_directory = PathBuf::from(std::env::var_os(RUNTIME_DIR_ENV).unwrap());
+            let launch_log = PathBuf::from(std::env::var_os(LAUNCH_LOG_ENV).unwrap());
+            let workspace = PathBuf::from(std::env::var_os(WORKSPACE_ENV).unwrap());
+            let start_gate = PathBuf::from(std::env::var_os(START_GATE_ENV).unwrap());
+            let ready_directory = PathBuf::from(std::env::var_os(READY_DIR_ENV).unwrap());
+            let server_hold = std::env::var(SERVER_HOLD_MS_ENV)
+                .unwrap()
+                .parse::<u64>()
+                .expect("server hold duration");
+            fs::write(
+                ready_directory.join(std::process::id().to_string()),
+                "ready",
+            )
+            .expect("record simulated client ready");
+            let gate_deadline = Instant::now() + Duration::from_secs(10);
+            while !start_gate.exists() {
+                assert!(
+                    Instant::now() < gate_deadline,
+                    "parent did not release start gate"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+
+            let connector = RuntimeConnector::with_timing_and_runtime_directory(
+                Arc::new(ProcessCountingLauncher { launch_log }),
+                Duration::from_secs(8),
+                Duration::from_millis(10),
+                runtime_directory,
+            );
+            let config = RuntimeLaunchConfig::new(
+                "127.0.0.1:0".parse().expect("loopback endpoint"),
+                workspace,
+            );
+            let _client = connector
+                .connect_or_start(&config)
+                .expect("separate client process connects to the single runtime");
+            thread::sleep(Duration::from_millis(server_hold));
+            return;
+        }
+
+        for client_count in [2, 10] {
+            let directory = tempfile::tempdir().expect("shared process runtime directory");
+            let gate = directory.path().join("start.gate");
+            let ready_directory = directory.path().join("ready");
+            fs::create_dir_all(&ready_directory).expect("create process readiness directory");
+            let launch_log = directory.path().join("launches.log");
+            let workspace = std::env::current_dir().expect("current workspace");
+            let mut children = Vec::new();
+            for _ in 0..client_count {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "bootstrap::tests::separate_client_processes_start_only_one_runtime",
+                    ])
+                    .env(CLIENT_ENV, "1")
+                    .env(RUNTIME_DIR_ENV, directory.path())
+                    .env(LAUNCH_LOG_ENV, &launch_log)
+                    .env(WORKSPACE_ENV, &workspace)
+                    .env(START_GATE_ENV, &gate)
+                    .env(READY_DIR_ENV, &ready_directory)
+                    .env(
+                        SERVER_HOLD_MS_ENV,
+                        if client_count == 2 { "700" } else { "5000" },
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                children.push(command.spawn().expect("start simulated client process"));
+            }
+            let ready_deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let ready_count = fs::read_dir(&ready_directory)
+                    .expect("read simulated client readiness markers")
+                    .count();
+                if ready_count == client_count {
+                    break;
+                }
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "only {ready_count} of {client_count} clients reached the start barrier"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            fs::write(&gate, "go").expect("release all simulated clients together");
+            for mut child in children {
+                assert!(child.wait().expect("simulated client exits").success());
+            }
+            let starts = fs::read_to_string(&launch_log)
+                .expect("runtime launch was recorded")
+                .lines()
+                .count();
+            assert_eq!(
+                starts, 1,
+                "{client_count} separate clients must start exactly one runtime"
+            );
+        }
+    }
+
+    fn run_concurrent_start_case(client_count: usize) {
         let config = auto_config();
+        let directory = tempfile::tempdir().expect("shared runtime metadata directory");
+        let launcher = Arc::new(ConcurrentLauncher::new(Duration::from_millis(80)));
+        let barrier = Arc::new(Barrier::new(client_count + 1));
+        let connectors = (0..client_count)
+            .map(|_| {
+                RuntimeConnector::with_timing_and_runtime_directory(
+                    launcher.clone(),
+                    Duration::from_secs(8),
+                    Duration::from_millis(5),
+                    directory.path(),
+                )
+            })
+            .collect::<Vec<_>>();
 
-        let first_config = config.clone();
-        let first_thread = thread::spawn(move || first.connect_or_start(&first_config));
-        thread::sleep(Duration::from_millis(30));
-        let _second_client = second
-            .connect_or_start(&config)
-            .expect("second client connects to first runtime");
-        let _first_client = first_thread
-            .join()
-            .expect("first connector thread completes")
-            .expect("first runtime starts");
+        let clients = connectors
+            .into_iter()
+            .map(|connector| {
+                let config = config.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    connector
+                        .connect_or_start(&config)
+                        .map(|client| {
+                            (
+                                client,
+                                connector.status().endpoint.expect("connected endpoint"),
+                            )
+                        })
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
 
-        assert!(first_launcher.started.load(Ordering::SeqCst));
-        assert!(!second_launcher.started.load(Ordering::SeqCst));
+        let results = clients
+            .into_iter()
+            .map(|client| client.join().expect("connector thread completes"))
+            .collect::<Vec<_>>();
+        let errors = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "{client_count} concurrent clients failed: {errors:?}; runtime starts: {}",
+            launcher.starts.load(Ordering::SeqCst)
+        );
+        let clients = results.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+        let shared_endpoint = clients[0].1;
+        assert!(clients
+            .iter()
+            .all(|(_, endpoint)| *endpoint == shared_endpoint));
+        assert_eq!(
+            launcher.starts.load(Ordering::SeqCst),
+            1,
+            "{client_count} simultaneous clients must start exactly one runtime"
+        );
+        drop(clients);
+        launcher.stop();
     }
 
     #[test]

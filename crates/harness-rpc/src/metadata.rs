@@ -246,6 +246,9 @@ pub(crate) fn process_exists(pid: u32) -> Option<bool> {
     if pid == 0 {
         return Some(false);
     }
+    if pid == std::process::id() {
+        return Some(true);
+    }
 
     #[cfg(windows)]
     {
@@ -302,7 +305,7 @@ fn sanitize_instance_id(instance_id: &str) -> String {
         .collect()
 }
 
-fn set_private_file_mode(options: &mut OpenOptions) {
+pub(crate) fn set_private_file_mode(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

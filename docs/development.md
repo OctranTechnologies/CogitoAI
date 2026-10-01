@@ -45,6 +45,25 @@ an OS-assigned loopback TCP port because the current RPC client uses
 fields plus a random instance ID. Startup locks use a sibling
 `runtime-<workspace-hash>.lock` file.
 
+Automatic startup takes an exclusive OS file lock on that per-workspace lock
+file (`flock` on Unix and `LockFileEx` on Windows, through `fs2`). The lock file
+is intentionally retained: deleting it while another client has the old file
+open can let a third client lock a newly-created file at the same path. The
+kernel releases the lock when its handle closes, including after a client
+crashes. Windows connector threads are also serialized per lock path because
+Windows file locks coordinate processes rather than threads. Once the lock is
+acquired, the connector always probes metadata or the explicit endpoint again
+before launching. It holds the lock until the new runtime passes readiness, so
+other clients wait and then connect to the same instance. Healthy manually
+started endpoints are reused by the initial probe and do not trigger a second
+launch.
+
+Lock acquisition is bounded by the configured readiness timeout. Timeout
+errors include the endpoint and lock path plus a best-effort owner PID. That
+diagnostic PID is recorded in a sibling `.lock.owner` file; it is informational
+only and may be stale when no lock is held. Neither the PID file nor lock file
+contains credentials or other sensitive data.
+
 Default locations:
 
 - Windows: `%LOCALAPPDATA%\\CogitoAI\\runtime`
