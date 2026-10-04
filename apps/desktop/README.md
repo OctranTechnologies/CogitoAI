@@ -29,18 +29,31 @@ pnpm install
 pnpm tauri dev
 ```
 
-Enter a workspace path in the shell and select Connect. The default `auto`
-endpoint discovers a runtime through per-user metadata; Tauri reuses a healthy
-Harness runtime or starts one on an OS-assigned loopback port in the desktop
-backend process. You can enter a fixed address such as `127.0.0.1:4545` to
-connect to a manually managed endpoint. No separate RPC server command is
-normally needed. The conversation panel shows prompts, streamed assistant output, and
-run phase. The context panel shows expandable tool cards, verification results,
-a checkpoint timeline, and a chronological session timeline. Approval requests
-are explicitly allow-once or deny-once; no permanent policy change is inferred
-by the UI. Select a persisted session and use Resume to rehydrate its durable
-events and conversation, then continue sending work. Closing the window does
-not corrupt the runtime-owned session.
+On first launch, choose a workspace folder. The desktop then discovers a healthy
+runtime or starts the bundled/local runtime automatically; no terminal or manual
+server command is needed. On later launches, it reconnects to the last workspace
+and restores the selected session. Startup and recovery progress appear in a small
+status strip. If startup fails, use Retry, Restart runtime, or Open logs; endpoint
+and transport details are available only under Details. When the runtime drops,
+the window stays open and reconnects with bounded retries. It reloads saved session
+history after reconnect and does not repeat an in-flight task.
+
+The default `auto` endpoint uses per-user runtime metadata. You can enter a fixed
+address such as `127.0.0.1:4545` to connect to a manually managed endpoint. The
+conversation panel shows prompts, streamed assistant output, and run phase. The
+context panel shows expandable tool cards, verification results, a checkpoint
+timeline, and a chronological session timeline. Approval requests are explicitly
+allow-once or deny-once; no permanent policy change is inferred by the UI. Closing
+the window does not corrupt the runtime-owned session.
+
+Development runtime discovery uses the same shared Rust `HarnessConnectionManager`
+as the CLI. The Tauri bridge forwards state changes to React and keeps launch,
+reconnect, and process discovery out of TypeScript. The launcher checks the
+application resource directory (including `binaries/`) and executable-relative
+build locations using platform paths, so paths containing spaces or non-ASCII
+characters are passed without shell interpretation. Packaged builds include the
+target-specific `cogito-harness-runtime` sidecar declared in
+`src-tauri/tauri.conf.json`.
 
 ## Code changes and checkpoints
 
@@ -217,8 +230,9 @@ pnpm check:classes
 pnpm tauri build --debug
 ```
 
-`bundle.active` is `false` in `tauri.conf.json`, so this produces an executable
-under `target/debug/` rather than a packaged installer.
+This builds the native shell and packages the configured runtime sidecar. The
+resulting app can start its local runtime without relying on the install folder as
+the current working directory.
 
 The v0 transport is loopback-only and unauthenticated. Do not bind it to a
 public interface.

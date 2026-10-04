@@ -217,9 +217,16 @@ authentication or encryption; hosts must not bind it to a public interface.
 
 The desktop shell is under `apps/desktop`. It is implemented with Tauri 2,
 React, TypeScript, Vite, Tailwind, and Zustand. Its Tauri commands own only
-RPC connection plumbing; they do not implement agent logic. The shell uses the
-shared connector to reuse or start a loopback runtime, and session durability
-remains in the Rust JSONL store.
+RPC connection plumbing; they do not implement agent logic. On first use the
+shell asks for a workspace, then its Tauri bridge uses the same Rust
+`HarnessConnectionManager` as the CLI to discover or start the loopback runtime.
+The bridge forwards lifecycle state events to React without exposing endpoint or
+error details in normal UI. On transport loss, the shell keeps its local view,
+reconnects with bounded retries, and reloads the authoritative workspace/session
+state; it never resends the interrupted task. Session durability remains in the
+Rust JSONL store. Packaged Tauri builds include the target-specific runtime as a
+sidecar, and binary discovery uses resource and executable-relative paths rather
+than the user's working directory.
 
 ## Privileged operations and UI clients
 

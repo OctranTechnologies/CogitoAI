@@ -157,6 +157,71 @@ describe("desktop runtime store", () => {
     expect(resumed.events).toHaveLength(2);
   });
 
+  it("reconnects without replaying work and restores authoritative session history", async () => {
+    const persistedEvents = [
+      event("persisted-user", "user.message", { text: "fix the bug" }, 1),
+      event("persisted-answer", "assistant.message", { text: "fixed" }, 2),
+    ];
+    const session = {
+      id: "session-1",
+      workspace_root: "/repo",
+      title: "Fix the bug",
+      status: "Active" as const,
+      created_at: 1,
+      last_updated_at: 2,
+      event_count: 2,
+      context_compactions: 0,
+    };
+    useDesktopStore.setState({
+      status: "connected",
+      clientId: "client-old",
+      address: "auto",
+      workspacePath: "/repo",
+      activeSessionId: "session-1",
+      activeRunId: "run-old",
+      runPhase: "running",
+      events: [event("old-event", "assistant.delta", { text: "partial" }, 3)],
+      messages: [{ id: "partial", role: "assistant", text: "partial", createdAt: 3, streaming: true }],
+    });
+    connectRuntime.mockResolvedValue("client-new");
+    requestRuntime.mockImplementation(async (_clientId: string, method: string) => {
+      if (method === "session.list") return response([session]);
+      if (method === "session.inspect") {
+        return response({ session: { id: "session-1", workspace_root: "/repo", events: persistedEvents }, warnings: [] });
+      }
+      return response({});
+    });
+
+    await useDesktopStore.getState().reconnectRuntime();
+
+    expect(connectRuntime).toHaveBeenCalledWith("auto", "/repo", true);
+    expect(requestRuntime).toHaveBeenCalledWith("client-new", "session.inspect", { session_id: "session-1" });
+    expect(requestRuntime).not.toHaveBeenCalledWith("client-new", "agent.send", expect.anything());
+    expect(useDesktopStore.getState()).toMatchObject({
+      status: "connected",
+      runtimeState: "connected",
+      clientId: "client-new",
+      activeSessionId: "session-1",
+      activeRunId: null,
+      runPhase: "idle",
+      isRecoveringRuntime: false,
+      events: persistedEvents,
+      messages: [
+        { role: "user", text: "fix the bug" },
+        { role: "assistant", text: "fixed" },
+      ],
+    });
+  });
+
+  it("ignores duplicate stream events after reconnect", () => {
+    const duplicate = event("same-event", "assistant.message", { text: "done" });
+    useDesktopStore.setState({ events: [duplicate] });
+
+    useDesktopStore.getState().handleServerMessage(notification("agent.event", { event: duplicate }));
+
+    expect(useDesktopStore.getState().events).toEqual([duplicate]);
+  });
+
   describe("code changes and checkpoints", () => {
     function mockWorkspace(method: string, params: Record<string, unknown>) {
       if (method === "git.status") {

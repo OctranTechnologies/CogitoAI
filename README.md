@@ -291,7 +291,8 @@ RPC method for reading a stored secret.
 Environment variables are an alternative to connecting in the desktop settings;
 they are useful for headless launches and always take precedence over an
 OS-stored key. Set the values before starting the CLI or desktop application. The
-desktop starts its local runtime after you select a workspace and connect.
+desktop starts its local runtime automatically after you select a workspace on
+first launch, and reconnects to the saved workspace on later launches.
 
 ```powershell
 $env:ANTHROPIC_API_KEY = "<your-key>"
@@ -319,9 +320,10 @@ $env:COGITO_MODEL = "opencode-zen/gpt-5.6-sol" # choose an ID from the model pic
 cargo run -p harness-cli -- run "Summarize the repository"
 ```
 
-For desktop use, start the app with the environment configured and connect to a
-workspace; it starts the RPC runtime automatically. API keys stay in the local
-runtime process and are never sent to the frontend.
+For desktop use, start the app with the environment configured and select a
+workspace on first launch. The desktop discovers or starts the RPC runtime and
+loads projects and sessions automatically. API keys stay in the local runtime
+process and are never sent to the frontend.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
@@ -663,11 +665,14 @@ pnpm tauri dev
 ```
 
 `pnpm tauri dev` builds the local runtime executable, starts the Vite dev server,
-and compiles the Rust shell. In the
-app, enter a repository path and select Connect. The default `auto` endpoint
-discovers the runtime through the same per-user metadata as the CLI. The desktop
-reuses a healthy Harness runtime or starts its local runtime executable; packaged
-builds include it as a sidecar.
+and compiles the Rust shell. On first launch, choose a workspace folder. The
+desktop then discovers a healthy runtime or starts it automatically and loads
+projects and sessions. Later launches reconnect to the saved workspace and
+selected session. The default `auto` endpoint discovers the runtime through the
+same per-user metadata as the CLI. Packaged builds include the runtime as a
+sidecar. If startup fails, use Retry, Restart runtime, or Open logs in the
+recovery strip; endpoint and transport diagnostics appear only when Details is
+opened.
 Enter a fixed address such as `127.0.0.1:4545` to connect to a manually managed
 endpoint. The server is tied to its startup workspace; select a workspace
 inside that root or choose another endpoint for a different runtime. RPC has no
@@ -688,8 +693,10 @@ pnpm tauri build --debug
 ```
 
 The packaged application includes a target-specific
-`cogito-harness-runtime` sidecar, so runtime discovery does not depend on the
-user's working directory. The interactive terminal requires a real terminal emulator to answer the console
+`cogito-harness-runtime` sidecar. The shared Rust launcher searches the Tauri
+resource directory and executable-relative build locations using native paths,
+so runtime discovery does not depend on the user's working directory and keeps
+spaces and non-ASCII path characters intact. The interactive terminal requires a real terminal emulator to answer the console
 host's cursor-position query, which xterm.js does; the CLI's non-interactive shell
 tool does not.
 

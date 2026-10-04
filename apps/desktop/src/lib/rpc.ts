@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export const RPC_PROTOCOL_VERSION = 1;
 
@@ -8,6 +9,59 @@ export type RuntimeStatus =
   | "connected"
   | "disconnected"
   | "error";
+
+export type RuntimeConnectionState =
+  | "disconnected"
+  | "discovering"
+  | "starting"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "failed";
+
+export interface RuntimeConnectionEvent {
+  state: RuntimeConnectionState;
+  message: string;
+}
+
+export interface RuntimeDiagnostics {
+  state: string;
+  endpoint: string | null;
+  workspace_root: string | null;
+  started_runtime: boolean;
+  retry_count: number;
+  last_error: string | null;
+}
+
+const runtimeEvents = [
+  "runtime.disconnected",
+  "runtime.discovering",
+  "runtime.starting",
+  "runtime.connecting",
+  "runtime.connected",
+  "runtime.reconnecting",
+  "runtime.failed",
+] as const;
+
+/** Registers the runtime-state bridge before startup begins. */
+export async function listenRuntimeConnectionStates(
+  onState: (event: RuntimeConnectionEvent) => void,
+): Promise<UnlistenFn> {
+  const unlisten: UnlistenFn[] = [];
+  try {
+    for (const name of runtimeEvents) {
+      unlisten.push(
+        await listen<RuntimeConnectionEvent>(name, ({ payload }) => {
+          onState(payload);
+        }),
+      );
+    }
+  } catch (error) {
+    unlisten.forEach((stop) => stop());
+    throw error;
+  }
+  return () => unlisten.forEach((stop) => stop());
+}
 
 export interface RpcError {
   code: string;
@@ -136,11 +190,42 @@ export class RpcTransportError extends Error {
   }
 }
 
-export async function connectRuntime(address: string, workspacePath: string): Promise<string> {
+export async function connectRuntime(
+  address: string,
+  workspacePath: string,
+  reconnect = false,
+): Promise<string> {
   try {
-    return await invoke<string>("rpc_connect", { address, workspacePath });
-  } catch (error) {
-    throw new RpcTransportError(String(error), "runtime_unavailable");
+    return await invoke<string>("rpc_connect", { address, workspacePath, reconnect });
+  } catch {
+    throw new RpcTransportError(
+      "Harness could not connect or start. Retry, restart the runtime, or open logs for details.",
+      "runtime_unavailable",
+    );
+  }
+}
+
+export async function openRuntimeLogs(): Promise<void> {
+  try {
+    await invoke("rpc_open_runtime_logs");
+  } catch {
+    throw new RpcTransportError("Harness logs could not be opened", "runtime_unavailable");
+  }
+}
+
+export async function restartRuntime(address: string, workspacePath: string): Promise<void> {
+  try {
+    await invoke("rpc_restart_runtime", { address, workspacePath });
+  } catch {
+    throw new RpcTransportError("Harness could not be restarted. Open logs for details.", "runtime_unavailable");
+  }
+}
+
+export async function readRuntimeDiagnostics(): Promise<RuntimeDiagnostics> {
+  try {
+    return await invoke<RuntimeDiagnostics>("rpc_connection_status");
+  } catch {
+    throw new RpcTransportError("Runtime diagnostics are unavailable", "runtime_unavailable");
   }
 }
 
@@ -151,8 +236,8 @@ export async function requestRuntime<T>(
 ): Promise<RpcResponse<T>> {
   try {
     return await invoke<RpcResponse<T>>("rpc_request", { clientId, method, params });
-  } catch (error) {
-    throw new RpcTransportError(String(error));
+  } catch {
+    throw new RpcTransportError("Harness connection was interrupted", "disconnected");
   }
 }
 
@@ -163,8 +248,8 @@ export async function receiveRuntimeMessage(clientId: string): Promise<ServerMes
       throw new RpcTransportError("runtime connection closed", "disconnected");
     }
     return parseServerMessage(value);
-  } catch (error) {
-    throw new RpcTransportError(String(error));
+  } catch {
+    throw new RpcTransportError("Harness connection was interrupted", "disconnected");
   }
 }
 

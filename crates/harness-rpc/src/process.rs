@@ -565,6 +565,29 @@ mod tests {
     }
 
     #[test]
+    fn packaged_sidecar_discovery_handles_spaces_and_non_ascii_paths() {
+        let directory = tempfile::tempdir().expect("temporary package dir");
+        let resource_directory = directory.path().join("应用 bundle with spaces");
+        fs::create_dir_all(&resource_directory).expect("resource directory");
+        let sidecar_name = format!(
+            "cogito-harness-runtime-{}-{}{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            executable_extension()
+        );
+        let sidecar = resource_directory.join(sidecar_name);
+        fs::copy(std::env::current_exe().expect("test executable"), &sidecar)
+            .expect("copy executable fixture");
+
+        let located = ProcessRuntimeLauncher::new()
+            .with_search_directory(&resource_directory)
+            .locate_executable()
+            .expect("sidecar is found in the packaged resource directory");
+
+        assert_eq!(located, sidecar);
+    }
+
+    #[test]
     fn child_crash_before_readiness_is_reported_and_reaped() {
         let directory = tempfile::tempdir().expect("temporary runtime dir");
         let workspace = set_mode(directory.path(), "crash");

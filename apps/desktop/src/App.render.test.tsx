@@ -22,7 +22,7 @@ vi.mock("./lib/rpc", async (importOriginal) => {
   };
 });
 
-const { default: App } = await import("./App");
+const { default: App, RuntimeConnectionNotice } = await import("./App");
 
 function render() {
   return renderToString(createElement(App));
@@ -89,6 +89,28 @@ describe("App shell layout", () => {
     const html = render();
     expect(html).toContain("What should we build?");
     expect(html).toContain("No runtime connected");
+  });
+
+  it("shows safe runtime recovery actions after automatic startup fails", () => {
+    const html = renderToString(
+      createElement(RuntimeConnectionNotice, {
+        state: "failed",
+        message: "Harness could not connect or start. Retry, restart the runtime, or open logs for details.",
+        diagnostics: null,
+        diagnosticsOpen: false,
+        busy: false,
+        onRetry: () => undefined,
+        onOpenLogs: () => undefined,
+        onRestart: () => undefined,
+        onToggleDiagnostics: () => undefined,
+      }),
+    );
+    expect(html).toContain("Harness isn’t available");
+    expect(html).toContain("Retry");
+    expect(html).toContain("Restart runtime");
+    expect(html).toContain("Open logs");
+    expect(html).toContain("Details");
+    expect(html).not.toContain("connection refused");
   });
 
   it("does not leak a raw palette value into the markup", () => {

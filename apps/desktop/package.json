@@ -2,6 +2,7 @@
   "name": "@cogitoai/desktop",
   "private": true,
   "version": "0.1.0",
+  "packageManager": "pnpm@10.33.4",
   "type": "module",
   "scripts": {
     "dev": "vite",

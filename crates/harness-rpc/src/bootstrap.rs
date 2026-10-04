@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -107,6 +108,7 @@ pub struct RuntimeConnector {
 
 struct ConnectorInner {
     status: Mutex<ConnectionStatus>,
+    status_subscribers: Mutex<Vec<Sender<ConnectionStatus>>>,
     launcher: Arc<dyn RuntimeLauncher>,
     readiness_timeout: Duration,
     retry_interval: Duration,
@@ -163,6 +165,7 @@ impl RuntimeConnector {
         Self {
             inner: Arc::new(ConnectorInner {
                 status: Mutex::new(ConnectionStatus::default()),
+                status_subscribers: Mutex::new(Vec::new()),
                 launcher,
                 readiness_timeout,
                 retry_interval,
@@ -523,6 +526,26 @@ impl RuntimeConnector {
             .clone()
     }
 
+    /// Subscribes to connection-state changes. The receiver first gets the
+    /// current snapshot, then each subsequent state transition. Subscribers
+    /// that have been dropped are removed on the next transition.
+    pub fn subscribe_status(&self) -> Receiver<ConnectionStatus> {
+        let status = self
+            .inner
+            .status
+            .lock()
+            .expect("runtime connection status lock poisoned");
+        let (sender, receiver) = mpsc::channel();
+        let mut subscribers = self
+            .inner
+            .status_subscribers
+            .lock()
+            .expect("runtime status subscriber lock poisoned");
+        let _ = sender.send(status.clone());
+        subscribers.push(sender);
+        receiver
+    }
+
     fn wait_until_ready_normalized(
         &self,
         config: &RuntimeLaunchConfig,
@@ -633,6 +656,13 @@ impl RuntimeConnector {
         }
         status.state = to;
         status.last_error = error;
+        let snapshot = status.clone();
+        let mut subscribers = self
+            .inner
+            .status_subscribers
+            .lock()
+            .expect("runtime status subscriber lock poisoned");
+        subscribers.retain(|subscriber| subscriber.send(snapshot.clone()).is_ok());
         Ok(())
     }
 }
@@ -1241,6 +1271,36 @@ mod tests {
         );
         assert!(RuntimeConnector::resolve_endpoint(&workspace, Some("not-an-address")).is_err());
         assert!(RuntimeConnector::resolve_endpoint(&workspace, Some("0.0.0.0:4545")).is_err());
+    }
+
+    #[test]
+    fn status_subscribers_receive_a_snapshot_and_each_connection_transition() {
+        use ConnectionState::{Connected, Connecting, Disconnected, Discovering, Starting};
+
+        let (connector, _directory) = test_connector(
+            Arc::new(TestLauncher::new(Duration::ZERO, false)),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        );
+        let statuses = connector.subscribe_status();
+        let mut received = vec![statuses.recv().expect("initial connection snapshot").state];
+
+        for state in [Discovering, Starting, Connecting, Connected] {
+            connector
+                .transition(state, None)
+                .expect("valid state transition");
+            received.push(
+                statuses
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("connection-state notification")
+                    .state,
+            );
+        }
+
+        assert_eq!(
+            received,
+            [Disconnected, Discovering, Starting, Connecting, Connected]
+        );
     }
 
     #[test]

@@ -4,7 +4,10 @@ import {
   connectRuntime,
   disconnectRuntime,
   expectResult,
+  openRuntimeLogs,
+  readRuntimeDiagnostics,
   receiveRuntimeMessage,
+  restartRuntime,
   requestRuntime,
   RpcTransportError,
   type AgentTask,
@@ -15,6 +18,8 @@ import {
   type HarnessEvent,
   type RestoreReport,
   type RuntimeStatus,
+  type RuntimeConnectionState,
+  type RuntimeDiagnostics,
   type ServerMessage,
   type SessionSummary,
   type WorkspaceSummary,
@@ -90,6 +95,10 @@ interface SessionInspectReport {
 
 export interface DesktopStore {
   status: RuntimeStatus;
+  runtimeState: RuntimeConnectionState;
+  runtimeDiagnostics: RuntimeDiagnostics | null;
+  isRestartingRuntime: boolean;
+  isRecoveringRuntime: boolean;
   address: string;
   clientId: string | null;
   workspacePath: string;
@@ -129,7 +138,13 @@ export interface DesktopStore {
   isLoadingSettings: boolean;
   settingsError: string | null;
   modelTest: ConnectionTestResult | null;
-  connect: (address: string, workspacePath: string) => Promise<void>;
+  connect: (address: string, workspacePath: string, reconnect?: boolean) => Promise<void>;
+  reconnectRuntime: () => Promise<void>;
+  retryRuntime: () => Promise<void>;
+  restartRuntime: () => Promise<void>;
+  openRuntimeLogs: () => Promise<void>;
+  loadRuntimeDiagnostics: () => Promise<void>;
+  setRuntimeConnectionState: (state: RuntimeConnectionState) => void;
   disconnect: () => Promise<void>;
   setWorkspacePath: (path: string) => void;
   setComposer: (value: string) => void;
@@ -301,6 +316,10 @@ export const useDesktopStore = create<DesktopStore>()(
   persist(
     (set, get) => ({
       status: "unavailable",
+      runtimeState: "disconnected",
+      runtimeDiagnostics: null,
+      isRestartingRuntime: false,
+      isRecoveringRuntime: false,
       address: "auto",
       clientId: null,
       workspacePath: "",
@@ -341,21 +360,38 @@ export const useDesktopStore = create<DesktopStore>()(
       settingsError: null,
       modelTest: null,
 
-      connect: async (address, workspacePath) => {
+      connect: async (address, workspacePath, reconnect = false) => {
         if (get().clientId) await get().disconnect();
-        set({ status: "connecting", address, workspacePath, lastError: null, isLoadingWorkspace: true, modelCatalog: null });
+        set({
+          status: "connecting",
+          runtimeState: reconnect ? "reconnecting" : "discovering",
+          runtimeDiagnostics: null,
+          address,
+          workspacePath,
+          lastError: null,
+          isLoadingWorkspace: true,
+          modelCatalog: null,
+        });
         try {
-          const clientId = await connectRuntime(address, workspacePath);
+          const clientId = await connectRuntime(address, workspacePath, reconnect);
           set({ clientId });
           expectResult(await requestRuntime(clientId, "rpc.initialize"));
           const workspace = await requestRuntime<WorkspaceSummary>(clientId, "workspace.open", { path: workspacePath });
           const sessions = await requestRuntime<SessionSummary[]>(clientId, "session.list", { limit: 200 });
           const workspaceResult = expectResult(workspace);
           const sessionResult = expectResult(sessions);
-          set({ workspace: workspaceResult, sessions: sessionResult, status: "connected", isLoadingWorkspace: false });
+          set({
+            workspace: workspaceResult,
+            sessions: sessionResult,
+            status: "connected",
+            runtimeState: "connected",
+            isLoadingWorkspace: false,
+          });
           const persistedSession = get().activeSessionId;
           if (persistedSession && sessionResult.some((session) => session.id === persistedSession)) {
             await get().resumeSession(persistedSession);
+          } else if (persistedSession) {
+            set({ activeSessionId: null, ...emptyRunState() });
           }
           // Load existing workspace changes and checkpoints on connect so the
           // changes panel is populated before any run happens.
@@ -363,17 +399,104 @@ export const useDesktopStore = create<DesktopStore>()(
           // Settings are workspace-derived, so they load alongside the rest.
           await get().refreshSettings();
           await get().loadModelCatalog();
-        } catch (error) {
+        } catch {
           const clientId = get().clientId;
-          if (clientId) await disconnectRuntime(clientId).catch(() => undefined);
-          set({ status: "error", clientId: null, isLoadingWorkspace: false, lastError: errorMessage(error) });
+          if (clientId) await Promise.resolve(disconnectRuntime(clientId)).catch(() => undefined);
+          set({
+            status: "error",
+            runtimeState: "failed",
+            clientId: null,
+            isLoadingWorkspace: false,
+            lastError: "Harness could not connect or start. Retry, restart the runtime, or open logs for details.",
+          });
         }
       },
+
+      reconnectRuntime: async () => {
+        const { address, workspacePath } = get();
+        if (!workspacePath || get().isRecoveringRuntime) return;
+        set({ isRecoveringRuntime: true, runtimeState: "reconnecting", lastError: null });
+        const previousClientId = get().clientId;
+        if (previousClientId) {
+          await Promise.resolve(disconnectRuntime(previousClientId)).catch(() => undefined);
+          set({ clientId: null, activeRunId: null, runPhase: "failed", approvals: [] });
+        }
+        const backoff = [0, 300, 900, 1800];
+        try {
+          for (const delay of backoff) {
+            if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+            set({ status: "connecting", runtimeState: "reconnecting" });
+            await get().connect(address, workspacePath, true);
+            if (get().status === "connected") return;
+          }
+          set({
+            status: "error",
+            runtimeState: "failed",
+            lastError: "Harness could not reconnect. Retry, restart the runtime, or open logs for details.",
+          });
+        } finally {
+          set({ isRecoveringRuntime: false });
+        }
+      },
+
+      retryRuntime: async () => {
+        const { address, workspacePath } = get();
+        if (!workspacePath || get().isLoadingWorkspace) return;
+        await get().connect(address, workspacePath);
+      },
+
+      restartRuntime: async () => {
+        const { address, workspacePath } = get();
+        if (!workspacePath || get().isRestartingRuntime) return;
+        set({ isRestartingRuntime: true, runtimeState: "reconnecting", lastError: null });
+        try {
+          const oldClientId = get().clientId;
+          if (oldClientId) {
+            await Promise.resolve(disconnectRuntime(oldClientId)).catch(() => undefined);
+            set({ clientId: null, activeRunId: null, runPhase: "failed", approvals: [] });
+          }
+          await restartRuntime(address, workspacePath);
+          await get().connect(address, workspacePath);
+        } catch (error) {
+          set({
+            status: "error",
+            runtimeState: "failed",
+            lastError: errorMessage(error),
+          });
+        } finally {
+          set({ isRestartingRuntime: false });
+        }
+      },
+
+      openRuntimeLogs: async () => {
+        try {
+          await openRuntimeLogs();
+        } catch (error) {
+          set({ lastError: errorMessage(error) });
+        }
+      },
+
+      loadRuntimeDiagnostics: async () => {
+        try {
+          set({ runtimeDiagnostics: await readRuntimeDiagnostics() });
+        } catch (error) {
+          set({ lastError: errorMessage(error) });
+        }
+      },
+
+      setRuntimeConnectionState: (runtimeState) => set({ runtimeState }),
 
       disconnect: async () => {
         const clientId = get().clientId;
         if (clientId) await disconnectRuntime(clientId);
-        set({ status: "disconnected", clientId: null, activeRunId: null, runPhase: "idle", modelCatalog: null });
+        set({
+          status: "disconnected",
+          runtimeState: "disconnected",
+          clientId: null,
+          activeRunId: null,
+          runPhase: "idle",
+          modelCatalog: null,
+        });
       },
 
       setWorkspacePath: (workspacePath) => {
@@ -420,8 +543,8 @@ export const useDesktopStore = create<DesktopStore>()(
         }
       },
       setRuntimeError: (message) =>
-        set({ status: "error", lastError: message, clientId: null, activeRunId: null, runPhase: "failed" }),
-      markDisconnected: () => set({ status: "disconnected", clientId: null, activeRunId: null }),
+        set({ status: "error", runtimeState: "failed", lastError: message, clientId: null, activeRunId: null, runPhase: "failed" }),
+      markDisconnected: () => set({ status: "disconnected", runtimeState: "disconnected", clientId: null, activeRunId: null }),
       clearError: () => set({ lastError: null }),
 
       createSession: async () => {
@@ -913,6 +1036,7 @@ export const useDesktopStore = create<DesktopStore>()(
             return;
           }
           set((state) => {
+            if (state.events.some((existing) => existing.event_id === event.event_id)) return {};
             const events = [...state.events, event].slice(-250);
             let messages = state.messages;
             if (event.event_type === "user.message" && !messages.some((item) => item.role === "user" && item.text === eventText(event))) {

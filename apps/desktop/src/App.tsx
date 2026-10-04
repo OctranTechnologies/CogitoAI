@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
   CircleAlert,
   Code2,
+  ChevronDown,
+  FileText,
   FileDiff,
   FolderOpen,
   LoaderCircle,
@@ -69,6 +71,10 @@ function App() {
   const [pendingMode, setPendingMode] = useState<string | null>(null);
   const {
     status,
+    runtimeState,
+    runtimeDiagnostics,
+    isRestartingRuntime,
+    isRecoveringRuntime,
     clientId,
     workspacePath,
     workspace,
@@ -106,6 +112,11 @@ function App() {
     closeTerminal,
     startTerminal,
     connect,
+    reconnectRuntime,
+    retryRuntime,
+    restartRuntime,
+    openRuntimeLogs,
+    loadRuntimeDiagnostics,
     setWorkspacePath,
     setComposer,
     createSession,
@@ -118,22 +129,26 @@ function App() {
     clearSelectedFile,
     restoreCheckpoint,
     handleServerMessage,
-    setRuntimeError,
-    markDisconnected,
     clearError,
   } = useDesktopStore();
+
+  const autoConnectStarted = useRef(false);
+  const [runtimeDiagnosticsOpen, setRuntimeDiagnosticsOpen] = useState(false);
 
   useEffect(() => {
     if (!clientId || status !== "connected") return;
     return startEventPump(
       clientId,
       handleServerMessage,
-      (error) => {
-        setRuntimeError(error instanceof Error ? error.message : String(error));
-        markDisconnected();
-      },
+      () => void reconnectRuntime(),
     );
-  }, [clientId, status, handleServerMessage, markDisconnected, setRuntimeError]);
+  }, [clientId, status, handleServerMessage, reconnectRuntime]);
+
+  useEffect(() => {
+    if (!workspacePath || status !== "unavailable" || autoConnectStarted.current) return;
+    autoConnectStarted.current = true;
+    void connect(address, workspacePath);
+  }, [address, connect, status, workspacePath]);
 
   const connected = status === "connected";
   const running = runPhase === "pending" || runPhase === "running" || runPhase === "cancelling";
@@ -166,10 +181,14 @@ function App() {
     const selected = await open({ directory: true, multiple: false, title: "Select workspace" });
     if (typeof selected !== "string" || selected === workspacePath) return;
     setWorkspacePath(selected);
-    if (connected) await connect(address, selected);
+    await connect(address, selected);
   }
 
   async function connectRuntime() {
+    if (!workspacePath) {
+      await chooseWorkspace();
+      return;
+    }
     await connect(address, workspacePath);
   }
 
@@ -408,6 +427,7 @@ function App() {
       <main className="flex min-w-0 flex-1 flex-col">
         <WorkspaceTopBar
           status={status}
+          runtimeState={runtimeState}
           address={address}
           connected={connected}
           onAddressChange={setAddress}
@@ -417,6 +437,21 @@ function App() {
           onToggleContext={() => setInspectorOpen((value) => !value)}
           onOpenCommands={() => setShowCommands(true)}
           showContext={inspectorOpen}
+        />
+        <RuntimeConnectionNotice
+          state={runtimeState}
+          message={lastError}
+          diagnostics={runtimeDiagnosticsOpen ? runtimeDiagnostics : null}
+          diagnosticsOpen={runtimeDiagnosticsOpen}
+          busy={isRecoveringRuntime || isRestartingRuntime}
+          onRetry={() => void retryRuntime()}
+          onOpenLogs={() => void openRuntimeLogs()}
+          onRestart={() => void restartRuntime()}
+          onToggleDiagnostics={() => {
+            const opening = !runtimeDiagnosticsOpen;
+            setRuntimeDiagnosticsOpen(opening);
+            if (opening && !runtimeDiagnostics) void loadRuntimeDiagnostics();
+          }}
         />
         {railTarget === "home" ? (
           showSessionWorkspace ? (
@@ -534,7 +569,7 @@ function App() {
         label="Command palette"
         placeholder="Search actions and sessions…"
       />
-      {lastError ? <ErrorToast message={lastError} onClose={clearError} /> : null}
+      {lastError && runtimeState !== "failed" ? <ErrorToast message={lastError} onClose={clearError} /> : null}
     </div>
   );
 }
@@ -562,6 +597,7 @@ function BrandMark() {
  */
 function WorkspaceTopBar({
   status,
+  runtimeState,
   address,
   connected,
   onAddressChange,
@@ -573,6 +609,7 @@ function WorkspaceTopBar({
   showContext,
 }: {
   status: string;
+  runtimeState: string;
   address: string;
   connected: boolean;
   onAddressChange: (value: string) => void;
@@ -607,16 +644,16 @@ function WorkspaceTopBar({
         variant="primary"
         size="sm"
         onClick={onConnect}
-        disabled={connected}
+        disabled={connected || status === "connecting"}
         icon={
-          status === "connecting" ? (
+          status === "connecting" || runtimeState === "starting" || runtimeState === "reconnecting" ? (
             <LoaderCircle className="size-icon-sm animate-spin" />
           ) : (
             <PlugZap className="size-icon-sm" />
           )
         }
       >
-        {connected ? "Connected" : "Connect"}
+        {connected ? "Connected" : status === "connecting" ? "Connecting…" : "Connect"}
       </Button>
 
       <Tooltip label={`Command palette (${paletteShortcutLabel()})`}>
@@ -649,6 +686,98 @@ function WorkspaceTopBar({
 
 
 
+
+export function RuntimeConnectionNotice({
+  state,
+  message,
+  diagnostics,
+  diagnosticsOpen,
+  busy,
+  onRetry,
+  onOpenLogs,
+  onRestart,
+  onToggleDiagnostics,
+}: {
+  state: string;
+  message: string | null;
+  diagnostics: { endpoint: string | null; workspace_root: string | null; retry_count: number; last_error: string | null } | null;
+  diagnosticsOpen: boolean;
+  busy: boolean;
+  onRetry: () => void;
+  onOpenLogs: () => void;
+  onRestart: () => void;
+  onToggleDiagnostics: () => void;
+}) {
+  if (state === "connected" || state === "disconnected") return null;
+
+  if (state !== "failed") {
+    const label =
+      state === "starting"
+        ? "Starting harness…"
+        : state === "reconnecting"
+          ? "Reconnecting…"
+          : state === "discovering"
+            ? "Connecting to harness…"
+            : "Connecting…";
+    return (
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-panel/60 px-4 text-xs text-muted" role="status" aria-live="polite">
+        <LoaderCircle className="size-icon-sm animate-spin text-accent" />
+        <span>{label}</span>
+      </div>
+    );
+  }
+
+  return (
+    <section
+      className="shrink-0 border-b border-line bg-panel/70 px-4 py-3"
+      role="alert"
+      aria-live="assertive"
+      aria-label="Harness runtime recovery"
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <CircleAlert className="size-icon-md shrink-0 text-warning" />
+        <div className="min-w-48 flex-1">
+          <p className="text-sm font-medium text-primary">Harness isn’t available</p>
+          <p className="mt-0.5 text-xs leading-5 text-muted">
+            {message ?? "The local runtime stopped responding."} Your workspace and session are preserved.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button variant="primary" size="sm" onClick={onRetry} disabled={busy} icon={<RotateCcw className="size-icon-sm" />}>
+            Retry
+          </Button>
+          <Button variant="secondary" size="sm" onClick={onRestart} disabled={busy} icon={<RotateCcw className="size-icon-sm" />}>
+            Restart runtime
+          </Button>
+          <Button variant="ghost" size="sm" onClick={onOpenLogs} disabled={busy} icon={<FileText className="size-icon-sm" />}>
+            Open logs
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onToggleDiagnostics}
+            aria-expanded={diagnosticsOpen}
+            icon={<ChevronDown className={`size-icon-sm transition-transform duration-fast ${diagnosticsOpen ? "rotate-180" : ""}`} />}
+          >
+            Details
+          </Button>
+        </div>
+      </div>
+      {diagnosticsOpen ? (
+        <dl className="mt-3 grid gap-x-4 gap-y-1 border-t border-line pt-2 text-2xs sm:grid-cols-[max-content_minmax(0,1fr)]">
+          <dt className="text-faint">Endpoint</dt>
+          <dd className="break-all font-mono text-muted">{diagnostics?.endpoint ?? "Loading…"}</dd>
+          <dt className="text-faint">Workspace</dt>
+          <dd className="break-all font-mono text-muted">{diagnostics?.workspace_root ?? "Loading…"}</dd>
+          <dt className="text-faint">Readiness retries</dt>
+          <dd className="font-mono text-muted">{diagnostics?.retry_count ?? "—"}</dd>
+          <dt className="text-faint">Last error</dt>
+          <dd className="break-words font-mono text-muted">{diagnostics?.last_error ?? "Loading…"}</dd>
+        </dl>
+      ) : null}
+    </section>
+  );
+}
 
 function StatusBar({
   status,

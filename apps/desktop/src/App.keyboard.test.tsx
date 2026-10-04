@@ -40,6 +40,23 @@ beforeEach(() => {
 });
 
 describe("desktop keyboard workflow", () => {
+  it("automatically reconnects to the saved workspace when the desktop launches", async () => {
+    const connect = vi.fn(async () => undefined);
+    useDesktopStore.setState({
+      status: "unavailable",
+      runtimeState: "disconnected",
+      workspacePath: "C:/work/repo with spaces",
+      connect,
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(connect).toHaveBeenCalledOnce();
+      expect(connect).toHaveBeenCalledWith("auto", "C:/work/repo with spaces");
+    });
+  });
+
   it("opens the palette from either shortcut and supports search, arrows, Enter, and Escape", () => {
     render(<App />);
     fireEvent.keyDown(window, { key: "p", ctrlKey: true, shiftKey: true });
