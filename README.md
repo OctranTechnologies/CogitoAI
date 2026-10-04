@@ -542,7 +542,7 @@ Point at another repository, with machine-readable output:
 cargo run -p harness-cli -- --workspace /path/to/project --json run "Fix the failing test" /path/to/project
 ```
 
-Session and recovery commands:
+Session and inspection commands:
 
 ```bash
 cargo run -p harness-cli -- sessions
@@ -551,9 +551,6 @@ cargo run -p harness-cli -- resume <session-id> "Continue the remaining work"
 cargo run -p harness-cli -- status
 cargo run -p harness-cli -- diff
 cargo run -p harness-cli -- undo
-cargo run -p harness-cli -- runtime status
-cargo run -p harness-cli -- runtime restart
-cargo run -p harness-cli -- runtime stop
 ```
 
 `inspect` reports the repository root, Git state, detected languages, manifests,
@@ -570,26 +567,35 @@ Global options: `--workspace` (default `.`), `--session-root` (default
 `Ctrl+C`; the cancellation token is shared with tool execution and verification
 commands.
 
-Runtime-backed CLI workflows discover a loopback server through per-user runtime
-metadata and start it automatically when needed; no separate server command is
-needed. In a terminal, `harness` and `harness .` open the interactive interface,
+The harness RPC runtime starts and connects automatically. Users normally do not
+need to start the RPC server manually. In a terminal, `harness` and `harness .` open the interactive interface,
 which connects before showing the prompt. `harness run "..."` does the same
 bootstrap for a one-shot task. The runtime binary is located beside the CLI
 executable or in application resource directories, independently of the current
 working directory. Set `COGITO_RUNTIME_BINARY` only when you need to override
 discovery.
-The CLI requests an OS-assigned loopback port when it starts a server; set
-`--rpc-address` or `COGITO_RPC_ADDRESS` to use a fixed loopback endpoint. A
-connected runtime must already serve the requested workspace and use the same
-session root.
+Startup and connection diagnostics stay off `--json` stdout. Sessions remain
+available after either client closes because the shared per-user runtime stays
+running.
 
-The runtime stays available after a CLI or desktop window closes. Stop it for
-development or troubleshooting with `harness runtime stop` (`shutdown` remains
-an alias), check it with `harness runtime status`, or replace it with
-`harness runtime restart`. Add `--workspace <path>` to select a different
-workspace runtime. Use `--log-level debug` to print connection diagnostics such
-as endpoint, PID, startup/reuse, protocol, and runtime version. Startup status is
-kept off `--json` stdout.
+### Runtime troubleshooting and development
+
+Use these only to inspect or control the persistent runtime while developing or
+troubleshooting:
+
+```bash
+cargo run -p harness-cli -- runtime status
+cargo run -p harness-cli -- runtime restart
+cargo run -p harness-cli -- runtime stop
+```
+
+If a protocol mismatch is reported, update the CLI and desktop app to matching
+releases. A runtime from an incompatible release cannot be shut down over the
+incompatible RPC protocol; close that older process from the operating system's
+process manager, then retry. Use `--log-level debug` for endpoint, PID,
+startup/reuse, protocol, runtime version, and retry diagnostics. Set
+`--rpc-address` or `COGITO_RPC_ADDRESS` only when intentionally using a fixed
+loopback endpoint. `--workspace <path>` selects the workspace runtime.
 
 `--yes` auto-approves policy prompts. Use it only in a disposable workspace or in
 CI.
@@ -663,6 +669,9 @@ cd apps/desktop
 pnpm install
 pnpm tauri dev
 ```
+
+The harness RPC runtime starts and connects automatically. Users normally do not
+need to start the RPC server manually.
 
 `pnpm tauri dev` builds the local runtime executable, starts the Vite dev server,
 and compiles the Rust shell. On first launch, choose a workspace folder. The

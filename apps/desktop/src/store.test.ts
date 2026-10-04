@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useDesktopStore } from "./store";
 import { summarizeChanges } from "./lib/changes";
+import { RpcTransportError } from "./lib/rpc";
 import type { HarnessEvent, RpcResponse, ServerMessage } from "./lib/rpc";
 
 const mocks = vi.hoisted(() => ({
@@ -113,6 +114,21 @@ describe("desktop runtime store", () => {
     expect(completed.messages.map((message) => message.text)).toEqual(["inspect the repository", "Complete"]);
     expect(completed.toolActivity[0]).toMatchObject({ name: "list_directory", state: "succeeded", output: "README.md" });
     expect(completed.timeline.map((entry) => entry.eventType)).toContain("tool.completed");
+  });
+
+  it("shows a recovery step for incompatible runtime protocol versions", async () => {
+    connectRuntime.mockRejectedValue(
+      new RpcTransportError(
+        "Harness runtime protocol is incompatible. Close the older runtime process, update the CLI and desktop app to matching releases, then retry.",
+        "incompatible_protocol",
+      ),
+    );
+
+    await useDesktopStore.getState().connect("auto", "/repo");
+
+    expect(useDesktopStore.getState().runtimeState).toBe("failed");
+    expect(useDesktopStore.getState().lastError).toContain("Close the older runtime process");
+    expect(requestRuntime).not.toHaveBeenCalled();
   });
 
   it("resolves allow-once and deny-once approval requests", async () => {

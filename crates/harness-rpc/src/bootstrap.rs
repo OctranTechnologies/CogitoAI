@@ -25,6 +25,8 @@ use crate::{RpcClient, RpcClientError, RpcResponse};
 const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(12);
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_millis(80);
 const MAX_READINESS_BACKOFF: Duration = Duration::from_millis(500);
+const HEALTH_PROBE_ATTEMPTS: u32 = 3;
+const TRANSIENT_RECONNECT_RETRIES: u32 = 3;
 // OS file locks coordinate separate CLI/desktop processes. Windows locks are
 // process-scoped, so also serialize competing connector threads per lock path.
 static PROCESS_STARTUP_LOCKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Arc<AtomicBool>>>> =
@@ -76,6 +78,15 @@ pub enum RuntimeConnectError {
     Transport(String),
     #[error("runtime rejected {method}: {message}")]
     Rejected { method: String, message: String },
+    #[error(
+        "Harness RPC protocol mismatch: client protocol {client_protocol} (v{client_version}), runtime protocol {server_protocol} (v{runtime_version}). Close the older runtime process and retry; keep the CLI and desktop app on matching releases."
+    )]
+    IncompatibleProtocol {
+        client_protocol: u32,
+        server_protocol: u32,
+        client_version: String,
+        runtime_version: String,
+    },
     #[error("runtime startup failed: {0}")]
     Startup(String),
     #[error("timed out waiting for the runtime at {endpoint}")]
@@ -225,7 +236,7 @@ impl RuntimeConnector {
                 Err(error) => return self.failed(error),
             }
         } else {
-            match probe(&config, None, None, Duration::from_secs(1)) {
+            match probe_with_retries(&config, None, None, Duration::from_secs(1)) {
                 Ok(client) => return self.connected(client, false),
                 Err(error) if is_runtime_absent(&error) => {}
                 Err(error) => return self.failed(error),
@@ -242,6 +253,8 @@ impl RuntimeConnector {
             .ensure_private_directory()
             .map_err(|error| RuntimeConnectError::Startup(error.to_string()))?;
         let process_lock = process_startup_lock(&lock_path);
+        let mut lock_attempt = 0_u32;
+        let mut lock_backoff = self.inner.retry_interval;
         let _process_startup_guard = loop {
             if process_lock
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -256,8 +269,12 @@ impl RuntimeConnector {
                     owner_pid: lock_owner_pid(&lock_path),
                 });
             }
-            thread::sleep(self.inner.retry_interval);
+            thread::sleep(jittered_backoff(lock_backoff, lock_attempt, config.address));
+            lock_attempt = lock_attempt.saturating_add(1);
+            lock_backoff = lock_backoff.saturating_mul(2).min(MAX_READINESS_BACKOFF);
         };
+        lock_attempt = 0;
+        lock_backoff = self.inner.retry_interval;
         let mut startup_lock = loop {
             match try_startup_lock(&lock_path) {
                 Ok(Some(lock)) => break Some(lock),
@@ -265,7 +282,7 @@ impl RuntimeConnector {
                     let existing = if config.address.port() == 0 {
                         self.try_connect_from_metadata(&config, false)
                     } else {
-                        match probe(&config, None, None, Duration::from_secs(1)) {
+                        match probe_with_retries(&config, None, None, Duration::from_secs(1)) {
                             Ok(client) => Ok(Some(client)),
                             Err(error) if is_runtime_absent(&error) => Ok(None),
                             Err(error) => Err(error),
@@ -285,7 +302,9 @@ impl RuntimeConnector {
                             owner_pid: lock_owner_pid(&lock_path),
                         });
                     }
-                    thread::sleep(self.inner.retry_interval);
+                    thread::sleep(jittered_backoff(lock_backoff, lock_attempt, config.address));
+                    lock_attempt = lock_attempt.saturating_add(1);
+                    lock_backoff = lock_backoff.saturating_mul(2).min(MAX_READINESS_BACKOFF);
                 }
                 Err(error) => return self.failed(error),
             }
@@ -296,7 +315,7 @@ impl RuntimeConnector {
         let existing = if config.address.port() == 0 {
             self.try_connect_from_metadata(&config, true)
         } else {
-            match probe(&config, None, None, Duration::from_secs(1)) {
+            match probe_with_retries(&config, None, None, Duration::from_secs(1)) {
                 Ok(client) => Ok(Some(client)),
                 Err(error) if is_runtime_absent(&error) => Ok(None),
                 Err(error) => Err(error),
@@ -361,6 +380,14 @@ impl RuntimeConnector {
                 self.inner.launcher.startup_succeeded(&launch.instance_id);
                 Ok(client)
             }
+            Err(error @ RuntimeConnectError::IncompatibleProtocol { .. }) => {
+                // The child is responsive but was built against a different
+                // protocol. Keep it and its metadata visible so later clients
+                // report the same actionable mismatch instead of respawning
+                // the same incompatible executable on every attempt.
+                self.inner.launcher.startup_succeeded(&launch.instance_id);
+                Err(error)
+            }
             Err(error) => {
                 self.inner.launcher.startup_failed(&launch.instance_id);
                 let _ = self.inner.metadata_store.remove_if_unchanged(
@@ -391,7 +418,7 @@ impl RuntimeConnector {
                 }),
             }
         } else {
-            match probe(&config, None, None, Duration::from_secs(1)) {
+            match probe_with_retries(&config, None, None, Duration::from_secs(1)) {
                 Ok(client) => self.connected(client, false),
                 Err(error) => self.failed(error),
             }
@@ -420,7 +447,6 @@ impl RuntimeConnector {
         };
         let endpoint = metadata.endpoint.parse::<SocketAddr>().ok();
         let compatible = metadata.metadata_version == RUNTIME_METADATA_FORMAT_VERSION
-            && metadata.protocol_version == crate::RPC_PROTOCOL_VERSION
             && metadata.transport == RPC_TRANSPORT_TCP_LOOPBACK
             && !metadata.instance_id.is_empty()
             && endpoint.is_some_and(|endpoint| endpoint.ip().is_loopback() && endpoint.port() != 0);
@@ -431,17 +457,13 @@ impl RuntimeConnector {
             return Ok(None);
         }
 
-        // PID presence is checked as a cheap stale-record signal, but RPC
-        // identity remains authoritative because operating systems reuse PIDs.
-        if process_exists(metadata.pid) == Some(false) {
-            if clean_stale {
-                self.remove_metadata_snapshot(&config.workspace_root, &bytes)?;
-            }
-            return Ok(None);
-        }
+        // PID presence is only a hint. Always ask the endpoint for its live
+        // instance and PID because operating systems reuse PIDs and metadata
+        // can outlive the process it describes.
+        let _pid_may_be_stale = process_exists(metadata.pid) == Some(false);
         let mut candidate = config.clone();
         candidate.address = endpoint.expect("compatible metadata has an endpoint");
-        match probe(
+        match probe_with_retries(
             &candidate,
             Some(&metadata.instance_id),
             Some(metadata.pid),
@@ -450,6 +472,27 @@ impl RuntimeConnector {
             Ok(client) => {
                 self.set_endpoint(candidate.address);
                 Ok(Some(client))
+            }
+            Err(error @ RuntimeConnectError::IncompatibleProtocol { .. })
+                if process_exists(metadata.pid) != Some(false) =>
+            {
+                Err(error)
+            }
+            Err(RuntimeConnectError::IncompatibleProtocol { .. }) => {
+                if clean_stale {
+                    self.remove_metadata_snapshot(&config.workspace_root, &bytes)?;
+                }
+                Ok(None)
+            }
+            Err(error)
+                if is_transient_probe_error(&error)
+                    && process_exists(metadata.pid) != Some(false) =>
+            {
+                // A live PID plus a transiently failing health exchange is
+                // ambiguous (sleep/resume, a just-restarting socket, or a
+                // hung server). Preserve its metadata and avoid starting a
+                // competing persistent process.
+                Err(error)
             }
             Err(_) => {
                 if clean_stale {
@@ -509,7 +552,23 @@ impl RuntimeConnector {
         let config = normalized_config(config)?;
         self.transition(ConnectionState::Reconnecting, None)?;
         self.transition(ConnectionState::Discovering, None)?;
-        self.connect_or_start(&config)
+        let mut backoff = Duration::from_millis(100);
+        for attempt in 0..=TRANSIENT_RECONNECT_RETRIES {
+            match self.connect_or_start(&config) {
+                Ok(client) => return Ok(client),
+                Err(error)
+                    if attempt < TRANSIENT_RECONNECT_RETRIES
+                        && is_transient_probe_error(&error) =>
+                {
+                    self.transition(ConnectionState::Reconnecting, None)?;
+                    self.transition(ConnectionState::Discovering, None)?;
+                    thread::sleep(jittered_backoff(backoff, attempt, config.address));
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded reconnect loop always returns")
     }
 
     /// Marks the client disconnected. Closing the concrete socket is the
@@ -554,6 +613,7 @@ impl RuntimeConnector {
     ) -> Result<RpcClient, RuntimeConnectError> {
         let deadline = Instant::now() + self.inner.readiness_timeout;
         self.transition(ConnectionState::Connecting, None)?;
+        let mut attempt = 0_u32;
         let mut backoff = Duration::from_millis(50);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -572,12 +632,15 @@ impl RuntimeConnector {
             } else {
                 match probe(config, expected_instance_id, expected_pid, request_timeout) {
                     Ok(client) => return self.connected(client, self.status().started_runtime),
-                    Err(error) if is_runtime_absent(&error) => {}
+                    Err(error) if is_runtime_absent(&error) || is_transient_probe_error(&error) => {
+                    }
                     Err(error) => return self.failed(error),
                 }
             }
             self.record_retry();
-            thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
+            let delay = jittered_backoff(backoff, attempt, config.address);
+            thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+            attempt = attempt.saturating_add(1);
             backoff = backoff.saturating_mul(2).min(MAX_READINESS_BACKOFF);
         }
     }
@@ -694,21 +757,86 @@ fn probe(
 ) -> Result<RpcClient, RuntimeConnectError> {
     let mut client = RpcClient::connect_timeout(config.address, timeout)
         .map_err(|error| RuntimeConnectError::Transport(error.to_string()))?;
-    let health = response_result(client.request("health/check", json!({}))?, "health/check")?;
+    let response = client.request(
+        "health/check",
+        json!({
+            "clientProtocolVersion": crate::RPC_PROTOCOL_VERSION,
+            "clientVersion": env!("CARGO_PKG_VERSION"),
+        }),
+    )?;
+    if !response.ok
+        && response
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == "unsupported_version")
+    {
+        let data = response
+            .error
+            .as_ref()
+            .and_then(|error| error.data.as_ref());
+        return Err(RuntimeConnectError::IncompatibleProtocol {
+            client_protocol: crate::RPC_PROTOCOL_VERSION,
+            server_protocol: data
+                .and_then(|data| data.get("serverProtocolVersion"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|version| u32::try_from(version).ok())
+                .unwrap_or(response.version),
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            runtime_version: data
+                .and_then(|data| data.get("runtimeVersion"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        });
+    }
+    let health = response_result(response, "health/check")?;
     if health.get("status").and_then(serde_json::Value::as_str) != Some("ready") {
         return Err(RuntimeConnectError::Rejected {
             method: "health/check".to_owned(),
             message: "server is not ready".to_owned(),
         });
     }
+    let server_protocol = health
+        .get("serverProtocolVersion")
+        .or_else(|| health.get("protocolVersion"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok());
+    if server_protocol != Some(crate::RPC_PROTOCOL_VERSION) {
+        return Err(RuntimeConnectError::IncompatibleProtocol {
+            client_protocol: crate::RPC_PROTOCOL_VERSION,
+            server_protocol: server_protocol.unwrap_or(0),
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            runtime_version: health
+                .get("runtimeVersion")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        });
+    }
     if health
-        .get("protocolVersion")
+        .get("clientProtocolVersion")
         .and_then(serde_json::Value::as_u64)
         != Some(u64::from(crate::RPC_PROTOCOL_VERSION))
     {
+        return Err(RuntimeConnectError::IncompatibleProtocol {
+            client_protocol: crate::RPC_PROTOCOL_VERSION,
+            server_protocol: server_protocol.unwrap_or(0),
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            runtime_version: health
+                .get("runtimeVersion")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        });
+    }
+    if health
+        .get("clientVersion")
+        .and_then(serde_json::Value::as_str)
+        != Some(env!("CARGO_PKG_VERSION"))
+    {
         return Err(RuntimeConnectError::Rejected {
             method: "health/check".to_owned(),
-            message: "server reports an incompatible RPC protocol version".to_owned(),
+            message: "server did not complete the client-version handshake".to_owned(),
         });
     }
     if health
@@ -757,6 +885,49 @@ fn probe(
     Ok(client)
 }
 
+fn probe_with_retries(
+    config: &RuntimeLaunchConfig,
+    expected_instance_id: Option<&str>,
+    expected_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<RpcClient, RuntimeConnectError> {
+    let mut backoff = Duration::from_millis(50);
+    for attempt in 0..HEALTH_PROBE_ATTEMPTS {
+        match probe(config, expected_instance_id, expected_pid, timeout) {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if attempt + 1 < HEALTH_PROBE_ATTEMPTS && is_transient_probe_error(&error) =>
+            {
+                thread::sleep(jittered_backoff(backoff, attempt, config.address));
+                backoff = backoff.saturating_mul(2).min(MAX_READINESS_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the bounded health-probe loop always returns")
+}
+
+fn is_transient_probe_error(error: &RuntimeConnectError) -> bool {
+    let RuntimeConnectError::Transport(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    [
+        "connection reset",
+        "forcibly closed",
+        "connection aborted",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "closed before a response",
+        "os error 10053",
+        "os error 10054",
+        "os error 10060",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
+}
+
 fn response_result(
     response: RpcResponse,
     method: &str,
@@ -786,6 +957,27 @@ fn is_runtime_absent(error: &RuntimeConnectError) -> bool {
         }
         _ => false,
     }
+}
+
+fn jittered_backoff(base: Duration, attempt: u32, endpoint: SocketAddr) -> Duration {
+    use std::hash::{Hash, Hasher};
+
+    let exponent = attempt.min(16);
+    let nominal = base
+        .checked_mul(1_u32 << exponent)
+        .unwrap_or(MAX_READINESS_BACKOFF)
+        .min(MAX_READINESS_BACKOFF);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    endpoint.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    timestamp.hash(&mut hasher);
+    let permille = 800 + (hasher.finish() % 401);
+    let micros = nominal.as_micros().saturating_mul(u128::from(permille)) / 1000;
+    Duration::from_micros(u64::try_from(micros).unwrap_or(u64::MAX)).min(MAX_READINESS_BACKOFF)
 }
 
 fn is_address_in_use(error: &str) -> bool {
@@ -970,7 +1162,9 @@ mod tests {
                 thread::sleep(delay);
                 for stream in listener.incoming().flatten() {
                     let instance_id = server_instance_id.clone();
-                    thread::spawn(move || serve_test_connection(stream, instance_id));
+                    thread::spawn(move || {
+                        serve_test_connection(stream, instance_id, RPC_PROTOCOL_VERSION)
+                    });
                 }
             });
             Ok(RuntimeLaunchInfo {
@@ -1033,7 +1227,9 @@ mod tests {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let instance_id = server_instance_id.clone();
-                            thread::spawn(move || serve_test_connection(stream, instance_id));
+                            thread::spawn(move || {
+                                serve_test_connection(stream, instance_id, RPC_PROTOCOL_VERSION)
+                            });
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(2));
@@ -1113,7 +1309,7 @@ mod tests {
             thread::spawn(move || {
                 thread::sleep(delay);
                 if let Some(Ok(stream)) = listener.incoming().next() {
-                    serve_test_connection(stream, instance_id);
+                    serve_test_connection(stream, instance_id, RPC_PROTOCOL_VERSION);
                 }
             });
             Err("address already in use".to_owned())
@@ -1143,7 +1339,9 @@ mod tests {
             thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
                     let instance_id = server_instance_id.clone();
-                    thread::spawn(move || serve_test_connection(stream, instance_id));
+                    thread::spawn(move || {
+                        serve_test_connection(stream, instance_id, RPC_PROTOCOL_VERSION)
+                    });
                 }
             });
             Ok(RuntimeLaunchInfo {
@@ -1155,7 +1353,11 @@ mod tests {
         }
     }
 
-    fn serve_test_connection(mut stream: TcpStream, instance_id: String) {
+    fn serve_test_connection(
+        mut stream: TcpStream,
+        instance_id: String,
+        server_protocol_version: u32,
+    ) {
         // On Windows a stream accepted from a nonblocking listener can retain
         // that mode, unlike Unix. The test RPC handler requires blocking I/O.
         if stream.set_nonblocking(false).is_err() {
@@ -1179,7 +1381,10 @@ mod tests {
             let result = match request.method.as_str() {
                 "health/check" => Some(json!({
                     "status": "ready",
-                    "protocolVersion": RPC_PROTOCOL_VERSION,
+                    "protocolVersion": server_protocol_version,
+                    "clientProtocolVersion": request.params.get("clientProtocolVersion"),
+                    "serverProtocolVersion": server_protocol_version,
+                    "clientVersion": request.params.get("clientVersion"),
                     "runtimeVersion": env!("CARGO_PKG_VERSION"),
                     "instanceId": instance_id.clone(),
                     "pid": std::process::id(),
@@ -1247,7 +1452,9 @@ mod tests {
         thread::spawn(move || {
             for stream in server_listener.incoming().flatten() {
                 let instance_id = instance_id.clone();
-                thread::spawn(move || serve_test_connection(stream, instance_id));
+                thread::spawn(move || {
+                    serve_test_connection(stream, instance_id, RPC_PROTOCOL_VERSION)
+                });
             }
         });
         listener
@@ -1634,6 +1841,20 @@ mod tests {
     }
 
     #[test]
+    fn connector_retry_delay_has_bounded_exponential_jitter() {
+        let endpoint = "127.0.0.1:4545".parse().unwrap();
+        let base = Duration::from_millis(50);
+        let mut previous = Duration::ZERO;
+        for attempt in 0..10 {
+            let delay = jittered_backoff(base, attempt, endpoint);
+            assert!(delay >= Duration::from_millis(40));
+            assert!(delay <= MAX_READINESS_BACKOFF);
+            assert!(delay >= previous || attempt >= 4);
+            previous = delay;
+        }
+    }
+
+    #[test]
     fn start_and_wait_until_ready_share_the_same_runtime_lifecycle() {
         let (connector, _directory) = test_connector(
             Arc::new(TestLauncher::new(Duration::from_millis(40), false)),
@@ -1966,12 +2187,9 @@ mod tests {
         let unhealthy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = unhealthy_listener.local_addr().unwrap();
         let store = RuntimeMetadataStore::new(directory.path());
-        store
-            .write(
-                &config.workspace_root,
-                &RuntimeMetadata::new(endpoint, "unhealthy-instance"),
-            )
-            .unwrap();
+        let mut metadata = RuntimeMetadata::new(endpoint, "unhealthy-instance");
+        metadata.pid = 2_147_483_647;
+        store.write(&config.workspace_root, &metadata).unwrap();
 
         let launcher = Arc::new(TestLauncher::new(Duration::ZERO, false));
         let connector = RuntimeConnector::with_timing_and_runtime_directory(
@@ -1987,12 +2205,57 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_metadata_protocol_is_removed_and_replaced() {
+    fn live_process_with_transient_health_failures_does_not_start_a_duplicate() {
+        let config = auto_config();
+        let directory = tempfile::tempdir().expect("runtime metadata directory");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..HEALTH_PROBE_ATTEMPTS {
+                let (stream, _) = listener.accept().expect("probe connection");
+                drop(stream);
+            }
+        });
+        let store = RuntimeMetadataStore::new(directory.path());
+        let mut metadata = RuntimeMetadata::new(endpoint, "temporarily-unhealthy-instance");
+        metadata.pid = std::process::id();
+        store.write(&config.workspace_root, &metadata).unwrap();
+
+        let launcher = Arc::new(TestLauncher::new(Duration::ZERO, false));
+        let connector = RuntimeConnector::with_timing_and_runtime_directory(
+            launcher.clone(),
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            directory.path(),
+        );
+        let error = match connector.connect_or_start(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("a transient health failure must not launch another runtime"),
+        };
+        assert!(matches!(error, RuntimeConnectError::Transport(_)));
+        assert!(!launcher.started.load(Ordering::SeqCst));
+        assert!(matches!(
+            store.read(&config.workspace_root).unwrap(),
+            MetadataSnapshot::Valid(_, _)
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn incompatible_live_protocol_is_preserved_and_not_replaced_repeatedly() {
         let config = auto_config();
         let directory = tempfile::tempdir().expect("runtime metadata directory");
         let store = RuntimeMetadataStore::new(directory.path());
-        let mut metadata = RuntimeMetadata::new("127.0.0.1:1".parse().unwrap(), "old-protocol");
-        metadata.protocol_version = RPC_PROTOCOL_VERSION + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let instance_id = "old-protocol".to_owned();
+        let server_instance_id = instance_id.clone();
+        let server = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                serve_test_connection(stream, server_instance_id, RPC_PROTOCOL_VERSION + 1);
+            }
+        });
+        let metadata = RuntimeMetadata::new(endpoint, instance_id);
         store.write(&config.workspace_root, &metadata).unwrap();
         let launcher = Arc::new(TestLauncher::new(Duration::ZERO, false));
         let connector = RuntimeConnector::with_timing_and_runtime_directory(
@@ -2001,12 +2264,57 @@ mod tests {
             Duration::from_millis(10),
             directory.path(),
         );
-        let _client = connector.connect_or_start(&config).unwrap();
-        assert!(launcher.started.load(Ordering::SeqCst));
+        let error = match connector.connect_or_start(&config) {
+            Err(error) => error,
+            Ok(_) => panic!("incompatible server must not be connected or replaced"),
+        };
+        assert!(matches!(
+            error,
+            RuntimeConnectError::IncompatibleProtocol { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("Close the older runtime process"));
+        assert!(!launcher.started.load(Ordering::SeqCst));
         let MetadataSnapshot::Valid(current, _) = store.read(&config.workspace_root).unwrap()
         else {
-            panic!("replacement metadata should be valid");
+            panic!("live incompatible server metadata should be preserved");
         };
         assert_eq!(current.protocol_version, RPC_PROTOCOL_VERSION);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn incompatible_endpoint_is_cleaned_when_metadata_pid_is_definitively_dead() {
+        let config = auto_config();
+        let directory = tempfile::tempdir().expect("runtime metadata directory");
+        let store = RuntimeMetadataStore::new(directory.path());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let instance_id = "unrelated-incompatible-service".to_owned();
+        let server_instance_id = instance_id.clone();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().expect("protocol probe");
+                serve_test_connection(stream, server_instance_id.clone(), RPC_PROTOCOL_VERSION + 1);
+            }
+        });
+        let mut metadata = RuntimeMetadata::new(endpoint, instance_id);
+        metadata.pid = 2_147_483_647;
+        store.write(&config.workspace_root, &metadata).unwrap();
+
+        let launcher = Arc::new(TestLauncher::new(Duration::ZERO, false));
+        let connector = RuntimeConnector::with_timing_and_runtime_directory(
+            launcher.clone(),
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            directory.path(),
+        );
+        let _client = connector
+            .connect_or_start(&config)
+            .expect("definitively stale metadata should be replaced");
+        assert!(launcher.started.load(Ordering::SeqCst));
+        assert_ne!(connector.status().endpoint, Some(endpoint));
+        server.join().unwrap();
     }
 }

@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,7 @@ use crate::settings::SecretStore;
 use crate::Runtime;
 
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IDEMPOTENCY_ENTRIES: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum RpcServerError {
@@ -159,6 +161,104 @@ struct ServerState {
     session_root: PathBuf,
     shutdown: Arc<AtomicBool>,
     shutdown_responses: Mutex<HashSet<(u64, String)>>,
+    idempotency: IdempotencyCache,
+}
+
+#[derive(Default)]
+struct IdempotencyCache {
+    state: Mutex<IdempotencyCacheState>,
+}
+
+#[derive(Default)]
+struct IdempotencyCacheState {
+    entries: HashMap<String, Arc<IdempotencyEntry>>,
+    insertion_order: VecDeque<String>,
+}
+
+struct IdempotencyEntry {
+    request_fingerprint: u64,
+    response: Mutex<Option<RpcResponse>>,
+    completed: Condvar,
+}
+
+enum IdempotencyLookup {
+    Execute(Arc<IdempotencyEntry>),
+    Existing(Arc<IdempotencyEntry>),
+    Conflict,
+}
+
+impl IdempotencyCache {
+    fn lookup(&self, key: &str, method: &str, params: &Value) -> IdempotencyLookup {
+        // Hash even caller-provided idempotency keys so a poorly behaved
+        // client cannot cause credential-like values to remain in the cache.
+        let key = format!("{:016x}", digest(&key));
+        let fingerprint = digest(&(method, params));
+        let mut state = self.state.lock().expect("RPC idempotency lock poisoned");
+        if let Some(entry) = state.entries.get(&key) {
+            return if entry.request_fingerprint == fingerprint {
+                IdempotencyLookup::Existing(Arc::clone(entry))
+            } else {
+                IdempotencyLookup::Conflict
+            };
+        }
+        let entry = Arc::new(IdempotencyEntry {
+            request_fingerprint: fingerprint,
+            response: Mutex::new(None),
+            completed: Condvar::new(),
+        });
+        state.entries.insert(key.clone(), Arc::clone(&entry));
+        state.insertion_order.push_back(key);
+        IdempotencyLookup::Execute(entry)
+    }
+
+    fn trim(&self) {
+        let mut state = self.state.lock().expect("RPC idempotency lock poisoned");
+        while state.entries.len() > MAX_IDEMPOTENCY_ENTRIES {
+            let removable = state.insertion_order.iter().position(|key| {
+                state.entries.get(key).is_some_and(|entry| {
+                    entry
+                        .response
+                        .lock()
+                        .expect("RPC idempotency entry lock poisoned")
+                        .is_some()
+                })
+            });
+            let Some(index) = removable else { break };
+            if let Some(key) = state.insertion_order.remove(index) {
+                state.entries.remove(&key);
+            }
+        }
+    }
+}
+
+fn digest(value: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl IdempotencyEntry {
+    fn complete(&self, response: RpcResponse) {
+        *self
+            .response
+            .lock()
+            .expect("RPC idempotency entry lock poisoned") = Some(response);
+        self.completed.notify_all();
+    }
+
+    fn wait(&self) -> RpcResponse {
+        let mut response = self
+            .response
+            .lock()
+            .expect("RPC idempotency entry lock poisoned");
+        while response.is_none() {
+            response = self
+                .completed
+                .wait(response)
+                .expect("RPC idempotency entry lock poisoned");
+        }
+        response.as_ref().expect("response checked above").clone()
+    }
 }
 
 struct ActiveRun {
@@ -183,6 +283,7 @@ impl ServerState {
             session_root: PathBuf::from("."),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_responses: Mutex::new(HashSet::new()),
+            idempotency: IdempotencyCache::default(),
         }
     }
 
@@ -689,20 +790,108 @@ fn dispatch(
 ) -> RpcResponse {
     if request.version != RPC_PROTOCOL_VERSION {
         clear_secret_param(&mut request.params);
-        return error_response(
+        let mut response = error_response(
             request.id,
             "unsupported_version",
             format!("unsupported RPC protocol version {}", request.version),
         );
+        if let Some(error) = response.error.as_mut() {
+            error.data = Some(json!({
+                "serverProtocolVersion": RPC_PROTOCOL_VERSION,
+                "runtimeVersion": env!("CARGO_PKG_VERSION"),
+            }));
+        }
+        return response;
     }
     if request.id.is_none() {
         clear_secret_param(&mut request.params);
         return error_response(request.id, "missing_id", "RPC requests require an id");
     }
+
+    if request
+        .idempotency_key
+        .as_ref()
+        .is_some_and(|key| key.is_empty() || key.len() > 256 || key.chars().any(char::is_control))
+    {
+        clear_secret_param(&mut request.params);
+        return error_response(
+            request.id,
+            "invalid_idempotency_key",
+            "idempotency keys must be 1–256 printable characters",
+        );
+    }
+
+    if is_mutating_method(&request.method) {
+        if let Some(key) = request.idempotency_key.clone() {
+            match state
+                .idempotency
+                .lookup(&key, &request.method, &request.params)
+            {
+                IdempotencyLookup::Execute(entry) => {
+                    let response = dispatch_validated(request, state, runtime, client_id);
+                    entry.complete(response.clone());
+                    state.idempotency.trim();
+                    return response;
+                }
+                IdempotencyLookup::Existing(entry) => {
+                    let mut response = entry.wait();
+                    response.id = request.id;
+                    return response;
+                }
+                IdempotencyLookup::Conflict => {
+                    return error_response(
+                        request.id,
+                        "idempotency_key_conflict",
+                        "this idempotency key was already used for a different request",
+                    );
+                }
+            }
+        }
+    }
+    dispatch_validated(request, state, runtime, client_id)
+}
+
+fn is_mutating_method(method: &str) -> bool {
+    matches!(
+        method,
+        "rpc.shutdown"
+            | "settings.update_model"
+            | "settings.update_permissions"
+            | "credentials.disconnect"
+            | "models.refresh"
+            | "config.update"
+            | "session.create"
+            | "session.resume"
+            | "agent.send"
+            | "agent.run"
+            | "agent.approve"
+            | "agent.deny"
+            | "agent.cancel"
+            | "checkpoint.undo"
+            | "terminal.open"
+            | "terminal.write"
+            | "terminal.resize"
+            | "terminal.close"
+    )
+}
+
+fn dispatch_validated(
+    mut request: RpcRequest,
+    state: &Arc<ServerState>,
+    runtime: &Arc<Runtime>,
+    client_id: u64,
+) -> RpcResponse {
     let result = match request.method.as_str() {
         "health/check" => Ok(json!({
             "status": "ready",
+            // protocolVersion remains as a compatibility alias for existing
+            // diagnostics; the connection handshake uses the explicit fields.
             "protocolVersion": RPC_PROTOCOL_VERSION,
+            "clientProtocolVersion": request.version,
+            "serverProtocolVersion": RPC_PROTOCOL_VERSION,
+            "clientVersion": request.params.get("clientVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
             "runtimeVersion": env!("CARGO_PKG_VERSION"),
             "instanceId": runtime.instance_id(),
             "pid": std::process::id(),

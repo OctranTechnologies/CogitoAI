@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -305,6 +306,103 @@ fn start_server(
     let handle = thread::spawn(move || server.serve().unwrap());
     let client = RpcClient::connect(address).unwrap();
     (client, address, shutdown, handle)
+}
+
+#[test]
+fn runtime_health_exchanges_client_and_server_versions() {
+    let temporary = tempdir().unwrap();
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
+    let (runtime, _) = setup(
+        temporary.path(),
+        ExecutionMode::Normal,
+        provider,
+        Arc::clone(&approvals),
+    );
+    let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
+
+    let health = client
+        .request(
+            "health/check",
+            json!({
+                "clientProtocolVersion": harness_rpc::RPC_PROTOCOL_VERSION,
+                "clientVersion": env!("CARGO_PKG_VERSION"),
+            }),
+        )
+        .unwrap();
+    assert_ok(&health);
+    let health = health.result.unwrap();
+    assert_eq!(
+        health["clientProtocolVersion"],
+        harness_rpc::RPC_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        health["serverProtocolVersion"],
+        harness_rpc::RPC_PROTOCOL_VERSION
+    );
+    assert_eq!(health["clientVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(health["runtimeVersion"], env!("CARGO_PKG_VERSION"));
+
+    drop(client);
+    shutdown.store(true, std::sync::atomic::Ordering::Release);
+    server.join().unwrap();
+}
+
+#[test]
+fn concurrent_retries_of_one_mutating_request_create_only_one_session() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let approvals = Arc::new(ApprovalBroker::new());
+    let provider = Arc::new(ScriptedMockProvider::new("rpc-mock", Vec::new()));
+    let (runtime, sessions) = setup(
+        root,
+        ExecutionMode::Normal,
+        provider,
+        Arc::clone(&approvals),
+    );
+    let (_client, address, shutdown, server) = start_server(runtime, approvals);
+    let session_ids = thread::scope(|scope| {
+        let requests = (0..10)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut client = RpcClient::connect(address).unwrap();
+                    let response = client
+                        .request_with_idempotency_key(
+                            "session-create-once",
+                            "session.create",
+                            json!({}),
+                        )
+                        .unwrap();
+                    assert_ok(&response);
+                    response.result.unwrap()["session"]["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+            })
+            .collect::<Vec<_>>();
+        requests
+            .into_iter()
+            .map(|request| request.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert!(session_ids.iter().all(|id| id == &session_ids[0]));
+    assert_eq!(sessions.recent(100).unwrap().len(), 1);
+    let mut client = RpcClient::connect(address).unwrap();
+    let conflict = client
+        .request_with_idempotency_key(
+            "session-create-once",
+            "session.create",
+            json!({"path": "a different request"}),
+        )
+        .unwrap();
+    assert!(!conflict.ok);
+    assert_eq!(conflict.error.unwrap().code, "idempotency_key_conflict");
+
+    drop(client);
+    shutdown.store(true, std::sync::atomic::Ordering::Release);
+    server.join().unwrap();
 }
 
 #[test]
@@ -1342,12 +1440,11 @@ fn dropped_client_cancels_active_run_and_allows_reconnect() {
     let temporary = tempdir().unwrap();
     let root = temporary.path();
     let approvals = Arc::new(ApprovalBroker::new());
-    let (runtime, sessions) = setup(
-        root,
-        ExecutionMode::Normal,
-        Arc::new(SlowProvider),
-        approvals.clone(),
-    );
+    let slow_provider = Arc::new(SlowProvider {
+        started: Arc::new(AtomicBool::new(false)),
+    });
+    let provider: Arc<dyn ModelProvider> = slow_provider.clone();
+    let (runtime, sessions) = setup(root, ExecutionMode::Normal, provider, approvals.clone());
     let (mut client, address, shutdown, server) = start_server(runtime, Arc::clone(&approvals));
     let created = client.request("session.create", json!({})).unwrap();
     assert_ok(&created);
@@ -1369,6 +1466,13 @@ fn dropped_client_cancels_active_run_and_allows_reconnect() {
         .as_str()
         .unwrap()
         .to_owned();
+    let provider_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !slow_provider.started.load(Ordering::Acquire)
+        && std::time::Instant::now() < provider_deadline
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(slow_provider.started.load(Ordering::Acquire));
     let cancelled = client
         .request("agent.cancel", json!({"run_id": run_id}))
         .unwrap();
@@ -1506,7 +1610,9 @@ fn cancelling_a_run_works_while_an_approval_is_left_unanswered() {
     let _ = server.join();
 }
 
-struct SlowProvider;
+struct SlowProvider {
+    started: Arc<AtomicBool>,
+}
 
 impl ModelProvider for SlowProvider {
     fn descriptor(&self) -> ModelDescriptor {
@@ -1517,6 +1623,7 @@ impl ModelProvider for SlowProvider {
             capabilities: ModelCapabilities {
                 text_input: true,
                 streaming: true,
+                tool_calling: true,
                 system_instructions: true,
                 context_window: Some(1024),
                 ..ModelCapabilities::default()
@@ -1534,6 +1641,7 @@ impl ModelProvider for SlowProvider {
         _request: &ModelRequest,
         on_event: &mut dyn FnMut(ModelStreamEvent) -> Result<(), ProviderError>,
     ) -> Result<ModelResponse, ProviderError> {
+        self.started.store(true, Ordering::Release);
         for _ in 0..100 {
             on_event(ModelStreamEvent::TextDelta {
                 text: "working".to_owned(),

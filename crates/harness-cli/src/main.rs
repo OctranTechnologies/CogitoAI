@@ -24,7 +24,9 @@ use harness_models::{
     ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
-use harness_rpc::{HarnessConnectionManager, RpcResponse, RuntimeLaunchConfig, ServerMessage};
+use harness_rpc::{
+    HarnessConnectionManager, RpcResponse, RuntimeConnectError, RuntimeLaunchConfig, ServerMessage,
+};
 use harness_session::{
     EventId, EventPayload, HarnessEvent, JsonlSessionStore, Session, SessionStore,
 };
@@ -1989,7 +1991,8 @@ fn connect_runtime_for_cli(
                     eprintln!("runtime connection failed: {error}");
                 }
             }
-            if is_verbose(cli) {
+            if is_verbose(cli) || matches!(&error, RuntimeConnectError::IncompatibleProtocol { .. })
+            {
                 Err(error.into())
             } else {
                 Err("Harness runtime unavailable. Check `harness runtime status` or enable --log-level debug for diagnostics.".into())

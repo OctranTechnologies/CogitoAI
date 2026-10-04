@@ -13,7 +13,7 @@ mod rpc_bridge {
     use harness_rpc::{
         metadata::RuntimeMetadataStore, ConnectionState, ConnectionStatus,
         HarnessConnectionManager, ProcessRuntimeLauncher, RpcClient, RpcClientReader,
-        RpcClientWriter, RuntimeLaunchConfig, ServerMessage,
+        RpcClientWriter, RuntimeConnectError, RuntimeLaunchConfig, ServerMessage,
     };
     use serde::Serialize;
     use serde_json::Value;
@@ -156,10 +156,13 @@ mod rpc_bridge {
             .recv()
             .map_err(|_| "Harness connection attempt did not complete".to_owned())?;
         let _ = worker.join();
-        result.map_err(|_| {
+        result.map_err(|error| {
             emit_runtime_state(app, ConnectionState::Failed);
-            "Harness could not connect or start. Retry, restart the runtime, or open logs for details."
-                .to_owned()
+            match error {
+                RuntimeConnectError::IncompatibleProtocol { .. } => error.to_string(),
+                _ => "Harness could not connect or start. Retry, restart the runtime, or open logs for details."
+                    .to_owned(),
+            }
         })
     }
 
@@ -287,6 +290,7 @@ mod rpc_bridge {
         client_id: String,
         method: String,
         params: Value,
+        idempotency_key: Option<String>,
     ) -> Result<Value, String> {
         let connection = state
             .connections
@@ -297,9 +301,11 @@ mod rpc_bridge {
         let Some((writer, inbox)) = connection else {
             return Err("runtime connection is not available".to_owned());
         };
-        let id = writer
-            .request(&method, params)
-            .map_err(|error| error.to_string())?;
+        let id = match idempotency_key {
+            Some(key) => writer.request_with_idempotency_key(key, &method, params),
+            None => writer.request(&method, params),
+        }
+        .map_err(|error| error.to_string())?;
         inbox
             .wait_for_response(&id)
             .map_err(|_| "runtime connection closed before a response arrived".to_owned())

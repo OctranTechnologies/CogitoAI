@@ -197,7 +197,14 @@ export async function connectRuntime(
 ): Promise<string> {
   try {
     return await invoke<string>("rpc_connect", { address, workspacePath, reconnect });
-  } catch {
+  } catch (error) {
+    const detail = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+    if (/protocol mismatch|incompatible rpc protocol/i.test(detail)) {
+      throw new RpcTransportError(
+        "Harness runtime protocol is incompatible. Close the older runtime process, update the CLI and desktop app to matching releases, then retry.",
+        "incompatible_protocol",
+      );
+    }
     throw new RpcTransportError(
       "Harness could not connect or start. Retry, restart the runtime, or open logs for details.",
       "runtime_unavailable",
@@ -233,9 +240,15 @@ export async function requestRuntime<T>(
   clientId: string,
   method: string,
   params: Record<string, unknown> = {},
+  idempotencyKey?: string,
 ): Promise<RpcResponse<T>> {
   try {
-    return await invoke<RpcResponse<T>>("rpc_request", { clientId, method, params });
+    return await invoke<RpcResponse<T>>("rpc_request", {
+      clientId,
+      method,
+      params,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+    });
   } catch {
     throw new RpcTransportError("Harness connection was interrupted", "disconnected");
   }

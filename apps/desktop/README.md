@@ -29,6 +29,9 @@ pnpm install
 pnpm tauri dev
 ```
 
+The harness RPC runtime starts and connects automatically. Users normally do not
+need to start the RPC server manually.
+
 On first launch, choose a workspace folder. The desktop then discovers a healthy
 runtime or starts the bundled/local runtime automatically; no terminal or manual
 server command is needed. On later launches, it reconnects to the last workspace
@@ -37,6 +40,14 @@ status strip. If startup fails, use Retry, Restart runtime, or Open logs; endpoi
 and transport details are available only under Details. When the runtime drops,
 the window stays open and reconnects with bounded retries. It reloads saved session
 history after reconnect and does not repeat an in-flight task.
+
+The connection handshake exchanges client/runtime versions and the RPC protocol
+version before the desktop uses the runtime. If versions are incompatible, update
+the CLI and desktop to matching releases and close the older runtime process
+before retrying. Mutating RPC requests carry unique request IDs that also act as
+idempotency keys; callers that retry an ambiguous request can reuse an explicit
+key, which the runtime deduplicates while it is alive. The desktop never replays
+an interrupted agent task after a runtime crash.
 
 The default `auto` endpoint uses per-user runtime metadata. You can enter a fixed
 address such as `127.0.0.1:4545` to connect to a manually managed endpoint. The

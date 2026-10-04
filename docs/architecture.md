@@ -73,10 +73,14 @@ provider, or policy implementation except through the runtime boundary.
 
 With no explicit endpoint override, the connector reads a per-user metadata
 record keyed by a hash of the canonical workspace path. It validates the
-metadata/protocol versions, checks the PID where the OS permits, then calls
-`health/check` and matches the process ID and instance ID. PID presence alone
-never establishes identity. Invalid or stale records are removed only if their
-bytes have not changed since they were read. If no matching runtime is healthy,
+metadata format and transport, treats PID liveness only as a hint, then calls
+`health/check` and matches the live process ID and instance ID. That exchange
+negotiates client/server RPC protocol versions and reports client/runtime
+versions before normal RPC methods are used. A healthy incompatible runtime is
+preserved and reported with a recovery step; it is never mistaken for stale
+metadata or replaced in a retry loop. PID presence alone never establishes
+identity. Invalid or stale records are removed only if their bytes have not
+changed since they were read. If no matching runtime is healthy,
 a per-workspace startup lock serializes the launch. `ProcessRuntimeLauncher`
 locates the packaged sidecar or local workspace build independently of the
 client's working directory, starts it detached, and sends non-secret startup
@@ -86,6 +90,16 @@ metadata and polls health with bounded exponential backoff. The current JSON-lin
 client uses `TcpStream`, so transport remains loopback TCP; the RPC server rejects
 non-loopback bind addresses. A healthy runtime is reused, and dropping a client
 closes its socket but leaves the runtime available to other local clients.
+
+Readiness and client reconnect delays use bounded exponential backoff with
+jitter. Each mutation carries a unique request ID that also acts as its default
+idempotency key; a caller retrying an ambiguous request can reuse an explicit
+key. The runtime keeps a bounded, in-memory result cache for matching mutation
+retries and rejects a key reused with a different method or payload. Client
+recovery never resubmits an ambiguous in-flight task after the runtime itself has
+restarted; it reconnects and refreshes persisted session state instead. Loopback
+binds to `127.0.0.1`, so local RPC discovery does not depend on the machine's
+external network interface.
 
 The runtime process is intentionally persistent across client lifetimes. It
 inherits the launch environment for provider credentials, receives no credential

@@ -8,6 +8,11 @@ pub const RPC_PROTOCOL_VERSION: u32 = 1;
 pub struct RpcRequest {
     pub version: u32,
     pub id: Option<String>,
+    /// Stable across retries of one logical mutation. The server remembers
+    /// completed requests for the lifetime of the runtime and returns the
+    /// original response instead of executing the mutation twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub method: String,
     #[serde(default)]
     pub params: Value,
@@ -19,6 +24,10 @@ impl fmt::Debug for RpcRequest {
         debug
             .field("version", &self.version)
             .field("id", &self.id)
+            .field(
+                "idempotency_key",
+                &self.idempotency_key.as_ref().map(|_| "[redacted]"),
+            )
             .field("method", &self.method);
         if matches!(
             self.method.as_str(),
@@ -120,6 +129,7 @@ mod tests {
         let request = RpcRequest {
             version: RPC_PROTOCOL_VERSION,
             id: Some("1".to_owned()),
+            idempotency_key: Some("request-1".to_owned()),
             method: "credentials.connect".to_owned(),
             params: serde_json::json!({
                 "provider_id": "openai",

@@ -679,25 +679,68 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_child_is_terminated() {
+    fn incompatible_child_is_reported_once_and_not_relaunched() {
         let directory = tempfile::tempdir().expect("temporary runtime dir");
         let workspace = set_mode(directory.path(), "incompatible");
         let runtime_directory = directory.path().join("connector-runtime");
-        let launcher = fixture_launcher(directory.path(), Duration::from_secs(2));
+        let metadata_store = crate::metadata::RuntimeMetadataStore::new(&runtime_directory);
+        let launcher: Arc<dyn RuntimeLauncher> =
+            Arc::new(fixture_launcher(directory.path(), Duration::from_secs(2)));
         let connector = RuntimeConnector::with_timing_and_runtime_directory(
-            Arc::new(launcher),
+            Arc::clone(&launcher),
             Duration::from_secs(2),
             Duration::from_millis(10),
-            runtime_directory,
+            runtime_directory.clone(),
         );
         let error = connector
             .connect_or_start(&launch_config(&workspace))
             .err()
             .expect("incompatible protocol must fail readiness");
-        assert!(error
-            .to_string()
-            .contains("incompatible RPC protocol version"));
+        assert!(error.to_string().contains("protocol mismatch"));
+        let pid = fixture_pid(&workspace);
+        let process_cleanup = FixtureProcessCleanup {
+            pid,
+            stop_file: workspace.join(".runtime-fixture-stop"),
+        };
+        assert_eq!(crate::metadata::process_exists(pid), Some(true));
+
+        let retry = connector
+            .connect_or_start(&launch_config(&workspace))
+            .err()
+            .expect("later clients must see the existing protocol mismatch");
+        assert!(retry.to_string().contains("protocol mismatch"));
+        assert_eq!(
+            fixture_pid(&workspace),
+            pid,
+            "incompatible child was relaunched"
+        );
+
+        let crate::metadata::MetadataSnapshot::Valid(metadata, _) = metadata_store
+            .read(&workspace)
+            .expect("incompatible runtime metadata remains available")
+        else {
+            panic!("incompatible runtime metadata must remain on disk");
+        };
+        assert_eq!(metadata.protocol_version, crate::RPC_PROTOCOL_VERSION);
+        drop(process_cleanup);
         assert_process_exited(fixture_pid(&workspace));
+    }
+
+    struct FixtureProcessCleanup {
+        pid: u32,
+        stop_file: PathBuf,
+    }
+
+    impl Drop for FixtureProcessCleanup {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.stop_file, b"stop");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while crate::metadata::process_exists(self.pid) != Some(false)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     fn write_ready_announcement(ready_path: &Path, endpoint: SocketAddr, instance_id: String) {
@@ -750,6 +793,10 @@ mod tests {
         let stopping = AtomicBool::new(false);
         let mut held_connections = Vec::new();
         while !stopping.load(Ordering::Acquire) {
+            if workspace.join(".runtime-fixture-stop").exists() {
+                stopping.store(true, Ordering::Release);
+                continue;
+            }
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_nonblocking(false).expect("blocking connection");
@@ -771,6 +818,9 @@ mod tests {
                             "health/check" => json!({
                                 "status": "ready",
                                 "protocolVersion": if mode.trim() == "incompatible" { 99 } else { crate::RPC_PROTOCOL_VERSION },
+                                "clientProtocolVersion": request.params.get("clientProtocolVersion"),
+                                "serverProtocolVersion": if mode.trim() == "incompatible" { 99 } else { crate::RPC_PROTOCOL_VERSION },
+                                "clientVersion": request.params.get("clientVersion"),
                                 "runtimeVersion": env!("CARGO_PKG_VERSION"),
                                 "instanceId": instance_id,
                                 "pid": std::process::id(),

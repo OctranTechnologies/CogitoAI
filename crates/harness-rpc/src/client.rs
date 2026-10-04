@@ -2,6 +2,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -9,6 +10,7 @@ use serde_json::Value;
 use crate::protocol::{RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION};
 
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcClientError {
@@ -23,7 +25,6 @@ pub enum RpcClientError {
 pub struct RpcClient {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
-    next_id: u64,
     pending: Vec<ServerMessage>,
 }
 
@@ -36,7 +37,6 @@ pub struct RpcClientReader {
 #[derive(Clone)]
 pub struct RpcClientWriter {
     writer: Arc<Mutex<BufWriter<TcpStream>>>,
-    next_id: Arc<AtomicU64>,
 }
 
 impl RpcClient {
@@ -60,7 +60,6 @@ impl RpcClient {
         Ok(Self {
             reader: BufReader::new(stream),
             writer,
-            next_id: 0,
             pending: Vec::new(),
         })
     }
@@ -72,7 +71,28 @@ impl RpcClient {
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<RpcResponse, RpcClientError> {
-        let id = write_request(&mut self.writer, &mut self.next_id, method, params)?;
+        self.request_with_key(method, params, None)
+    }
+
+    /// Issues a request with a caller-provided idempotency key. Reuse the key
+    /// only when retrying the same logical mutation after an ambiguous transport
+    /// failure. The request ID remains unique for response matching.
+    pub fn request_with_idempotency_key(
+        &mut self,
+        key: impl Into<String>,
+        method: &str,
+        params: Value,
+    ) -> Result<RpcResponse, RpcClientError> {
+        self.request_with_key(method, params, Some(key.into()))
+    }
+
+    fn request_with_key(
+        &mut self,
+        method: &str,
+        params: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<RpcResponse, RpcClientError> {
+        let id = write_request(&mut self.writer, method, params, idempotency_key)?;
         loop {
             match read_message(&mut self.reader)? {
                 ServerMessage::Response(response)
@@ -115,7 +135,6 @@ impl RpcClient {
             },
             RpcClientWriter {
                 writer: Arc::new(Mutex::new(self.writer)),
-                next_id: Arc::new(AtomicU64::new(self.next_id)),
             },
         )
     }
@@ -138,11 +157,27 @@ impl RpcClientReader {
 
 impl RpcClientWriter {
     pub fn request(&self, method: &str, params: Value) -> Result<String, RpcClientError> {
-        let mut next_id = self.next_id.load(Ordering::Relaxed);
+        self.request_with_key(method, params, None)
+    }
+
+    /// Writer equivalent of [`RpcClient::request_with_idempotency_key`].
+    pub fn request_with_idempotency_key(
+        &self,
+        key: impl Into<String>,
+        method: &str,
+        params: Value,
+    ) -> Result<String, RpcClientError> {
+        self.request_with_key(method, params, Some(key.into()))
+    }
+
+    fn request_with_key(
+        &self,
+        method: &str,
+        params: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<String, RpcClientError> {
         let mut writer = self.writer.lock().expect("RPC writer lock poisoned");
-        let id = write_request(&mut *writer, &mut next_id, method, params)?;
-        self.next_id.store(next_id, Ordering::Relaxed);
-        Ok(id)
+        write_request(&mut *writer, method, params, idempotency_key)
     }
 
     pub fn shutdown(&self) {
@@ -154,15 +189,15 @@ impl RpcClientWriter {
 
 fn write_request<W: Write>(
     writer: &mut W,
-    next_id: &mut u64,
     method: &str,
     params: Value,
+    idempotency_key: Option<String>,
 ) -> Result<String, RpcClientError> {
-    *next_id += 1;
-    let id = format!("request-{}", next_id);
+    let id = new_request_id();
     let request = RpcRequest {
         version: RPC_PROTOCOL_VERSION,
         id: Some(id.clone()),
+        idempotency_key: Some(idempotency_key.unwrap_or_else(|| id.clone())),
         method: method.to_owned(),
         params,
     };
@@ -177,6 +212,14 @@ fn write_request<W: Write>(
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(id)
+}
+
+fn new_request_id() -> String {
+    let sequence = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("request-{}-{timestamp}-{sequence}", std::process::id())
 }
 
 fn read_message<R: BufRead>(reader: &mut R) -> Result<ServerMessage, RpcClientError> {

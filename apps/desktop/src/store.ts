@@ -399,7 +399,7 @@ export const useDesktopStore = create<DesktopStore>()(
           // Settings are workspace-derived, so they load alongside the rest.
           await get().refreshSettings();
           await get().loadModelCatalog();
-        } catch {
+        } catch (error) {
           const clientId = get().clientId;
           if (clientId) await Promise.resolve(disconnectRuntime(clientId)).catch(() => undefined);
           set({
@@ -407,7 +407,10 @@ export const useDesktopStore = create<DesktopStore>()(
             runtimeState: "failed",
             clientId: null,
             isLoadingWorkspace: false,
-            lastError: "Harness could not connect or start. Retry, restart the runtime, or open logs for details.",
+            lastError:
+              error instanceof RpcTransportError
+                ? error.message
+                : "Harness could not connect or start. Retry, restart the runtime, or open logs for details.",
           });
         }
       },
@@ -421,19 +424,12 @@ export const useDesktopStore = create<DesktopStore>()(
           await Promise.resolve(disconnectRuntime(previousClientId)).catch(() => undefined);
           set({ clientId: null, activeRunId: null, runPhase: "failed", approvals: [] });
         }
-        const backoff = [0, 300, 900, 1800];
         try {
-          for (const delay of backoff) {
-            if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-            set({ status: "connecting", runtimeState: "reconnecting" });
-            await get().connect(address, workspacePath, true);
-            if (get().status === "connected") return;
-          }
-          set({
-            status: "error",
-            runtimeState: "failed",
-            lastError: "Harness could not reconnect. Retry, restart the runtime, or open logs for details.",
-          });
+          // Retry policy lives in the shared Rust connector so the CLI and
+          // desktop use the same bounded backoff and cannot start competing
+          // replacement runtimes from separate UI retry loops.
+          set({ status: "connecting", runtimeState: "reconnecting" });
+          await get().connect(address, workspacePath, true);
         } finally {
           set({ isRecoveringRuntime: false });
         }
