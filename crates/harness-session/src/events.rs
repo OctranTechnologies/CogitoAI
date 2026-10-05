@@ -147,6 +147,31 @@ pub enum TaskPhase {
     Finish,
 }
 
+/// Task behavior is separate from the permission mode that governs execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskMode {
+    Explore,
+    Plan,
+    #[default]
+    Code,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImplementationPlan {
+    pub goal: String,
+    #[serde(default)]
+    pub relevant_architecture: Vec<String>,
+    #[serde(default)]
+    pub files_likely_affected: Vec<String>,
+    #[serde(default)]
+    pub implementation_steps: Vec<String>,
+    #[serde(default)]
+    pub validation: Vec<String>,
+    #[serde(default)]
+    pub risks_or_unknowns: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCompletionStatus {
@@ -172,11 +197,15 @@ pub struct TaskVerificationResult {
 pub struct TaskRun {
     pub original_goal: String,
     #[serde(default)]
+    pub task_mode: TaskMode,
+    #[serde(default)]
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
     pub current_phase: TaskPhase,
     #[serde(default)]
     pub current_plan: Vec<String>,
+    #[serde(default)]
+    pub structured_plan: Option<ImplementationPlan>,
     #[serde(default)]
     pub relevant_files: Vec<PathBuf>,
     #[serde(default)]

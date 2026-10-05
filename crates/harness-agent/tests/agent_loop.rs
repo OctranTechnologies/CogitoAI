@@ -14,7 +14,7 @@ use harness_models::{
     ScriptedMockProvider, ToolCall, Usage,
 };
 use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
-use harness_session::{JsonlSessionStore, SessionStatus, SessionStore};
+use harness_session::{JsonlSessionStore, SessionStatus, SessionStore, TaskMode};
 use harness_tools::{CancellationToken, ToolRegistry};
 use harness_verification::{
     VerificationCategory, VerificationPlan, VerificationReport, VerificationRequest,
@@ -357,6 +357,237 @@ fn mock_agent_reads_edits_runs_observes_and_finishes() {
         event_types.last(),
         Some(&harness_session::EventType::SessionCompleted)
     );
+}
+
+#[test]
+fn task_modes_and_permission_modes_compose_without_read_only_bypass() {
+    let cases = [
+        (TaskMode::Explore, ExecutionMode::ReadOnly),
+        (TaskMode::Explore, ExecutionMode::Safe),
+        (TaskMode::Explore, ExecutionMode::Normal),
+        (TaskMode::Explore, ExecutionMode::Auto),
+        (TaskMode::Plan, ExecutionMode::ReadOnly),
+        (TaskMode::Plan, ExecutionMode::Safe),
+        (TaskMode::Plan, ExecutionMode::Normal),
+        (TaskMode::Plan, ExecutionMode::Auto),
+        (TaskMode::Code, ExecutionMode::ReadOnly),
+        (TaskMode::Code, ExecutionMode::Safe),
+        (TaskMode::Code, ExecutionMode::Normal),
+        (TaskMode::Code, ExecutionMode::Auto),
+    ];
+
+    for (task_mode, permission_mode) in cases {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path();
+        let plan = "Goal\nImplement a harmless test fixture update.\n\nRelevant architecture\n- Existing file-backed fixture.\n\nFiles likely affected\n- target.txt\n\nImplementation steps\n- Update target.txt.\n\nValidation\n- Run the fixture check.\n\nRisks/unknowns\n- None known.";
+        let final_text = match task_mode {
+            TaskMode::Explore => "The repository contains a small file-backed fixture.",
+            TaskMode::Plan => plan,
+            TaskMode::Code => "Implementation complete and verified.",
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider::new(
+            requests.clone(),
+            vec![
+                response(
+                    "",
+                    Some((
+                        "write_file",
+                        serde_json::json!({ "path": "target.txt", "content": "changed" }),
+                    )),
+                ),
+                response(final_text, None),
+            ],
+        ));
+        let policy = Arc::new(PolicyEngine::new(permission_mode, workspace));
+        let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+        let runner = AgentRunner::new(
+            provider,
+            "recording",
+            ToolRegistry::with_workspace_tools(),
+            policy,
+            sessions.clone(),
+            ContextBuilder::default(),
+            AgentLimits::default(),
+            Arc::new(ApproveAll),
+        );
+        let runner = runner.with_verifier(Arc::new(ScriptedVerifier::new([true])));
+        let mut task = task(workspace);
+        task.task_mode = task_mode;
+        if task_mode == TaskMode::Code {
+            task.verification_plan = Some(mock_verification_plan());
+        }
+
+        let result = runner.run(&task, &CancellationToken::new());
+        let should_edit = task_mode == TaskMode::Code && permission_mode != ExecutionMode::ReadOnly;
+        assert_eq!(
+            workspace.join("target.txt").exists(),
+            should_edit,
+            "{task_mode:?} + {permission_mode:?}"
+        );
+        let requests = requests.lock().unwrap();
+        for request in requests.iter() {
+            let advertises_write = request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "write_file" || tool.name == "apply_patch");
+            let advertises_command = request.tools.iter().any(|tool| tool.name == "shell");
+            assert_eq!(
+                advertises_write,
+                task_mode == TaskMode::Code,
+                "write tools must follow task behavior, not permission mode: {task_mode:?} + {permission_mode:?}"
+            );
+            assert_eq!(
+                advertises_command,
+                task_mode == TaskMode::Code,
+                "shell must follow task behavior, not permission mode: {task_mode:?} + {permission_mode:?}"
+            );
+        }
+        drop(requests);
+        if should_edit {
+            assert!(
+                result.is_ok(),
+                "{task_mode:?} + {permission_mode:?}: {result:?}"
+            );
+        } else if task_mode == TaskMode::Code {
+            assert!(
+                result.is_err(),
+                "read-only execution permission must deny CODE writes"
+            );
+        } else {
+            let outcome = result
+                .unwrap_or_else(|error| panic!("{task_mode:?} + {permission_mode:?}: {error}"));
+            assert_eq!(
+                outcome.completion_status,
+                harness_session::TaskCompletionStatus::Done
+            );
+        }
+
+        let session_id = sessions.recent(1).unwrap()[0].id.clone();
+        let state = sessions.load(&session_id).unwrap().state().unwrap();
+        let task_run = state.task_run.expect("task mode is persisted");
+        assert_eq!(task_run.task_mode, task_mode);
+        if task_mode == TaskMode::Plan {
+            let plan = task_run
+                .structured_plan
+                .expect("PLAN response should be structured");
+            assert_eq!(plan.goal, "Read, edit, run, and finish");
+            assert!(!plan.relevant_architecture.is_empty());
+            assert!(plan
+                .files_likely_affected
+                .iter()
+                .any(|file| file == "target.txt"));
+            assert!(!plan.implementation_steps.is_empty());
+            assert!(!plan.validation.is_empty());
+            assert!(!plan.risks_or_unknowns.is_empty());
+        }
+    }
+}
+
+#[test]
+fn approved_plan_continues_into_code_with_the_same_persisted_context() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    std::fs::write(workspace.join("target.txt"), "before").unwrap();
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let policy = Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace));
+    let plan_text = "Goal\nUpdate the fixture.\n\nRelevant architecture\n- The target is a text fixture.\n\nFiles likely affected\n- target.txt\n\nImplementation steps\n- Write the requested value.\n\nValidation\n- Run fixture validation.\n\nRisks/unknowns\n- None.";
+    let first_requests = Arc::new(Mutex::new(Vec::new()));
+    let planning_runner = AgentRunner::new(
+        Arc::new(RecordingProvider::new(
+            first_requests,
+            vec![response(plan_text, None)],
+        )),
+        "recording",
+        ToolRegistry::with_workspace_tools(),
+        policy.clone(),
+        sessions.clone(),
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    );
+    let plan_task = AgentTask {
+        task_mode: TaskMode::Plan,
+        user_task: "Update the fixture after I approve the plan".to_owned(),
+        ..task(workspace)
+    };
+    let plan_outcome = planning_runner
+        .run(&plan_task, &CancellationToken::new())
+        .unwrap();
+    let plan_state = sessions
+        .load(&plan_outcome.session_id)
+        .unwrap()
+        .state()
+        .unwrap();
+    let persisted_plan = plan_state.task_run.unwrap().structured_plan.unwrap();
+    assert_eq!(persisted_plan.goal, plan_task.user_task);
+    assert!(persisted_plan
+        .implementation_steps
+        .iter()
+        .any(|step| step.contains("Write")));
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let code_runner = AgentRunner::new(
+        Arc::new(RecordingProvider::new(
+            requests.clone(),
+            vec![
+                response(
+                    "",
+                    Some((
+                        "write_file",
+                        serde_json::json!({ "path": "target.txt", "content": "after" }),
+                    )),
+                ),
+                response("Done", None),
+            ],
+        )),
+        "recording",
+        ToolRegistry::with_workspace_tools(),
+        policy,
+        sessions.clone(),
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    )
+    .with_verifier(Arc::new(ScriptedVerifier::new([true])));
+    let code_task = AgentTask {
+        task_mode: TaskMode::Code,
+        user_task: "Implement the approved plan".to_owned(),
+        resume_session: Some(plan_outcome.session_id.clone()),
+        verification_plan: Some(mock_verification_plan()),
+        ..task(workspace)
+    };
+    let code_outcome = code_runner
+        .run(&code_task, &CancellationToken::new())
+        .unwrap();
+
+    assert_eq!(code_outcome.session_id, plan_outcome.session_id);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("target.txt")).unwrap(),
+        "after"
+    );
+    let final_state = sessions
+        .load(&code_outcome.session_id)
+        .unwrap()
+        .state()
+        .unwrap();
+    let task_run = final_state.task_run.unwrap();
+    assert_eq!(task_run.task_mode, TaskMode::Code);
+    assert_eq!(task_run.original_goal, plan_task.user_task);
+    assert_eq!(task_run.structured_plan, Some(persisted_plan));
+    let request = requests.lock().unwrap();
+    let system_prompt = request[0]
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(system_prompt.contains("Approved implementation plan"));
+    assert!(system_prompt.contains("Write the requested value"));
 }
 
 #[test]

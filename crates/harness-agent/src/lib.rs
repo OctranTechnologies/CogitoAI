@@ -10,11 +10,13 @@ use harness_models::{
     Message, ModelPricing, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError,
     ReasoningConfig, Role, Usage,
 };
-use harness_policy::{ExecutionMode, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest};
+use harness_policy::{
+    ExecutionMode, OperationKind, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest,
+};
 use harness_session::{
     CompactState, ConversationMessage as SessionConversationMessage, EventBus, EventPayload,
-    HarnessEvent, MessageRole, SessionStore, TaskCompletionStatus, TaskPhase, TaskRun,
-    TaskVerificationResult,
+    HarnessEvent, ImplementationPlan, MessageRole, SessionStore, TaskCompletionStatus, TaskMode,
+    TaskPhase, TaskRun, TaskVerificationResult,
 };
 use harness_tools::{CancellationToken, ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{VerificationPlan, VerificationRequest, Verifier};
@@ -206,12 +208,27 @@ fn push_unique_bounded<T: Eq>(values: &mut Vec<T>, value: T, limit: usize) {
 
 fn coding_agent_instructions(existing: &str) -> String {
     let guidance = "\
-You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Make focused changes, run relevant checks, read their complete result, inspect the final diff, and repair failures before finishing. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
+You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Make focused changes, run relevant checks, read their complete result, inspect the final diff, and repair failures before finishing. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. For a broad or high-risk request, you may recommend that the user switch to PLAN mode first, but do not force simple tasks through a verbose plan. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
     if existing.trim().is_empty() {
         guidance.to_owned()
     } else {
         format!("{}\n\n{guidance}", existing.trim())
     }
+}
+
+fn task_mode_instructions(existing: String, mode: TaskMode) -> String {
+    let behavior = match mode {
+        TaskMode::Explore => "\
+Current task mode: EXPLORE. Inspect the repository and answer the user's question. You may only read, list, or search workspace content. Do not edit or create files, apply patches, or run commands. Do not perform destructive actions. If the user asks for implementation, explain what you found and recommend switching to PLAN or CODE.",
+        TaskMode::Plan => "\
+Current task mode: PLAN. Inspect the repository and produce a structured implementation plan without changing files or running commands. You may only read, list, or search workspace content. Do not edit or create files, apply patches, or execute commands. The final response must use these headings: Goal, Relevant architecture, Files likely affected, Implementation steps, Validation, Risks/unknowns. Be specific, and keep simple plans concise.",
+        TaskMode::Code => "Current task mode: CODE. Follow the normal coding-agent workflow and the active execution permission mode.",
+    };
+    format!("{existing}\n\n{behavior}")
+}
+
+fn task_mode_allows_tool(mode: TaskMode, operation: Option<OperationKind>) -> bool {
+    mode == TaskMode::Code || matches!(operation, Some(OperationKind::Read | OperationKind::Search))
 }
 
 fn append_acceptance_criteria(instructions: &mut String, criteria: &[String]) {
@@ -259,6 +276,133 @@ fn append_prior_task_state(instructions: &mut String, previous: &TaskRun) {
             instructions.push_str("\n- ");
             instructions.push_str(item);
         }
+    }
+    if let Some(plan) = &previous.structured_plan {
+        instructions.push_str("\nApproved implementation plan:");
+        for (heading, items) in [
+            ("Relevant architecture", &plan.relevant_architecture),
+            ("Files likely affected", &plan.files_likely_affected),
+            ("Implementation steps", &plan.implementation_steps),
+            ("Validation", &plan.validation),
+            ("Risks/unknowns", &plan.risks_or_unknowns),
+        ] {
+            if items.is_empty() {
+                continue;
+            }
+            instructions.push_str(&format!("\n{heading}:"));
+            for item in items {
+                instructions.push_str("\n- ");
+                instructions.push_str(item);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PlanSection {
+    Goal,
+    Architecture,
+    Files,
+    Steps,
+    Validation,
+    Risks,
+}
+
+fn plan_section(heading: &str) -> Option<PlanSection> {
+    let heading = heading
+        .trim_start_matches('#')
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-'], " ");
+    match heading.as_str() {
+        "goal" | "objective" => Some(PlanSection::Goal),
+        "relevant architecture" | "architecture" => Some(PlanSection::Architecture),
+        "files likely affected" | "likely affected files" | "affected files" => {
+            Some(PlanSection::Files)
+        }
+        "implementation steps" | "steps" | "plan" => Some(PlanSection::Steps),
+        "validation" | "tests and validation" | "tests" => Some(PlanSection::Validation),
+        "risks/unknowns" | "risks and unknowns" | "risks" | "unknowns" => Some(PlanSection::Risks),
+        _ => None,
+    }
+}
+
+fn plan_item(line: &str) -> String {
+    let value = line.trim().trim_start_matches(['-', '*', '•']).trim();
+    let value = value
+        .split_once(". ")
+        .filter(|(prefix, _)| prefix.chars().all(|character| character.is_ascii_digit()))
+        .map_or(value, |(_, item)| item.trim());
+    bounded_summary(value)
+}
+
+fn parse_implementation_plan(
+    goal: &str,
+    response: &str,
+    relevant_files: &[PathBuf],
+) -> ImplementationPlan {
+    let mut plan = ImplementationPlan {
+        goal: goal.to_owned(),
+        ..ImplementationPlan::default()
+    };
+    let mut section = None;
+    let mut structured = false;
+    for line in response.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(next) = plan_section(line) {
+            section = Some(next);
+            structured = true;
+            let value = line
+                .trim_start_matches('#')
+                .trim()
+                .split_once(':')
+                .map(|(_, value)| plan_item(value))
+                .unwrap_or_default();
+            if !value.is_empty() {
+                push_plan_item(&mut plan, next, value);
+            }
+            continue;
+        }
+        let Some(section) = section else {
+            continue;
+        };
+        let item = plan_item(line);
+        if !item.is_empty() {
+            push_plan_item(&mut plan, section, item);
+        }
+    }
+    if !structured {
+        plan.implementation_steps = response
+            .lines()
+            .map(plan_item)
+            .filter(|line| !line.is_empty())
+            .collect();
+    }
+    for path in relevant_files {
+        let path = path.display().to_string();
+        if !plan.files_likely_affected.contains(&path) {
+            plan.files_likely_affected.push(path);
+        }
+    }
+    plan
+}
+
+fn push_plan_item(plan: &mut ImplementationPlan, section: PlanSection, item: String) {
+    let items = match section {
+        PlanSection::Goal => return,
+        PlanSection::Architecture => &mut plan.relevant_architecture,
+        PlanSection::Files => &mut plan.files_likely_affected,
+        PlanSection::Steps => &mut plan.implementation_steps,
+        PlanSection::Validation => &mut plan.validation,
+        PlanSection::Risks => &mut plan.risks_or_unknowns,
+    };
+    if !items.contains(&item) {
+        items.push(item);
     }
 }
 
@@ -481,6 +625,8 @@ pub struct AgentTask {
     pub workspace_root: PathBuf,
     pub user_task: String,
     #[serde(default)]
+    pub task_mode: TaskMode,
+    #[serde(default)]
     pub acceptance_criteria: Vec<String>,
     pub system_instructions: String,
     pub workspace: WorkspaceMetadata,
@@ -657,15 +803,24 @@ impl AgentRunner {
             .state()
             .map_err(|error| AgentError::Core(error.to_string()))?;
         let session_id = session.id.clone();
-        let mut task_run = previous_state
-            .task_run
-            .clone()
-            .filter(|run| run.completion_status != TaskCompletionStatus::Done)
+        let previous_task_run = previous_state.task_run.clone();
+        // A completed PLAN is still useful when the user explicitly resumes it
+        // in CODE mode. Keep its discoveries and structured plan as context.
+        let approved_plan_continuation = task.task_mode == TaskMode::Code
+            && task.resume_session.is_some()
+            && previous_task_run.as_ref().is_some_and(|run| {
+                run.task_mode == TaskMode::Plan && run.structured_plan.is_some()
+            });
+        let mut task_run = previous_task_run
+            .filter(|run| {
+                run.completion_status != TaskCompletionStatus::Done || approved_plan_continuation
+            })
             .unwrap_or_else(|| TaskRun::new(task.user_task.clone()));
         let resumed_task_state = task.resume_session.as_ref().map(|_| task_run.clone());
         if task_run.original_goal.is_empty() {
             task_run.original_goal.clone_from(&task.user_task);
         }
+        task_run.task_mode = task.task_mode;
         if !task.acceptance_criteria.is_empty() {
             task_run.acceptance_criteria = task.acceptance_criteria.clone();
         } else if task_run.acceptance_criteria.is_empty() {
@@ -679,7 +834,10 @@ impl AgentRunner {
                 .unresolved_errors
                 .retain(|error| !error.starts_with("runtime:guard:"));
         }
-        let mut system_instructions = coding_agent_instructions(&task.system_instructions);
+        let mut system_instructions = task_mode_instructions(
+            coding_agent_instructions(&task.system_instructions),
+            task.task_mode,
+        );
         append_acceptance_criteria(&mut system_instructions, &task_run.acceptance_criteria);
         if let Some(previous) = &resumed_task_state {
             append_prior_task_state(&mut system_instructions, previous);
@@ -759,7 +917,8 @@ impl AgentRunner {
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<HashMap<_, _>>();
         let mut no_progress_final_responses = 0_u32;
-        let mut validation_since_last_edit = task_run.changed_files.is_empty();
+        let mut validation_since_last_edit =
+            task.task_mode != TaskMode::Code || task_run.changed_files.is_empty();
         // Keep the latest canonical call/result batch for native model
         // protocols that require explicit tool-result messages. The rebuilt
         // context carries older observations without retaining an unbounded
@@ -816,6 +975,9 @@ impl AgentRunner {
                     .tools
                     .specs()
                     .into_iter()
+                    .filter(|spec| {
+                        task_mode_allows_tool(task.task_mode, self.tools.operation_for(&spec.name))
+                    })
                     .map(|spec| harness_models::ToolDefinition {
                         name: spec.name,
                         description: spec.description,
@@ -992,7 +1154,21 @@ impl AgentRunner {
                         estimated_cost_microusd,
                     );
                 }
-                if !task_run.changed_files.is_empty() && !validation_since_last_edit {
+                if task.task_mode == TaskMode::Plan {
+                    let plan = parse_implementation_plan(
+                        &task_run.original_goal,
+                        &response.text(),
+                        &task_run.relevant_files,
+                    );
+                    task_run.current_plan = plan.implementation_steps.clone();
+                    task_run.structured_plan = Some(plan);
+                    task_run.current_phase = TaskPhase::Finish;
+                    self.update_task_run(&session_id, &collector, &task_run)?;
+                }
+                if task.task_mode == TaskMode::Code
+                    && !task_run.changed_files.is_empty()
+                    && !validation_since_last_edit
+                {
                     let key = "verification:after_last_edit".to_owned();
                     unresolved_error_keys.entry(key.clone()).or_insert_with(|| {
                         format!(
@@ -1142,21 +1318,43 @@ impl AgentRunner {
                     collector: &collector,
                     cancellation,
                 };
-                let mut result = match self.execute_tool(&execution, request) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        unresolved_error_keys.insert(
-                            tool_error_key.clone(),
-                            format!(
-                                "{tool_error_key} :: {}",
-                                bounded_summary(&error.to_string())
-                            ),
-                        );
-                        task_run.unresolved_errors =
-                            unresolved_error_keys.values().cloned().collect();
-                        task_run.completion_status = TaskCompletionStatus::Blocked;
-                        task_run.current_phase = TaskPhase::Finish;
-                        return self.abort_with_task_run(session_id, collector, &task_run, error);
+                let operation = self.tools.operation_for(&tool_call.name);
+                let task_mode_denial = (!task_mode_allows_tool(task.task_mode, operation)).then(|| {
+                    format!(
+                        "Task mode {:?} is read-only and only allows workspace read/search tools. No command or file change was made.",
+                        task.task_mode
+                    )
+                });
+                let mut result = if let Some(reason) = &task_mode_denial {
+                    self.emit(
+                        &session_id,
+                        EventPayload::ToolDenied {
+                            tool: tool_call.name.clone(),
+                            reason: reason.clone(),
+                        },
+                        &collector,
+                    )?;
+                    let mut result = ToolResult::new(reason.clone());
+                    result.is_error = true;
+                    result
+                } else {
+                    match self.execute_tool(&execution, request) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            unresolved_error_keys.insert(
+                                tool_error_key.clone(),
+                                format!(
+                                    "{tool_error_key} :: {}",
+                                    bounded_summary(&error.to_string())
+                                ),
+                            );
+                            task_run.unresolved_errors =
+                                unresolved_error_keys.values().cloned().collect();
+                            task_run.completion_status = TaskCompletionStatus::Blocked;
+                            task_run.current_phase = TaskPhase::Finish;
+                            return self
+                                .abort_with_task_run(session_id, collector, &task_run, error);
+                        }
                     }
                 };
                 let (bounded_output, output_truncated) =
@@ -1164,7 +1362,7 @@ impl AgentRunner {
                 result.output = bounded_output;
                 result.truncated = output_truncated;
                 let changed_files = result.changed_files.clone();
-                if result.is_error {
+                if result.is_error && task_mode_denial.is_none() {
                     let error = format!("{tool_error_key} :: {}", bounded_summary(&result.output));
                     unresolved_error_keys.insert(tool_error_key, error);
                     let signature = format!("{}:{}", call_key, normalize_failure(&result.output));
@@ -1190,7 +1388,7 @@ impl AgentRunner {
                             estimated_cost_microusd,
                         );
                     }
-                } else {
+                } else if task_mode_denial.is_none() {
                     unresolved_error_keys.remove(&tool_error_key);
                     task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
                     no_progress_final_responses = 0;

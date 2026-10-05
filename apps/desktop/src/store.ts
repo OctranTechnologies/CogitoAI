@@ -22,6 +22,7 @@ import {
   type RuntimeDiagnostics,
   type ServerMessage,
   type SessionSummary,
+  type TaskMode,
   type WorkspaceSummary,
 } from "./lib/rpc";
 import {
@@ -105,6 +106,7 @@ export interface DesktopStore {
   workspace: WorkspaceSummary | null;
   sessions: SessionSummary[];
   activeSessionId: string | null;
+  taskMode: TaskMode;
   activeRunId: string | null;
   runPhase: RunPhase;
   messages: ChatMessage[];
@@ -148,6 +150,7 @@ export interface DesktopStore {
   disconnect: () => Promise<void>;
   setWorkspacePath: (path: string) => void;
   setComposer: (value: string) => void;
+  setTaskMode: (mode: TaskMode) => void;
   selectSession: (sessionId: string) => Promise<void>;
   refreshSessions: () => Promise<void>;
   createSession: () => Promise<void>;
@@ -240,10 +243,11 @@ function eventText(event: HarnessEvent): string {
   return typeof event.payload.data.text === "string" ? event.payload.data.text : "";
 }
 
-function makeTask(workspacePath: string, text: string, sessionId: string): AgentTask {
+function makeTask(workspacePath: string, text: string, sessionId: string, taskMode: TaskMode): AgentTask {
   return {
     workspace_root: workspacePath,
     user_task: text,
+    task_mode: taskMode,
     system_instructions: systemInstructions,
     workspace: { root: workspacePath, branch: null, monorepo: false, languages: [], manifests: [], details: {} },
     instructions: [],
@@ -326,6 +330,7 @@ export const useDesktopStore = create<DesktopStore>()(
       workspace: null,
       sessions: [],
       activeSessionId: null,
+      taskMode: "code",
       activeRunId: null,
       runPhase: "idle",
       messages: [],
@@ -522,6 +527,7 @@ export const useDesktopStore = create<DesktopStore>()(
         });
       },
       setComposer: (composer) => set({ composer }),
+      setTaskMode: (taskMode) => set({ taskMode }),
       selectSession: async (sessionId) => {
         if (get().activeSessionId === sessionId && get().events.length > 0) return;
         await get().resumeSession(sessionId);
@@ -589,8 +595,16 @@ export const useDesktopStore = create<DesktopStore>()(
           const events = report.session.events;
           const settings = expectResult(await requestRuntime(clientId, "settings.inspect", {}));
           if (isSettingsSnapshot(settings)) set({ settings });
+          const lastTaskMode = events
+            .filter((event) => event.event_type === "task.run.updated")
+            .reverse()
+            .map((event) => event.payload.data.task_run)
+            .filter((taskRun): taskRun is Record<string, unknown> => typeof taskRun === "object" && taskRun !== null)
+            .map((taskRun) => taskRun.task_mode)
+            .find((mode): mode is TaskMode => mode === "explore" || mode === "plan" || mode === "code");
           set({
             activeSessionId: targetSession,
+            ...(lastTaskMode ? { taskMode: lastTaskMode } : {}),
             ...derivedFromEvents(events),
             messages: hydrateConversation(events),
             approvals: [],
@@ -606,7 +620,7 @@ export const useDesktopStore = create<DesktopStore>()(
       },
 
       sendMessage: async (text) => {
-        const { clientId, workspacePath, activeSessionId, activeRunId } = get();
+        const { clientId, workspacePath, activeSessionId, activeRunId, taskMode } = get();
         if (!clientId || !workspacePath || activeRunId || !text.trim()) return;
         if (!activeSessionId) await get().createSession();
         const sessionId = get().activeSessionId;
@@ -635,7 +649,7 @@ export const useDesktopStore = create<DesktopStore>()(
         }));
         try {
           const response = await requestRuntime<{ run_id: string }>(clientId, "agent.send", {
-            task: makeTask(workspacePath, text, sessionId),
+            task: makeTask(workspacePath, text, sessionId, taskMode),
           });
           set({ activeRunId: expectResult(response).run_id, lastError: null });
         } catch (error) {
@@ -1136,6 +1150,7 @@ export const useDesktopStore = create<DesktopStore>()(
         address: state.address,
         workspacePath: state.workspacePath,
         activeSessionId: state.activeSessionId,
+        taskMode: state.taskMode,
       }),
     },
   ),

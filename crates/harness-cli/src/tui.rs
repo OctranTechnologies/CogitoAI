@@ -11,7 +11,7 @@ use crossterm::terminal::{
 };
 use crossterm::{cursor::Show, style::ResetColor};
 use harness_models::{ModelConfig, ProviderKind};
-use harness_session::EventPayload;
+use harness_session::{EventPayload, TaskMode};
 use harness_tools::CancellationToken;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position};
@@ -38,7 +38,7 @@ pub struct StartupInfo {
 
 enum UiMessage {
     Activity(String),
-    RuntimeEvent(EventPayload),
+    RuntimeEvent(Box<EventPayload>),
     WorkspaceContext {
         execution_mode: String,
         branch: Option<String>,
@@ -64,7 +64,9 @@ impl TuiSender {
     }
 
     pub fn runtime_event(&self, event: &EventPayload) {
-        let _ = self.sender.send(UiMessage::RuntimeEvent(event.clone()));
+        let _ = self
+            .sender
+            .send(UiMessage::RuntimeEvent(Box::new(event.clone())));
     }
 
     pub fn workspace_context(
@@ -121,6 +123,7 @@ enum InputAction {
 
 struct AppState {
     startup: StartupInfo,
+    task_mode: TaskMode,
     execution_mode: String,
     branch: Option<String>,
     workspace_dirty: Option<bool>,
@@ -145,11 +148,13 @@ struct AppState {
     quit: bool,
     colors: bool,
     active_session_id: Option<String>,
+    approved_plan_available: bool,
 }
 
 impl AppState {
     fn new(startup: StartupInfo, colors: bool) -> Self {
         let mut state = Self {
+            task_mode: TaskMode::Code,
             execution_mode: startup.execution_mode.clone(),
             branch: startup.branch.clone(),
             workspace_dirty: startup.workspace_dirty,
@@ -175,6 +180,7 @@ impl AppState {
             quit: false,
             colors,
             active_session_id: None,
+            approved_plan_available: false,
         };
         state.push_activity("Ready. Enter a task or type /help.".to_owned());
         state
@@ -187,6 +193,14 @@ impl AppState {
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(1);
         }
         self.activity.push_back(message);
+    }
+
+    fn approved_plan_session_for_code(&self) -> Option<&str> {
+        if self.task_mode == TaskMode::Code && self.approved_plan_available {
+            self.active_session_id.as_deref()
+        } else {
+            None
+        }
     }
 
     fn apply_runtime_event(&mut self, event: EventPayload) {
@@ -261,6 +275,11 @@ impl AppState {
                     "{check} {}",
                     if passed { "passed" } else { "failed" }
                 ));
+            }
+            EventPayload::TaskRunUpdated { task_run } => {
+                self.approved_plan_available = task_run.task_mode == TaskMode::Plan
+                    && task_run.structured_plan.is_some()
+                    && task_run.completion_status == harness_session::TaskCompletionStatus::Done;
             }
             EventPayload::FileChanged { .. } => {
                 self.workspace_dirty = Some(true);
@@ -634,6 +653,22 @@ impl Tui {
         self.model_config.clone()
     }
 
+    pub fn task_mode(&self) -> TaskMode {
+        self.state.task_mode
+    }
+
+    pub fn set_task_mode(&mut self, mode: TaskMode) {
+        self.state.task_mode = mode;
+        self.state.status = format!("Task mode · {}", task_mode_label(mode));
+        self.dirty = true;
+    }
+
+    pub fn approved_plan_session_for_code(&self) -> Option<String> {
+        self.state
+            .approved_plan_session_for_code()
+            .map(str::to_owned)
+    }
+
     pub fn set_model_config(&mut self, model: ModelConfig) {
         self.state.startup.model = model.model.clone();
         self.state.startup.provider = match model.provider {
@@ -654,6 +689,9 @@ impl Tui {
     }
 
     pub fn set_active_session_id(&mut self, session_id: Option<String>) {
+        if session_id != self.state.active_session_id {
+            self.state.approved_plan_available = false;
+        }
         self.state.active_session_id = session_id;
     }
 
@@ -811,7 +849,7 @@ impl Tui {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
                 UiMessage::Activity(message) => self.state.push_activity(message),
-                UiMessage::RuntimeEvent(event) => self.state.apply_runtime_event(event),
+                UiMessage::RuntimeEvent(event) => self.state.apply_runtime_event(*event),
                 UiMessage::WorkspaceContext {
                     execution_mode,
                     branch,
@@ -852,6 +890,9 @@ impl Tui {
                     }
                 }
                 UiMessage::SessionId(session_id) => {
+                    if self.state.active_session_id.as_deref() != Some(&session_id) {
+                        self.state.approved_plan_available = false;
+                    }
                     self.state.active_session_id = Some(session_id);
                 }
             }
@@ -1005,7 +1046,10 @@ fn draw_ui(frame: &mut Frame<'_>, state: &AppState, colors: bool) {
     frame.render_widget(List::new(items).block(activity_block), areas[1]);
 
     let input_block = Block::default()
-        .title(" INPUT  Enter runs  |  Alt+Enter adds a line ")
+        .title(format!(
+            " INPUT · {}  Enter runs  |  Alt+Enter adds a line ",
+            task_mode_label(state.task_mode)
+        ))
         .borders(Borders::TOP)
         .border_style(Style::default().fg(muted));
     let input_inner = input_block.inner(areas[2]);
@@ -1050,6 +1094,14 @@ fn draw_ui(frame: &mut Frame<'_>, state: &AppState, colors: bool) {
     ])
     .block(footer_block);
     frame.render_widget(status, areas[3]);
+}
+
+fn task_mode_label(mode: TaskMode) -> &'static str {
+    match mode {
+        TaskMode::Explore => "EXPLORE",
+        TaskMode::Plan => "PLAN",
+        TaskMode::Code => "CODE",
+    }
 }
 
 fn status_line(state: &AppState, width: u16, colors: bool) -> Line<'static> {
@@ -1466,6 +1518,61 @@ mod tests {
             .collect::<String>();
         assert!(activity_heading.contains("ACTIVITY"));
         assert!(!activity_heading.contains('┌'));
+    }
+
+    #[test]
+    fn task_behavior_mode_is_visible_separately_from_execution_permission() {
+        for (mode, label) in [
+            (TaskMode::Explore, "EXPLORE"),
+            (TaskMode::Plan, "PLAN"),
+            (TaskMode::Code, "CODE"),
+        ] {
+            let mut state = AppState::new(startup(), false);
+            state.task_mode = mode;
+            let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+            terminal
+                .draw(|frame| draw_ui(frame, &state, false))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+
+            assert!(rendered.contains(&format!("INPUT · {label}")));
+            assert!(
+                rendered.contains("normal"),
+                "execution permission remains visible"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_a_completed_plan_to_code_reuses_its_session_once() {
+        let mut state = AppState::new(startup(), false);
+        state.task_mode = TaskMode::Plan;
+        state.active_session_id = Some("plan-session".to_owned());
+        let mut task_run = harness_session::TaskRun::new("implement the requested change");
+        task_run.task_mode = TaskMode::Plan;
+        task_run.structured_plan = Some(harness_session::ImplementationPlan {
+            goal: task_run.original_goal.clone(),
+            ..harness_session::ImplementationPlan::default()
+        });
+        task_run.completion_status = harness_session::TaskCompletionStatus::Done;
+        state.apply_runtime_event(EventPayload::TaskRunUpdated {
+            task_run: task_run.clone(),
+        });
+
+        assert_eq!(state.approved_plan_session_for_code(), None);
+        state.task_mode = TaskMode::Code;
+        assert_eq!(state.approved_plan_session_for_code(), Some("plan-session"));
+
+        task_run.task_mode = TaskMode::Code;
+        task_run.completion_status = harness_session::TaskCompletionStatus::InProgress;
+        state.apply_runtime_event(EventPayload::TaskRunUpdated { task_run });
+        assert_eq!(state.approved_plan_session_for_code(), None);
     }
 
     #[test]

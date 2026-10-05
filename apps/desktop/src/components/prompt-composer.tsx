@@ -1,10 +1,11 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { FolderGit2, LoaderCircle, Send, Square, X } from "lucide-react";
 import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
+import type { TaskMode } from "../lib/rpc";
 import { Button, IconButton, Tooltip, cx } from "./ui";
 import { ComposerShell } from "./composer-parts";
 import { useAutoGrow } from "../lib/composer";
-import { AttachButton, ModelSelector, ModeSelector } from "./composer-selectors";
+import { AttachButton, ModelSelector, ModeSelector, TaskModeSelector } from "./composer-selectors";
 import { desktopShortcutLabel, matchesDesktopShortcut } from "../lib/keyboard";
 
 export interface PromptComposerProps {
@@ -24,6 +25,8 @@ export interface PromptComposerProps {
   onConnectProvider: (providerId: string) => void;
   onSelectReasoning: (effort: string) => void;
   onSelectMode: (mode: string) => void;
+  taskMode: TaskMode;
+  onSelectTaskMode: (mode: TaskMode) => void;
   pendingMode: string | null;
   /** Workspace path shown above the textarea, with a switch affordance. */
   workspacePath: string;
@@ -61,6 +64,8 @@ export function PromptComposer({
   onConnectProvider,
   onSelectReasoning,
   onSelectMode,
+  taskMode,
+  onSelectTaskMode,
   pendingMode,
   workspacePath,
   onChooseWorkspace,
@@ -136,7 +141,7 @@ export function PromptComposer({
           onBlur={() => setFocused(false)}
         />
 
-        <div className="mt-2 flex items-center gap-2">
+        <div className="mt-2 flex flex-wrap items-center gap-2">
           <AttachButton />
           <ModeSelector
             permissions={permissions}
@@ -144,6 +149,18 @@ export function PromptComposer({
             pending={pendingMode}
             disabled={!connected}
             disabledReason={!connected ? "Connect a runtime to change the execution mode" : undefined}
+          />
+          <TaskModeSelector
+            mode={taskMode}
+            onSelect={onSelectTaskMode}
+            disabled={!connected || running}
+            disabledReason={
+              !connected
+                ? "Connect a runtime to change task behavior"
+                : running
+                  ? "Task behavior cannot change while a task is running"
+                  : undefined
+            }
           />
           <ModelSelector
             models={models}

@@ -12,8 +12,8 @@ pub mod events;
 
 pub use bus::{EventBus, EventSubscriber, EventSubscription};
 pub use events::{
-    CompactState, EventId, EventPayload, EventType, FileChange, HarnessEvent, TaskCompletionStatus,
-    TaskPhase, TaskRun, TaskVerificationResult, Timestamp,
+    CompactState, EventId, EventPayload, EventType, FileChange, HarnessEvent, ImplementationPlan,
+    TaskCompletionStatus, TaskMode, TaskPhase, TaskRun, TaskVerificationResult, Timestamp,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

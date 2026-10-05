@@ -651,13 +651,27 @@ and elapsed time for the current run. Its second line shows an approval, current
 action, or shortcuts. Context percentage, price, and reasoning effort are omitted
 when the runtime cannot determine them.
 
+Task behavior is a separate composer control from execution permission. Choose
+`Explore` to ask read/search questions, `Plan` to produce a structured plan
+without edits or commands, or `Code` for the full edit-and-verify loop. These
+choices never raise the workspace permission mode: for example, CODE with the
+execution mode set to Safe still requires policy approval for guarded actions.
+The runtime enforces EXPLORE and PLAN tool restrictions, and records the active
+mode in the session. Resuming a PLAN session in CODE carries its saved plan and
+repository discoveries forward.
+
 The interactive slash commands are `/help`, `/run`, `/resume`, `/inspect`,
 `/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/models`, `/connect`, `/mode`,
+`/explore`, `/plan`, `/code`,
 `/clear`, `/cancel`, and `/exit`. `/models` shows the cached model registry;
 `/models refresh [provider-id]` refreshes all catalogs or one provider. `/model`
 shows the current provider/model; `/model provider/model-id` changes it. `/mode`
 reports the execution mode loaded from the
 workspace policy; change that setting in `.agent/config.toml` and restart the CLI.
+`/explore`, `/plan`, and `/code` select task behavior for the next task. They do
+not change `/mode`, which remains the workspace's execution permission level.
+After reviewing a PLAN result, use `/code` and submit an implementation request
+in the same session to continue from the persisted plan.
 Tab completes commands. The `TERM=dumb` line-oriented fallback lists only the
 commands it supports while preserving ordinary terminal output.
 

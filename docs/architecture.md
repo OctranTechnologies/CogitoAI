@@ -52,6 +52,27 @@ is `done` only after the model returns a final response with no outstanding
 runtime-recorded errors. Cost stays unknown unless the provider supplies both
 token usage and trustworthy pricing metadata.
 
+Task behavior is a separate runtime contract from execution permission. Each
+`AgentTask` carries `TaskMode::{Explore, Plan, Code}`, and the session event log
+stores the selected mode in `TaskRun`. EXPLORE and PLAN expose only tools whose
+canonical operation is read or search; the runtime checks the same restriction
+again before executing a model-requested call. The permission engine still
+decides whether an otherwise permitted operation is allowed, needs approval, or
+is denied. This keeps PLAN plus Safe and CODE plus ReadOnly meaningful without
+duplicating the permission system.
+
+PLAN ends with an `ImplementationPlan` snapshot containing the goal, relevant
+architecture, likely files, steps, validation, and risks. Continuing that session
+in CODE retains the original goal and plan in runtime-owned context, so the model
+can implement an approved plan without repeating repository discovery. Simple
+tasks may go directly to CODE; general agent instructions let a model recommend
+PLAN when scope or risk warrants it.
+
+The CLI exposes `/explore`, `/plan`, and `/code`; the desktop composer has a
+separate Task behavior selector next to the execution permission selector. The
+clients send the mode on a task request and display persisted session state; the
+runtime owns enforcement, plan state, and continuation.
+
 Agent safeguards can be tuned in the runtime environment with
 `COGITO_AGENT_MAX_TURNS`, `COGITO_AGENT_MAX_TOOL_CALLS`,
 `COGITO_AGENT_MAX_RUNTIME_SECONDS`, `COGITO_AGENT_MAX_MODEL_TOKENS`,

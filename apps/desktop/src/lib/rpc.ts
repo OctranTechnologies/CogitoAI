@@ -137,6 +137,7 @@ export interface ApprovalRequest {
 export interface AgentTask {
   workspace_root: string;
   user_task: string;
+  task_mode: TaskMode;
   system_instructions: string;
   workspace: Record<string, unknown>;
   instructions: unknown[];
@@ -147,6 +148,8 @@ export interface AgentTask {
   verification_plan: null;
   resume_session: string | null;
 }
+
+export type TaskMode = "explore" | "plan" | "code";
 
 export interface GitStatusSummary {
   repository_root: string;

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Bot } from "lucide-react";
 import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
+import type { TaskMode } from "../lib/rpc";
 import { ComposerNotice, PromptComposer } from "./prompt-composer";
 
 export interface LandingViewProps {
@@ -23,6 +24,8 @@ export interface LandingViewProps {
   onConnectProvider: (providerId: string) => void;
   onSelectReasoning: (effort: string) => void;
   onSelectMode: (mode: string) => void;
+  taskMode: TaskMode;
+  onSelectTaskMode: (mode: TaskMode) => void;
   pendingMode: string | null;
   /** Shown as a dismissible banner above the composer. */
   runtimeError: string | null;
@@ -55,6 +58,8 @@ export function LandingView({
   onConnectProvider,
   onSelectReasoning,
   onSelectMode,
+  taskMode,
+  onSelectTaskMode,
   pendingMode,
   runtimeError,
 }: LandingViewProps) {
@@ -108,6 +113,8 @@ export function LandingView({
             onConnectProvider={onConnectProvider}
             onSelectReasoning={onSelectReasoning}
             onSelectMode={onSelectMode}
+            taskMode={taskMode}
+            onSelectTaskMode={onSelectTaskMode}
             pendingMode={pendingMode}
             workspacePath={workspacePath}
             onChooseWorkspace={onChooseWorkspace}

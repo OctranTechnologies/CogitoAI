@@ -7,7 +7,7 @@ import { TerminalPanel } from "./terminal-panel";
 import { buildActivityStream, summariseStream, type ActivityBlock } from "../lib/activity";
 import { useAutoScroll } from "../lib/auto-scroll";
 import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
-import type { HarnessEvent } from "../lib/rpc";
+import type { HarnessEvent, TaskMode } from "../lib/rpc";
 import type { CheckpointEntry, ChangeEntry, FileChange, FileView } from "../lib/changes";
 import type { RunPhase } from "../lib/events";
 
@@ -42,6 +42,8 @@ export interface SessionWorkspaceProps {
     onConnectProvider: (providerId: string) => void;
     onSelectReasoning: (effort: string) => void;
     onSelectMode: (mode: string) => void;
+    taskMode: TaskMode;
+    onSelectTaskMode: (mode: TaskMode) => void;
   };
   terminal?: {
     visible: boolean;
@@ -179,6 +181,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 onConnectProvider={props.composer.onConnectProvider}
                 onSelectReasoning={props.composer.onSelectReasoning}
                 onSelectMode={props.composer.onSelectMode}
+                taskMode={props.composer.taskMode}
+                onSelectTaskMode={props.composer.onSelectTaskMode}
                 pendingMode={props.composer.pendingMode}
                 workspacePath={props.composer.workspacePath}
                 onChooseWorkspace={props.composer.onChooseWorkspace}

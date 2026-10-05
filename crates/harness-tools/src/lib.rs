@@ -249,6 +249,15 @@ impl ToolRegistry {
     pub fn names(&self) -> Vec<String> {
         self.tools.iter().map(|tool| tool.spec().name).collect()
     }
+
+    /// Returns the registered operation for a tool so higher-level runtime
+    /// modes can restrict which classes of tools are available and executable.
+    pub fn operation_for(&self, name: &str) -> Option<OperationKind> {
+        self.tools
+            .iter()
+            .find(|tool| tool.spec().name == name)
+            .map(|tool| tool.operation())
+    }
 }
 
 fn build_policy_request(

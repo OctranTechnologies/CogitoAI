@@ -2,15 +2,18 @@ import { useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Bot,
   Check,
+  Code2,
   ChevronDown,
   Cpu,
   Eye,
   Layers3,
+  ListChecks,
   Paperclip,
   PlugZap,
   RefreshCw,
   Search,
   ShieldCheck,
+  ScanSearch,
   Sparkles,
   Wrench,
 } from "lucide-react";
@@ -20,6 +23,7 @@ import type {
   PermissionSettings,
   ProviderCredentialStatus,
 } from "../lib/settings";
+import type { TaskMode } from "../lib/rpc";
 import { modeLabel } from "../lib/composer";
 import { Badge, Dropdown, Popover, Tooltip, cx, type DropdownItem } from "./ui";
 
@@ -390,6 +394,55 @@ export function ModeSelector({
       trigger={
         <SelectorShell label="Execution mode" icon={<ShieldCheck className="size-icon-sm" />}>
           <span className="truncate">{pending ? "Applying…" : modeLabel(current)}</span>
+        </SelectorShell>
+      }
+    />
+  );
+}
+
+/** Task behavior is separate from the permission selector below. */
+export function TaskModeSelector({
+  mode,
+  onSelect,
+  disabled,
+  disabledReason,
+}: {
+  mode: TaskMode;
+  onSelect: (mode: TaskMode) => void;
+  disabled?: boolean;
+  disabledReason?: string;
+}) {
+  const modes: { id: TaskMode; label: string; detail: string; icon: ReactNode }[] = [
+    { id: "explore", label: "Explore", detail: "Read and search only", icon: <ScanSearch className="size-icon-sm" /> },
+    { id: "plan", label: "Plan", detail: "Create a read-only implementation plan", icon: <ListChecks className="size-icon-sm" /> },
+    { id: "code", label: "Code", detail: "Edit, run approved commands, and verify", icon: <Code2 className="size-icon-sm" /> },
+  ];
+  const selected = modes.find((item) => item.id === mode) ?? modes[2];
+  const items: DropdownItem[] = modes.map((item) => ({
+    id: item.id,
+    label: item.label,
+    detail: `${item.detail}${item.id === mode ? " · active" : ""}`,
+    icon: item.id === mode ? <Check className="size-icon-sm" /> : item.icon,
+    onSelect: () => onSelect(item.id),
+  }));
+
+  if (disabled) {
+    return (
+      <SelectorShell label="Task behavior" icon={selected.icon} disabled disabledReason={disabledReason}>
+        <span className="truncate">{selected.label}</span>
+      </SelectorShell>
+    );
+  }
+
+  return (
+    <Dropdown
+      label={`Task behavior: ${selected.label}`}
+      items={items}
+      placement="top-start"
+      panelClassName="w-80"
+      trigger={
+        <SelectorShell label="Task behavior" icon={selected.icon} disabled={disabled}>
+          <span className="truncate">{selected.label}</span>
         </SelectorShell>
       }
     />

@@ -48,6 +48,7 @@ function resetStore() {
     workspace: null,
     sessions: [],
     activeSessionId: null,
+    taskMode: "code",
     activeRunId: null,
     runPhase: "idle",
     messages: [],
@@ -116,6 +117,16 @@ describe("desktop runtime store", () => {
     expect(completed.timeline.map((entry) => entry.eventType)).toContain("tool.completed");
   });
 
+  it("sends the selected task behavior to the runtime", async () => {
+    await useDesktopStore.getState().connect("127.0.0.1:4545", "/repo");
+    useDesktopStore.getState().setTaskMode("plan");
+    await useDesktopStore.getState().sendMessage("plan the settings change");
+
+    expect(requestRuntime).toHaveBeenCalledWith("client-1", "agent.send", {
+      task: expect.objectContaining({ task_mode: "plan" }),
+    });
+  });
+
   it("shows a recovery step for incompatible runtime protocol versions", async () => {
     connectRuntime.mockRejectedValue(
       new RpcTransportError(
@@ -171,6 +182,29 @@ describe("desktop runtime store", () => {
     expect(resumed.isLoadingSession).toBe(false);
     expect(resumed.messages.map((message) => message.text)).toEqual(["persisted task", "persisted answer"]);
     expect(resumed.events).toHaveLength(2);
+  });
+
+  it("restores the last task mode recorded in a resumed session", async () => {
+    useDesktopStore.setState({ activeSessionId: "session-1", clientId: "client-1", taskMode: "code" });
+    requestRuntime.mockImplementation(async (_clientId: string, method: string) => {
+      if (method === "session.resume") return response({});
+      if (method === "session.inspect") return response({
+        session: {
+          id: "session-1",
+          workspace_root: "/repo",
+          events: [
+            event("older-mode", "task.run.updated", { task_run: { task_mode: "explore" } }, 1),
+            event("latest-mode", "task.run.updated", { task_run: { task_mode: "plan" } }, 2),
+          ],
+        },
+        warnings: [],
+      });
+      return response({});
+    });
+
+    await useDesktopStore.getState().resumeSession("session-1");
+
+    expect(useDesktopStore.getState().taskMode).toBe("plan");
   });
 
   it("reconnects without replaying work and restores authoritative session history", async () => {

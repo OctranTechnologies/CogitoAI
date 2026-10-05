@@ -80,6 +80,7 @@ function App() {
     workspace,
     sessions,
     activeSessionId,
+    taskMode,
     runPhase,
     messages,
     events,
@@ -119,6 +120,7 @@ function App() {
     loadRuntimeDiagnostics,
     setWorkspacePath,
     setComposer,
+    setTaskMode,
     createSession,
     resumeSession,
     sendMessage,
@@ -482,6 +484,8 @@ function App() {
                 onConnectProvider: connectProviderFromPicker,
                 onSelectReasoning: selectReasoning,
                 onSelectMode: selectMode,
+                taskMode,
+                onSelectTaskMode: setTaskMode,
               }}
               onApprove={approve}
               onDeny={deny}
@@ -532,6 +536,8 @@ function App() {
               onConnectProvider={connectProviderFromPicker}
               onSelectReasoning={selectReasoning}
               onSelectMode={selectMode}
+              taskMode={taskMode}
+              onSelectTaskMode={setTaskMode}
               pendingMode={pendingMode}
               runtimeError={lastError}
             />

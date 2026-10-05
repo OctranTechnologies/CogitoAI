@@ -51,6 +51,7 @@ function setup(overrides: Partial<Parameters<typeof PromptComposer>[0]> = {}) {
   const onChange = vi.fn();
   const onSelectModel = vi.fn();
   const onSelectMode = vi.fn();
+  const onSelectTaskMode = vi.fn();
   const props = {
     value: "",
     onChange,
@@ -68,6 +69,8 @@ function setup(overrides: Partial<Parameters<typeof PromptComposer>[0]> = {}) {
     onConnectProvider: vi.fn(),
     onSelectReasoning: vi.fn(),
     onSelectMode,
+    taskMode: "code" as const,
+    onSelectTaskMode,
     pendingMode: null,
     workspacePath: "C:/repo",
     onChooseWorkspace: vi.fn(),
@@ -77,7 +80,7 @@ function setup(overrides: Partial<Parameters<typeof PromptComposer>[0]> = {}) {
   };
   render(createElement(PromptComposer, props));
   const textarea = screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
-  return { textarea, onSubmit, onChange, onSelectModel, onSelectMode, props };
+  return { textarea, onSubmit, onChange, onSelectModel, onSelectMode, onSelectTaskMode, props };
 }
 
 describe("PromptComposer", () => {
@@ -233,14 +236,28 @@ describe("PromptComposer", () => {
     expect(onSelectMode).toHaveBeenCalledWith("read_only");
   });
 
+  it("keeps task behavior separate from execution permission and selects PLAN", async () => {
+    const { onSelectTaskMode } = setup();
+    fireEvent.click(screen.getByRole("button", { name: "Task behavior: Code" }));
+    expect(await screen.findByRole("menuitem", { name: /Explore.*Read and search only/ })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Plan.*read-only implementation plan/i })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /Code.*Edit, run approved commands, and verify/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Plan/ }));
+    expect(onSelectTaskMode).toHaveBeenCalledWith("plan");
+    expect(screen.getByRole("button", { name: /^Execution mode:/ })).toBeTruthy();
+  });
+
   it("does not open a menu for a selector with no runtime behind it", () => {
     setup({ connected: false, models: null, permissions: null });
     const model = screen.getByRole("button", { name: "Model" });
     const mode = screen.getByRole("button", { name: "Execution mode" });
+    const taskMode = screen.getByRole("button", { name: "Task behavior" });
     fireEvent.click(model);
     fireEvent.click(mode);
+    fireEvent.click(taskMode);
     expect(screen.queryByRole("menu")).toBeNull();
     expect(model.getAttribute("aria-disabled")).toBe("true");
+    expect(taskMode.getAttribute("aria-disabled")).toBe("true");
   });
 
   it("does not render reasoning effort controls when the registry reports none", () => {
@@ -379,6 +396,8 @@ describe("LandingView notice", () => {
         onConnectProvider: vi.fn(),
         onSelectReasoning: vi.fn(),
         onSelectMode: vi.fn(),
+        taskMode: "code",
+        onSelectTaskMode: vi.fn(),
         pendingMode: null,
         runtimeError: null,
       }),
@@ -406,6 +425,8 @@ describe("LandingView notice", () => {
         onConnectProvider: vi.fn(),
         onSelectReasoning: vi.fn(),
         onSelectMode: vi.fn(),
+        taskMode: "code",
+        onSelectTaskMode: vi.fn(),
         pendingMode: null,
         runtimeError: "runtime said no",
       }),

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use harness_core::{Error, Id};
 use harness_session::{
     CompactState, EventBus, EventPayload, EventType, FileChange, HarnessEvent, JsonlSessionStore,
-    MessageRole, Session, SessionState, SessionStatus, SessionStore,
+    MessageRole, Session, SessionState, SessionStatus, SessionStore, TaskMode, TaskRun,
 };
 use tempfile::tempdir;
 
@@ -27,6 +27,17 @@ fn compacted_state(task: &str) -> CompactState {
         test_status: vec!["cargo test passed".to_owned()],
         remaining_work: vec!["resume verification".to_owned()],
     }
+}
+
+#[test]
+fn legacy_task_run_payloads_default_to_code_mode_without_a_plan() {
+    let task_run: TaskRun = serde_json::from_value(serde_json::json!({
+        "original_goal": "continue a saved task"
+    }))
+    .unwrap();
+
+    assert_eq!(task_run.task_mode, TaskMode::Code);
+    assert!(task_run.structured_plan.is_none());
 }
 
 #[test]

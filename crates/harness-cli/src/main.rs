@@ -28,7 +28,7 @@ use harness_rpc::{
     HarnessConnectionManager, RpcResponse, RuntimeConnectError, RuntimeLaunchConfig, ServerMessage,
 };
 use harness_session::{
-    EventId, EventPayload, HarnessEvent, JsonlSessionStore, Session, SessionStore,
+    EventId, EventPayload, HarnessEvent, JsonlSessionStore, Session, SessionStore, TaskMode,
 };
 use harness_tools::CancellationToken;
 use harness_verification::VerificationPlan;
@@ -52,6 +52,9 @@ enum InteractiveCommand {
     ModelSelect,
     Connect,
     Mode,
+    Explore,
+    Plan,
+    Code,
     Clear,
     Cancel,
     Exit,
@@ -63,6 +66,13 @@ struct InteractiveCommandDefinition {
     description: &'static str,
     command: InteractiveCommand,
     plain_supported: bool,
+}
+
+#[derive(Default)]
+struct AgentRunUi {
+    task_mode: TaskMode,
+    tui: Option<TuiSender>,
+    cancellation: Option<CancellationToken>,
 }
 
 /// The single source used for interactive dispatch, help, and Tab completion.
@@ -156,6 +166,27 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandDefinition] = &[
         usage: "/mode",
         description: "Show the workspace execution mode",
         command: InteractiveCommand::Mode,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/explore",
+        usage: "/explore",
+        description: "Use read/search-only task behavior",
+        command: InteractiveCommand::Explore,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/plan",
+        usage: "/plan",
+        description: "Inspect and produce a structured plan without edits",
+        command: InteractiveCommand::Plan,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/code",
+        usage: "/code",
+        description: "Use the normal coding-task workflow",
+        command: InteractiveCommand::Code,
         plain_supported: true,
     },
     InteractiveCommandDefinition {
@@ -584,6 +615,7 @@ fn plain_interactive(
     connector: HarnessConnectionManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut session_cli = cli.clone();
+    let mut task_mode = TaskMode::Code;
     let workspace = std::fs::canonicalize(effective_path(&session_cli, Path::new(".")))?;
     let model = model_config(&session_cli)?;
     println!(
@@ -643,12 +675,13 @@ fn plain_interactive(
                     if arguments.is_empty() {
                         eprintln!("usage: /run <task>");
                     } else {
-                        run_agent_with_connector(
+                        run_agent_with_task_mode(
                             &session_cli,
                             arguments.to_owned(),
                             effective_path(&session_cli, Path::new(".")),
                             None,
                             connector.clone(),
+                            task_mode,
                         )?;
                         break;
                     }
@@ -664,12 +697,13 @@ fn plain_interactive(
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                             .map(str::to_owned);
-                        resume_session_with_connector(
+                        resume_session_with_task_mode(
                             &session_cli,
                             id,
                             task,
                             None,
                             connector.clone(),
+                            task_mode,
                         )?;
                         break;
                     }
@@ -727,6 +761,26 @@ fn plain_interactive(
                         mode_info(&session_cli)?;
                     }
                 }
+                InteractiveCommand::Explore
+                | InteractiveCommand::Plan
+                | InteractiveCommand::Code => {
+                    if !arguments.is_empty() {
+                        eprintln!("usage: /{}", task_mode_command_for(command));
+                    } else {
+                        task_mode = match command {
+                            InteractiveCommand::Explore => TaskMode::Explore,
+                            InteractiveCommand::Plan => TaskMode::Plan,
+                            InteractiveCommand::Code => TaskMode::Code,
+                            _ => unreachable!("combined task-mode command arm"),
+                        };
+                        let (label, description) = match task_mode {
+                            TaskMode::Explore => ("EXPLORE", "workspace reads and searches only"),
+                            TaskMode::Plan => ("PLAN", "read-only structured implementation plan"),
+                            TaskMode::Code => ("CODE", "normal coding workflow"),
+                        };
+                        println!("Task mode: {label} · {description}");
+                    }
+                }
                 InteractiveCommand::Clear | InteractiveCommand::Cancel => {
                     let name = if command == InteractiveCommand::Clear {
                         "/clear"
@@ -739,12 +793,13 @@ fn plain_interactive(
             }
             continue;
         }
-        run_agent_with_connector(
+        run_agent_with_task_mode(
             &session_cli,
             line.to_owned(),
             effective_path(&session_cli, Path::new(".")),
             None,
             connector.clone(),
+            task_mode,
         )?;
         // The line-oriented fallback has no persistent event loop for signal
         // registration. Exit after a run so its one-shot Ctrl+C handler is not
@@ -761,11 +816,12 @@ fn dispatch_interactive(
     connector: &HarnessConnectionManager,
 ) -> Result<(), String> {
     if !line.starts_with('/') {
+        let resume_session = plan_continuation_session(tui)?;
         return start_interactive_run(
             cli,
             line,
             effective_path(cli, Path::new(".")),
-            None,
+            resume_session,
             tui,
             connector,
         );
@@ -785,11 +841,12 @@ fn dispatch_interactive(
             if arguments.is_empty() {
                 Err("usage: /run <task>".to_owned())
             } else {
+                let resume_session = plan_continuation_session(tui)?;
                 start_interactive_run(
                     cli,
                     arguments.to_owned(),
                     effective_path(cli, Path::new(".")),
-                    None,
+                    resume_session,
                     tui,
                     connector,
                 )
@@ -894,6 +951,47 @@ fn dispatch_interactive(
             }
             run_visible_command(tui, || mode_info(cli))
         }
+        InteractiveCommand::Explore => set_interactive_task_mode(tui, TaskMode::Explore, arguments),
+        InteractiveCommand::Plan => set_interactive_task_mode(tui, TaskMode::Plan, arguments),
+        InteractiveCommand::Code => set_interactive_task_mode(tui, TaskMode::Code, arguments),
+    }
+}
+
+fn plan_continuation_session(tui: &Tui) -> Result<Option<SessionId>, String> {
+    tui.approved_plan_session_for_code()
+        .map(SessionId::new)
+        .transpose()
+        .map_err(|error| error.to_string())
+}
+
+fn set_interactive_task_mode(tui: &mut Tui, mode: TaskMode, arguments: &str) -> Result<(), String> {
+    if !arguments.is_empty() {
+        return Err(format!("usage: /{}", task_mode_command(mode)));
+    }
+    tui.set_task_mode(mode);
+    let (label, description) = match mode {
+        TaskMode::Explore => ("EXPLORE", "workspace reads and searches only"),
+        TaskMode::Plan => ("PLAN", "read-only structured implementation plan"),
+        TaskMode::Code => ("CODE", "normal coding workflow"),
+    };
+    tui.add_activity(format!("Task mode · {label} · {description}"));
+    Ok(())
+}
+
+fn task_mode_command(mode: TaskMode) -> &'static str {
+    match mode {
+        TaskMode::Explore => "explore",
+        TaskMode::Plan => "plan",
+        TaskMode::Code => "code",
+    }
+}
+
+fn task_mode_command_for(command: InteractiveCommand) -> &'static str {
+    match command {
+        InteractiveCommand::Explore => "explore",
+        InteractiveCommand::Plan => "plan",
+        InteractiveCommand::Code => "code",
+        _ => unreachable!("not a task-mode command"),
     }
 }
 
@@ -928,6 +1026,7 @@ fn start_interactive_run(
     }
     let sender = tui.sender();
     let run_connector = connector.clone();
+    let task_mode = tui.task_mode();
     let failed_sender = sender.clone();
     let spawn = std::thread::Builder::new()
         .name("harness-agent-tui".to_owned())
@@ -937,8 +1036,11 @@ fn start_interactive_run(
                 task,
                 workspace,
                 resume_session,
-                Some(sender.clone()),
-                Some(cancellation),
+                AgentRunUi {
+                    task_mode,
+                    tui: Some(sender.clone()),
+                    cancellation: Some(cancellation),
+                },
                 run_connector,
             )
             .map_err(|error| error.to_string());
@@ -1391,6 +1493,17 @@ fn resume_session_with_connector(
     path: Option<PathBuf>,
     connector: HarnessConnectionManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    resume_session_with_task_mode(cli, id, task, path, connector, TaskMode::Code)
+}
+
+fn resume_session_with_task_mode(
+    cli: &Cli,
+    id: &str,
+    task: Option<String>,
+    path: Option<PathBuf>,
+    connector: HarnessConnectionManager,
+    task_mode: TaskMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session_id = SessionId::new(id.to_owned())?;
     let store = JsonlSessionStore::new(&cli.session_root)?;
     let existing = store.load(&session_id)?;
@@ -1413,7 +1526,14 @@ fn resume_session_with_connector(
     let task = task.unwrap_or_else(|| {
         "Continue from the compacted session state and finish the remaining work.".to_owned()
     });
-    run_agent_with_connector(&effective_cli, task, path, Some(session_id), connector)
+    run_agent_with_task_mode(
+        &effective_cli,
+        task,
+        path,
+        Some(session_id),
+        connector,
+        task_mode,
+    )
 }
 
 fn apply_session_model_preference(
@@ -1627,7 +1747,28 @@ fn run_agent_with_connector(
     resume_session: Option<SessionId>,
     connector: HarnessConnectionManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_agent_with_ui(cli, task, path, resume_session, None, None, connector)
+    run_agent_with_task_mode(cli, task, path, resume_session, connector, TaskMode::Code)
+}
+
+fn run_agent_with_task_mode(
+    cli: &Cli,
+    task: String,
+    path: PathBuf,
+    resume_session: Option<SessionId>,
+    connector: HarnessConnectionManager,
+    task_mode: TaskMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_agent_with_ui(
+        cli,
+        task,
+        path,
+        resume_session,
+        AgentRunUi {
+            task_mode,
+            ..AgentRunUi::default()
+        },
+        connector,
+    )
 }
 
 fn run_agent_with_ui(
@@ -1635,10 +1776,14 @@ fn run_agent_with_ui(
     task: String,
     path: PathBuf,
     resume_session: Option<SessionId>,
-    tui: Option<TuiSender>,
-    cancellation: Option<CancellationToken>,
+    ui: AgentRunUi,
     connector: HarnessConnectionManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let AgentRunUi {
+        task_mode,
+        tui,
+        cancellation,
+    } = ui;
     let path = std::fs::canonicalize(&path)?;
     let mut current_session_id = resume_session.as_ref().map(ToString::to_string);
     let description = discover_workspace(&path)?;
@@ -1683,6 +1828,7 @@ fn run_agent_with_ui(
     let agent_task = AgentTask {
         workspace_root: path.clone(),
         user_task: task,
+        task_mode,
         system_instructions:
             "You are the CogitoAI coding agent. Follow project instructions and use tools safely."
                 .to_owned(),
@@ -2881,7 +3027,8 @@ mod interactive_command_tests {
     fn help_uses_the_command_catalog_and_limits_plain_mode_to_supported_commands() {
         let full_help = interactive_help(false);
         for command in [
-            "/help", "/model", "/models", "/mode", "/diff", "/undo", "/resume", "/clear", "/exit",
+            "/help", "/model", "/models", "/mode", "/explore", "/plan", "/code", "/diff", "/undo",
+            "/resume", "/clear", "/exit",
         ] {
             assert!(
                 full_help.contains(command),
@@ -2890,6 +3037,9 @@ mod interactive_command_tests {
         }
         let plain_help = interactive_help(true);
         assert!(plain_help.contains("/mode"));
+        assert!(plain_help.contains("/explore"));
+        assert!(plain_help.contains("/plan"));
+        assert!(plain_help.contains("/code"));
         assert!(!plain_help.contains("/cancel"));
         assert!(!plain_help.contains("/clear"));
     }
