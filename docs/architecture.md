@@ -52,6 +52,17 @@ is `done` only after the model returns a final response with no outstanding
 runtime-recorded errors. Cost stays unknown unless the provider supplies both
 token usage and trustworthy pricing metadata.
 
+`harness-verification::VerificationPlanner` orders cheap checks before broader
+ones and narrows common test/build commands to the changed package or matching
+test file. It uses the discovered workspace commands, explicit `.agent/config.toml`
+commands, and labeled checks in `AGENTS.md`. `CommandVerifier` stops on the first
+failure; each failure carries its category, command, exit status, useful output,
+diagnostics, affected files when detectable, and a conservative attribution
+(`introduced`, `unrelated`, or `unknown`). The agent receives bounded failure
+context on its next turn and can repair the change or document an evidence-based
+unrelated failure. For Git workspaces, the runtime also sends the final diff after
+the last edit and before allowing completion.
+
 Task behavior is a separate runtime contract from execution permission. Each
 `AgentTask` carries `TaskMode::{Explore, Plan, Code}`, and the session event log
 stores the selected mode in `TaskRun`. EXPLORE and PLAN expose only tools whose

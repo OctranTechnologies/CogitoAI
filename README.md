@@ -524,11 +524,20 @@ Everything in this list is implemented and covered by tests.
 
 **Verification and recovery**
 
-- Verification plans derived from detected manifests, with formatter, lint,
-  typecheck, build, targeted test, general test, and Git-diff steps.
-- Failed verification is fed back into the model, and completion stays blocked
-  until recorded failures are resolved or the runtime stops the task as blocked
-  or resource-limited.
+- A runtime-owned `VerificationPlanner` reads discovered project commands,
+  `.agent/config.toml`, and explicit commands in `AGENTS.md` verification sections.
+- After an edit it uses available quick diagnostics, then checks the changed
+  package or matching test when it can infer one, followed by typecheck, lint,
+  build, and a broader test fallback only when a targeted command is unavailable.
+  It stops at the first failure so the agent can diagnose and repair before
+  spending time on later checks.
+- Failures are persisted with their command, category, exit code, relevant
+  diagnostics and bounded output, affected files when identifiable, and a
+  best-effort introduced/unrelated/unknown attribution. The agent may close an
+  unrelated failure only by citing evidence and naming its exact command.
+- A Git workspace's final diff is passed to the model after the last edit before
+  completion. A task is not marked done while a patch-related verification error
+  remains unresolved.
 - Git-aware checkpoints and precise, conflict-refusing undo.
 - Compaction of long sessions with the full history preserved.
 
@@ -837,6 +846,21 @@ lint = ["pnpm", "run", "lint"]
 typecheck = ["pnpm", "run", "typecheck"]
 ```
 
+`AGENTS.md` can provide repository-specific checks in a `## Verification`,
+`## Validation`, or `## Testing` section. Use one command per labeled line; for a
+targeted test command, `{changed_files}` expands to the current changed paths:
+
+```markdown
+## Verification
+- lint: `pnpm lint`
+- targeted-test: `pnpm test -- --run {changed_files}`
+```
+
+Commands explicitly set in `.agent/config.toml` take precedence for their
+category. The planner targets common Cargo package, Go package, pytest, Vitest,
+and Jest checks when it can identify a relevant scope; otherwise it retains the
+configured test command as a broader fallback.
+
 The same file may carry a `[policy]` section, which the CLI loads into its policy
 engine:
 
@@ -1023,9 +1047,10 @@ should be read as promising them:
   from `.agent/config.toml` and enforces both. The desktop enforces the execution
   mode but lists rules without loading them into the engine that authorises tool
   calls. See [Policy rule enforcement](#policy-rule-enforcement).
-- **Verification is command-based.** Verification runs the project commands that
-  were discovered or configured. There is no semantic analysis, test selection, or
-  understanding of which failure matters.
+- **Verification is command-based.** The planner uses deterministic manifest,
+  package, test-file, and repository-instruction signals. It does not perform
+  semantic test selection, and failure attribution is a best-effort hint that the
+  agent must check against the reported output.
 
 ## License
 

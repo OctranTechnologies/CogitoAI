@@ -21,7 +21,7 @@ the crates above it in this table and never the reverse.
 | `harness-tools` | `Tool` trait, `ToolRegistry`, `ToolContext`, `ToolResult`, filesystem/process tools, `RepositoryIndexService` and repository queries | `harness-core`, `harness-policy`, `harness-session` |
 | `harness-git` | `GitClient`, status and diffs, `Checkpoint`/`CheckpointStore` trait, `ShadowCheckpointStore`, runtime-state path exclusion | `harness-core`, `harness-session` |
 | `harness-context` | Context assembly from workspace description, instructions, and Git state | `harness-core`, `harness-git`, `harness-session`, `harness-tools` |
-| `harness-verification` | `VerificationPlan`, `VerificationStep`, `VerificationReport`, `Verifier` trait, `CommandVerifier` | `harness-core`, `harness-session`, `harness-tools` |
+| `harness-verification` | `VerificationPlanner`, staged `VerificationPlan`, structured `VerificationFailure`, `Verifier` trait, `CommandVerifier` | `harness-core`, `harness-tools` |
 | `harness-pty` | `PtyManager`, human terminal sessions over `portable-pty` | `harness-core` |
 | `harness-agent` | `AgentRunner`, `AgentTask`, `AgentOutcome`, `ApprovalHandler`, `AgentLimits`, the tool-calling loop, checkpointing, verification feedback | most of the above |
 | `harness-rpc` | `Runtime`, `RpcServer`, `RuntimeConnector`, `ProcessRuntimeLauncher`, runtime process composition, `ApprovalBroker`, `AgentRunnerFactory`, protocol types, `settings` module, runtime and `cogito-rpc-dev` binaries | `harness-agent` and the rest |
@@ -254,6 +254,35 @@ repository index is refreshed before the next model turn. For Rust, TypeScript,
 JavaScript, and Python files, a best-effort language-server diagnostic request
 uses a short startup/response budget; unavailable or slow servers never roll
 back a successful edit.
+
+## Verification planning
+
+The agent derives its verification plan from `discover_workspace`, so clients
+that omit a plan still receive project checks. `.agent/config.toml` command
+entries override inferred commands. `AGENTS.md` may define checks under a
+`## Verification`, `## Validation`, or `## Testing` heading using labeled lines:
+
+```markdown
+## Verification
+- lint: `pnpm lint`
+- targeted-test: `pnpm test -- --run {changed_files}`
+```
+
+`{changed_files}` is expanded to changed paths. The planner orders formatter,
+targeted test, typecheck, lint, build, broad test fallback, then Git diff. It
+narrows common Cargo checks to one package, Go tests to one package, and pytest or
+JavaScript test scripts to matching test files where the repository layout makes
+that safe. If scope cannot be inferred, it retains the configured full test
+command. The command verifier stops after the first failure so the next model
+turn receives one actionable issue at a time.
+
+Failure events are structured and bounded: category, exact command, exit code,
+diagnostics, relevant output, affected files when identifiable, and a
+best-effort origin. `unknown` remains the default when the output does not locate
+the failure. The model may close a failed check as unrelated only by returning
+`[UNRELATED_VERIFICATION] <exact command> :: <evidence>`; the task event history
+keeps the failed result and its disposition. In a Git workspace, a final diff is
+sent to the model after the latest mutation before the run can finish.
 
 The index currently uses deterministic declaration patterns rather than a
 Tree-sitter grammar. Keep extraction explicitly approximate, and prefer an LSP

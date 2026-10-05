@@ -459,7 +459,9 @@ fn malformed_configuration_is_a_structured_cli_error() {
 /// agent sees the failure, corrects the file, and verification passes.
 #[test]
 fn a_broken_edit_is_verified_failed_and_then_corrected_through_the_real_cli() {
-    const FIXED: &str = "pub fn value() -> u32 { 2 }\n\
+    const FIXED: &str = "pub fn value() -> u32 {\n\
+                         \x20   2\n\
+                         }\n\
                          \n\
                          #[cfg(test)]\n\
                          mod tests {\n\
@@ -468,8 +470,19 @@ fn a_broken_edit_is_verified_failed_and_then_corrected_through_the_real_cli() {
                          \x20       assert_eq!(super::value(), 2);\n\
                          \x20   }\n\
                          }\n";
-    // Not valid Rust, so the test command genuinely fails.
-    const BROKEN: &str = "pub fn value() -> u32 { this is not rust\n";
+    // This compiles but violates the test assertion, so the test command
+    // genuinely fails after the cheaper formatting check passes.
+    const BROKEN: &str = "pub fn value() -> u32 {\n\
+                          \x20   3\n\
+                          }\n\
+                          \n\
+                          #[cfg(test)]\n\
+                          mod tests {\n\
+                          \x20   #[test]\n\
+                          \x20   fn value_is_two() {\n\
+                          \x20       assert_eq!(super::value(), 2);\n\
+                          \x20   }\n\
+                          }\n";
 
     let temporary = tempdir().unwrap();
     let root = temporary.path();
@@ -540,8 +553,20 @@ fn a_broken_edit_is_verified_failed_and_then_corrected_through_the_real_cli() {
         "expected the corrected edit to pass verification, got {results:#?}"
     );
     // The failure must come before the pass, otherwise nothing was corrected.
-    let first_failure = results.iter().position(|event| !passed(event)).unwrap();
-    let first_pass = results.iter().position(|event| passed(event)).unwrap();
+    let test_results = results
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["category"].as_str(),
+                Some("TargetedTest" | "GeneralTest")
+            )
+        })
+        .collect::<Vec<_>>();
+    let first_failure = test_results
+        .iter()
+        .position(|event| !passed(event))
+        .unwrap();
+    let first_pass = test_results.iter().position(|event| passed(event)).unwrap();
     assert!(
         first_failure < first_pass,
         "verification must fail before it passes"
@@ -572,25 +597,11 @@ fn a_broken_edit_is_verified_failed_and_then_corrected_through_the_real_cli() {
         );
     }
 
-    // Undo must not silently clobber the file. `cargo fmt` changed it after the
-    // checkpoint was taken, so the restore is refused and reported rather than
-    // overwriting whatever is on disk now.
+    // The final source is formatted before it is persisted, so undo should
+    // restore the original formatted fixture without a false conflict.
     let undo = cli(root, &["undo"]);
-    assert!(
-        !undo.status.success(),
-        "undo must refuse when the file changed after the checkpoint"
-    );
-    let stderr = String::from_utf8_lossy(&undo.stderr);
-    assert!(
-        stderr.contains("src/lib.rs"),
-        "expected the conflicting file to be named, got: {stderr}"
-    );
-    assert!(
-        fs::read_to_string(root.join("src/lib.rs"))
-            .unwrap()
-            .contains("value_is_two"),
-        "a refused undo must leave the file alone"
-    );
+    assert_success(&undo);
+    assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), FIXED);
 }
 
 #[test]

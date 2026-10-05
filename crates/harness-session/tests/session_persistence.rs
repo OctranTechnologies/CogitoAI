@@ -161,6 +161,9 @@ fn persists_reloads_resumes_and_reconstructs_a_mock_session() {
             exit_code: Some(0),
             output: "ok".to_owned(),
             diagnostics: Vec::new(),
+            affected_files: Vec::new(),
+            failure_origin: None,
+            relevant_output: "ok".to_owned(),
         },
     );
     append(
@@ -450,6 +453,9 @@ fn serializes_every_event_type_with_schema_compatibility() {
             exit_code: Some(0),
             output: "ok".to_owned(),
             diagnostics: Vec::new(),
+            affected_files: Vec::new(),
+            failure_origin: None,
+            relevant_output: "ok".to_owned(),
         },
         EventPayload::SessionResumed { reason: None },
         EventPayload::ContextCompacted {

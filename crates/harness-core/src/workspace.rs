@@ -602,8 +602,11 @@ fn infer_commands(
             .build
             .push(CommandSpec::new("cargo", ["build", "--workspace"]));
         commands
+            .typecheck
+            .push(CommandSpec::new("cargo", ["check", "--workspace"]));
+        commands
             .format
-            .push(CommandSpec::new("cargo", ["fmt", "--all"]));
+            .push(CommandSpec::new("cargo", ["fmt", "--all", "--check"]));
         commands.lint.push(CommandSpec::new(
             "cargo",
             [

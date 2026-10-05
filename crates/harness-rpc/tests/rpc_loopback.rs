@@ -59,6 +59,7 @@ impl Verifier for PassingVerifier {
                 exit_code: Some(0),
                 output: "mock verification passed".to_owned(),
                 diagnostics: Vec::new(),
+                failure: None,
             })
             .collect())
     }

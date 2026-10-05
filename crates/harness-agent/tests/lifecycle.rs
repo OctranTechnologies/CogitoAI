@@ -23,7 +23,7 @@ use harness_models::{
 use harness_policy::{ExecutionMode, Policy, PolicyEngine, PolicyRequest};
 use harness_session::{EventType, HarnessEvent, JsonlSessionStore, Session, SessionStore};
 use harness_tools::{ProcessRunner, ToolRegistry};
-use harness_verification::{VerificationCategory, VerificationPlan, VerificationReport, Verifier};
+use harness_verification::{VerificationPlan, VerificationReport, Verifier};
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -72,27 +72,35 @@ struct FileVerifier {
 impl Verifier for FileVerifier {
     fn verify(
         &self,
-        _request: &harness_verification::VerificationRequest,
+        request: &harness_verification::VerificationRequest,
     ) -> Result<Vec<VerificationReport>, Error> {
         let contents = fs::read_to_string(&self.marker).unwrap_or_default();
         let passed = !contents.contains("BROKEN");
-        Ok(vec![VerificationReport {
-            category: VerificationCategory::GeneralTest,
-            command: "cargo test".to_owned(),
-            duration_ms: 3,
-            passed,
-            exit_code: Some(if passed { 0 } else { 101 }),
-            output: if passed {
-                "test result: ok. 1 passed; 0 failed".to_owned()
-            } else {
-                "error: test failed; assertion `value == 2` failed".to_owned()
-            },
-            diagnostics: if passed {
-                Vec::new()
-            } else {
-                vec!["assertion failed: the file still contained a broken value".to_owned()]
-            },
-        }])
+        let mut reports = Vec::new();
+        for step in &request.plan.steps {
+            reports.push(VerificationReport {
+                category: step.category,
+                command: format!("{} {}", step.command.program, step.command.args.join(" ")),
+                duration_ms: 3,
+                passed,
+                exit_code: Some(if passed { 0 } else { 101 }),
+                output: if passed {
+                    "test result: ok. 1 passed; 0 failed".to_owned()
+                } else {
+                    "error: test failed; assertion `value == 2` failed".to_owned()
+                },
+                diagnostics: if passed {
+                    Vec::new()
+                } else {
+                    vec!["assertion failed: the file still contained a broken value".to_owned()]
+                },
+                failure: None,
+            });
+            if !passed {
+                break;
+            }
+        }
+        Ok(reports)
     }
 }
 
@@ -384,6 +392,58 @@ fn the_complete_v0_lifecycle_works_end_to_end() {
     assert!(
         missing.is_err(),
         "expected an error for a missing checkpoint"
+    );
+}
+
+#[test]
+fn runtime_discovers_verification_plan_when_client_omits_it() {
+    let temporary = sample_repository();
+    let root = temporary.path().to_path_buf();
+    let harness = fixture(&root, ExecutionMode::Normal, lifecycle_script());
+    let session = harness.sessions.create(&root).expect("create session");
+    let mut task = task_for(
+        &root,
+        "Change the value returned by src/lib.rs.",
+        &session.id,
+    );
+    task.verification_plan = None;
+
+    let outcome = harness
+        .runner
+        .run(&task, &harness_tools::CancellationToken::new())
+        .expect("runtime-owned verification should complete");
+    let session = harness.sessions.load(&outcome.session_id).unwrap();
+    let results = session
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            harness_session::EventPayload::VerificationResult {
+                category, passed, ..
+            } => Some((category.as_str(), *passed)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(results.iter().any(|(_, passed)| !passed));
+    assert!(results
+        .iter()
+        .any(|(category, passed)| *category == "GitDiff" && *passed));
+    assert!(session.events.iter().any(|event| matches!(
+        &event.payload,
+        harness_session::EventPayload::VerificationResult { category, relevant_output, .. }
+            if category == "GitDiff" && relevant_output.contains("pub fn value")
+    )));
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
+    assert!(
+        session
+            .state()
+            .unwrap()
+            .task_run
+            .unwrap()
+            .final_diff_inspected
     );
 }
 

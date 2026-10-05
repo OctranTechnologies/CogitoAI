@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use harness_context::{ContextBuilder, ContextInput, ToolContextResult, WorkspaceMetadata};
-use harness_core::{Error, SessionId};
-use harness_git::CheckpointStore;
+use harness_core::{discover_workspace, CommandSpec, Error, SessionId};
+use harness_git::{CheckpointStore, GitClient};
 use harness_models::{
     Message, ModelPricing, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError,
     ReasoningConfig, Role, Usage,
@@ -19,7 +19,10 @@ use harness_session::{
     TaskPhase, TaskRun, TaskVerificationResult,
 };
 use harness_tools::{CancellationToken, ToolContext, ToolRegistry, ToolRequest, ToolResult};
-use harness_verification::{VerificationPlan, VerificationRequest, Verifier};
+use harness_verification::{
+    FailureOrigin, VerificationCategory, VerificationPlan, VerificationPlanner,
+    VerificationRequest, VerificationStep, Verifier,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -193,6 +196,67 @@ fn bounded_summary(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
+fn bounded_context(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let suffix = "\n... relevant verification output truncated ...";
+    let body_limit = limit.saturating_sub(suffix.len());
+    let mut end = body_limit;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}{suffix}", &value[..end])
+}
+
+fn task_final_diff(workspace_root: &std::path::Path, changed_files: &[PathBuf]) -> Option<String> {
+    const LIMIT: usize = 16 * 1024;
+    let workspace_root = std::fs::canonicalize(workspace_root).ok()?;
+    let git = GitClient::open(&workspace_root).ok()?;
+    let mut output = String::new();
+    for changed in changed_files {
+        let absolute = if changed.is_absolute() {
+            changed.clone()
+        } else {
+            workspace_root.join(changed)
+        };
+        let relative = absolute.strip_prefix(git.root()).ok()?;
+        let path = relative.to_str()?;
+        let change = git.file_change(path).ok()?;
+        if change.patch.is_empty() {
+            continue;
+        }
+        output.push_str(&format!("--- task change: {} ---\n", change.path));
+        output.push_str(&change.patch);
+        if output.len() >= LIMIT {
+            return Some(bounded_context(&output, LIMIT));
+        }
+    }
+    Some(if output.is_empty() {
+        "No task-owned file diffs were returned by Git.".to_owned()
+    } else {
+        output
+    })
+}
+
+fn complete_edit_diff(result: &ToolResult, changed_files: &[PathBuf]) -> Option<String> {
+    if changed_files.is_empty()
+        || result.truncated
+        || result
+            .metadata
+            .get("diff_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let diff = result
+        .metadata
+        .get("diff")
+        .and_then(serde_json::Value::as_str)?;
+    (!diff.trim().is_empty()).then(|| diff.to_owned())
+}
+
 fn push_bounded<T>(values: &mut Vec<T>, value: T, limit: usize) {
     values.push(value);
     if values.len() > limit {
@@ -208,7 +272,7 @@ fn push_unique_bounded<T: Eq>(values: &mut Vec<T>, value: T, limit: usize) {
 
 fn coding_agent_instructions(existing: &str) -> String {
     let guidance = "\
-You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Make focused changes, run relevant checks, read their complete result, inspect the final diff, and repair failures before finishing. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. For a broad or high-risk request, you may recommend that the user switch to PLAN mode first, but do not force simple tasks through a verbose plan. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
+You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Make focused changes, run the cheapest useful checks selected from workspace configuration and repository verification instructions, read structured diagnostics, inspect the final diff, and repair failures before finishing. Verification runs stop at the first failure so you can diagnose and repair before broader checks. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. For a broad or high-risk request, you may recommend that the user switch to PLAN mode first, but do not force simple tasks through a verbose plan. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a failure is clearly pre-existing or unrelated to your patch, inspect the evidence and report its exact command and reason on a line beginning `[UNRELATED_VERIFICATION] ` followed by the exact command and ` :: ` plus the evidence. Use this only when the failure is not caused by your changes. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
     if existing.trim().is_empty() {
         guidance.to_owned()
     } else {
@@ -497,6 +561,64 @@ fn parse_completion_directive(text: &str) -> (Option<TaskCompletionStatus>, Stri
     (None, text.to_owned())
 }
 
+fn parse_unrelated_verification_directives(text: &str) -> (String, Vec<(String, String)>) {
+    const MARKER: &str = "[UNRELATED_VERIFICATION]";
+    let mut message = Vec::new();
+    let mut dispositions = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(value) = trimmed.strip_prefix(MARKER) else {
+            message.push(line);
+            continue;
+        };
+        let Some((command, reason)) = value.trim().split_once(" :: ") else {
+            message.push(line);
+            continue;
+        };
+        let command = command.trim();
+        let reason = reason.trim();
+        if !command.is_empty() && !reason.is_empty() {
+            dispositions.push((command.to_owned(), reason.to_owned()));
+        } else {
+            message.push(line);
+        }
+    }
+    (message.join("\n").trim().to_owned(), dispositions)
+}
+
+fn apply_unrelated_verification_dispositions(
+    task_run: &mut TaskRun,
+    unresolved_error_keys: &mut HashMap<String, String>,
+    dispositions: &[(String, String)],
+    validation_since_last_edit: &mut bool,
+) {
+    let mut applied = false;
+    for (command, reason) in dispositions {
+        let key = format!("verification:{command}");
+        if unresolved_error_keys.remove(&key).is_none() {
+            continue;
+        }
+        applied = true;
+        if let Some(result) = task_run
+            .verification_results
+            .iter_mut()
+            .rev()
+            .find(|result| result.command == *command && !result.passed)
+        {
+            result.failure_origin = Some("unrelated".to_owned());
+            result.summary = bounded_summary(&format!(
+                "{} | agent classified as unrelated: {}",
+                result.summary, reason
+            ));
+        }
+    }
+    if applied {
+        unresolved_error_keys.remove("verification:after_last_edit");
+        *validation_since_last_edit = true;
+    }
+    task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+}
+
 fn tool_call_key(name: &str, arguments: &serde_json::Value) -> String {
     format!(
         "{name}:{}",
@@ -776,6 +898,17 @@ impl AgentRunner {
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
         let started_at = Instant::now();
+        // Desktop and other RPC clients may omit a plan. Discover the project
+        // here so verification remains runtime-owned and works consistently
+        // for every client.
+        let discovered_workspace = discover_workspace(&task.workspace_root).ok();
+        let verification_plan = task
+            .verification_plan
+            .clone()
+            .or_else(|| discovered_workspace.as_ref().map(VerificationPlan::all));
+        let git_available = discovered_workspace.as_ref().is_some_and(|workspace| {
+            workspace.git.available && workspace.repository_root.is_some()
+        });
         let session = if let Some(session_id) = &task.resume_session {
             let existing = self
                 .sessions
@@ -890,10 +1023,21 @@ impl AgentRunner {
             base: Arc::clone(&self.policy),
             approved: Arc::clone(&approved),
         };
+        let mut instructions = task.instructions.clone();
+        if let Some(discovered) = &discovered_workspace {
+            for instruction in &discovered.instructions {
+                if !instructions
+                    .iter()
+                    .any(|existing| existing.path == instruction.path)
+                {
+                    instructions.push(instruction.clone());
+                }
+            }
+        }
         let mut context_input = ContextInput {
             system_instructions,
             workspace: workspace_metadata,
-            instructions: task.instructions.clone(),
+            instructions,
             user_request: task.user_task.clone(),
             conversation: if task.recent_conversation.is_empty() {
                 if previous_state.continuation.is_some() {
@@ -1123,7 +1267,9 @@ impl AgentRunner {
                 );
             }
             if response.tool_calls.is_empty() {
-                let (directive, final_message) = parse_completion_directive(&response.text());
+                let (directive, completion_text) = parse_completion_directive(&response.text());
+                let (final_message, unrelated_verification) =
+                    parse_unrelated_verification_directives(&completion_text);
                 task_run.current_plan = extract_plan(&response.text())
                     .filter(|plan| !plan.is_empty())
                     .unwrap_or_else(|| task_run.current_plan.clone());
@@ -1178,9 +1324,70 @@ impl AgentRunner {
                     task_run.current_phase = TaskPhase::Finish;
                     self.update_task_run(&session_id, &collector, &task_run)?;
                 }
+                apply_unrelated_verification_dispositions(
+                    &mut task_run,
+                    &mut unresolved_error_keys,
+                    &unrelated_verification,
+                    &mut validation_since_last_edit,
+                );
+                if task.task_mode == TaskMode::Code
+                    && git_available
+                    && self.verifier.is_some()
+                    && !task_run.changed_files.is_empty()
+                    && !task_run.final_diff_inspected
+                {
+                    let diff_plan = VerificationPlan {
+                        steps: vec![VerificationStep {
+                            category: VerificationCategory::GitDiff,
+                            command: CommandSpec::new(
+                                "git",
+                                ["diff", "--no-ext-diff", "--no-color"],
+                            ),
+                            source: "required-final-diff-inspection".to_owned(),
+                        }],
+                    };
+                    let changed_files = task_run.changed_files.clone();
+                    let before = task_run.verification_results.len();
+                    self.run_verification_if_needed(
+                        &session_id,
+                        &task.workspace_root,
+                        Some(&diff_plan),
+                        self.verifier.as_ref(),
+                        &changed_files,
+                        &mut context_input,
+                        &collector,
+                        cancellation,
+                        &mut task_run,
+                        &mut unresolved_error_keys,
+                        &mut repeated_failures,
+                        self.limits.max_repeated_failures,
+                    )?;
+                    task_run.final_diff_inspected = task_run.verification_results[before..]
+                        .iter()
+                        .any(|result| result.category == "GitDiff" && result.passed);
+                    self.update_task_run(&session_id, &collector, &task_run)?;
+                    if task_run.final_diff_inspected {
+                        // The next model turn receives the final diff output
+                        // before it can declare the task complete.
+                        continue;
+                    }
+                }
+                if task.task_mode == TaskMode::Code
+                    && !task_run.changed_files.is_empty()
+                    && !task_run.final_diff_inspected
+                {
+                    let key = "verification:final_diff_inspection".to_owned();
+                    unresolved_error_keys.entry(key.clone()).or_insert_with(|| {
+                        format!(
+                            "{key} :: A final diff could not be assembled for the changed files. Inspect the latest file edits before finishing."
+                        )
+                    });
+                    task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+                }
                 if task.task_mode == TaskMode::Code
                     && !task_run.changed_files.is_empty()
                     && !validation_since_last_edit
+                    && !task_run.final_diff_inspected
                 {
                     let key = "verification:after_last_edit".to_owned();
                     unresolved_error_keys.entry(key.clone()).or_insert_with(|| {
@@ -1375,6 +1582,10 @@ impl AgentRunner {
                 result.output = bounded_output;
                 result.truncated = output_truncated;
                 let changed_files = result.changed_files.clone();
+                let quick_diagnostic = quick_diagnostic_result(&result, &changed_files);
+                let final_edit_diff = (!git_available || self.verifier.is_none())
+                    .then(|| complete_edit_diff(&result, &changed_files))
+                    .flatten();
                 if result.is_error && task_mode_denial.is_none() {
                     let error = format!("{tool_error_key} :: {}", bounded_summary(&result.output));
                     unresolved_error_keys.insert(tool_error_key, error);
@@ -1406,6 +1617,7 @@ impl AgentRunner {
                     task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
                     no_progress_final_responses = 0;
                     if !changed_files.is_empty() {
+                        task_run.final_diff_inspected = false;
                         task_run.current_phase = TaskPhase::Verify;
                     }
                 }
@@ -1428,6 +1640,9 @@ impl AgentRunner {
                                     passed,
                                     exit_code,
                                     summary: bounded_summary(&result.output),
+                                    affected_files: Vec::new(),
+                                    failure_origin: (!passed).then(|| "unknown".to_owned()),
+                                    relevant_output: bounded_context(&result.output, 8 * 1024),
                                 },
                                 200,
                             );
@@ -1436,6 +1651,9 @@ impl AgentRunner {
                                 unresolved_error_keys.remove(&key);
                                 unresolved_error_keys.remove("verification:after_last_edit");
                                 validation_since_last_edit = true;
+                                if command.to_ascii_lowercase().contains("git diff") {
+                                    task_run.final_diff_inspected = true;
+                                }
                             } else {
                                 unresolved_error_keys.insert(
                                     key.clone(),
@@ -1451,6 +1669,60 @@ impl AgentRunner {
                 }
                 if !changed_files.is_empty() {
                     validation_since_last_edit = false;
+                }
+                if let Some((command, passed, affected_files, output)) = quick_diagnostic {
+                    let key = format!("verification:{command}");
+                    let output = bounded_context(&output, 8 * 1024);
+                    push_bounded(&mut task_run.commands_executed, command.clone(), 200);
+                    push_bounded(
+                        &mut task_run.verification_results,
+                        TaskVerificationResult {
+                            command: command.clone(),
+                            category: "diagnostics".to_owned(),
+                            passed,
+                            exit_code: None,
+                            summary: bounded_summary(&output),
+                            affected_files: affected_files.clone(),
+                            failure_origin: (!passed).then(|| "unknown".to_owned()),
+                            relevant_output: output.clone(),
+                        },
+                        200,
+                    );
+                    self.emit(
+                        &session_id,
+                        EventPayload::VerificationResult {
+                            command: command.clone(),
+                            category: "diagnostics".to_owned(),
+                            duration_ms: 0,
+                            passed,
+                            exit_code: None,
+                            output: output.clone(),
+                            diagnostics: output.lines().map(str::to_owned).take(100).collect(),
+                            affected_files,
+                            failure_origin: (!passed).then(|| "unknown".to_owned()),
+                            relevant_output: output.clone(),
+                        },
+                        &collector,
+                    )?;
+                    context_input.tool_results.push(ToolContextResult {
+                        name: "verification".to_owned(),
+                        result: ToolResult::new(format!(
+                            "verification category=diagnostics command={command} passed={passed} affected_files={:?}\n{output}",
+                            changed_files
+                        )),
+                        is_shell: false,
+                    });
+                    if passed {
+                        unresolved_error_keys.remove(&key);
+                        unresolved_error_keys.remove("verification:after_last_edit");
+                        validation_since_last_edit = true;
+                    } else {
+                        validation_since_last_edit = false;
+                        unresolved_error_keys.insert(
+                            key.clone(),
+                            format!("{key} :: {}", bounded_summary(&output)),
+                        );
+                    }
                 }
                 if let (Some(checkpoints), Some(checkpoint_id)) =
                     (&self.checkpoints, &checkpoint_id)
@@ -1471,11 +1743,60 @@ impl AgentRunner {
                     result,
                     is_shell,
                 });
+                if let Some(diff) = final_edit_diff {
+                    let command = "inspect final edit diff".to_owned();
+                    let relevant_output = bounded_context(&diff, 8 * 1024);
+                    task_run.final_diff_inspected = true;
+                    push_bounded(
+                        &mut task_run.verification_results,
+                        TaskVerificationResult {
+                            command: command.clone(),
+                            category: "GitDiff".to_owned(),
+                            passed: true,
+                            exit_code: None,
+                            summary: "Complete edit-tool diff was provided to the model."
+                                .to_owned(),
+                            affected_files: changed_files.clone(),
+                            failure_origin: None,
+                            relevant_output: relevant_output.clone(),
+                        },
+                        200,
+                    );
+                    self.emit(
+                        &session_id,
+                        EventPayload::VerificationResult {
+                            command,
+                            category: "GitDiff".to_owned(),
+                            duration_ms: 0,
+                            passed: true,
+                            exit_code: None,
+                            output: relevant_output.clone(),
+                            diagnostics: Vec::new(),
+                            affected_files: changed_files.clone(),
+                            failure_origin: None,
+                            relevant_output,
+                        },
+                        &collector,
+                    )?;
+                    unresolved_error_keys.remove("verification:final_diff_inspection");
+                    let has_automated_checks = self.verifier.is_some()
+                        && verification_plan.as_ref().is_some_and(|plan| {
+                            plan.steps
+                                .iter()
+                                .any(|step| step.category != VerificationCategory::GitDiff)
+                        });
+                    if !has_automated_checks {
+                        // The complete patch was shown to the model and there
+                        // are no repository checks to run after this review.
+                        validation_since_last_edit = true;
+                        unresolved_error_keys.remove("verification:after_last_edit");
+                    }
+                }
                 let verification_results_before = task_run.verification_results.len();
                 let verification_repeated_failure = self.run_verification_if_needed(
                     &session_id,
                     &task.workspace_root,
-                    task.verification_plan.as_ref(),
+                    verification_plan.as_ref(),
                     self.verifier.as_ref(),
                     &changed_files,
                     &mut context_input,
@@ -1495,6 +1816,11 @@ impl AgentRunner {
                         unresolved_error_keys.remove("verification:after_last_edit");
                         no_progress_final_responses = 0;
                     }
+                } else if task_run.final_diff_inspected {
+                    // No automated command was available to run, but the
+                    // complete edit diff was reviewed and no check failed.
+                    validation_since_last_edit = true;
+                    unresolved_error_keys.remove("verification:after_last_edit");
                 }
                 task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
                 task_run.remaining_work = task_run.unresolved_errors.clone();
@@ -1686,7 +2012,7 @@ impl AgentRunner {
         let (Some(plan), Some(verifier)) = (plan, verifier) else {
             return Ok(false);
         };
-        let plan = plan.targeted();
+        let plan = VerificationPlanner::after_changes(plan, workspace_root, changed_files);
         if plan.steps.is_empty() {
             return Ok(false);
         }
@@ -1704,17 +2030,43 @@ impl AgentRunner {
         let request = VerificationRequest {
             working_directory: workspace_root.to_path_buf(),
             plan,
+            changed_files: changed_files.to_vec(),
             max_output_bytes: 64 * 1024,
         };
         match verifier.verify_cancellable(&request, cancellation) {
             Ok(reports) => {
                 for report in reports {
                     let failure_key = format!("verification:{}", report.command);
+                    let failure = report.failure.as_ref();
+                    let git_diff_output = (report.category == VerificationCategory::GitDiff
+                        && report.passed)
+                        .then(|| task_final_diff(workspace_root, changed_files))
+                        .flatten();
+                    let relevant_output = failure
+                        .map(|failure| failure.relevant_output.as_str())
+                        .filter(|output| !output.is_empty())
+                        .or(git_diff_output.as_deref())
+                        .unwrap_or(report.output.as_str());
+                    let context_output = bounded_context(relevant_output, 8 * 1024);
+                    let affected_files = failure
+                        .map(|failure| failure.affected_files.clone())
+                        .unwrap_or_default();
+                    let failure_origin = failure.map(|failure| {
+                        match failure.origin {
+                            FailureOrigin::Introduced => "introduced",
+                            FailureOrigin::Unrelated => "unrelated",
+                            FailureOrigin::Unknown => "unknown",
+                        }
+                        .to_owned()
+                    });
                     push_bounded(
                         &mut task_run.commands_executed,
                         bounded_summary(&report.command),
                         200,
                     );
+                    if report.category == VerificationCategory::GitDiff && report.passed {
+                        task_run.final_diff_inspected = true;
+                    }
                     push_bounded(
                         &mut task_run.verification_results,
                         TaskVerificationResult {
@@ -1725,8 +2077,11 @@ impl AgentRunner {
                             summary: bounded_summary(&format!(
                                 "{} {}",
                                 report.diagnostics.join("; "),
-                                report.output
+                                context_output
                             )),
+                            affected_files: affected_files.clone(),
+                            failure_origin: failure_origin.clone(),
+                            relevant_output: context_output.clone(),
                         },
                         200,
                     );
@@ -1738,14 +2093,31 @@ impl AgentRunner {
                             duration_ms: report.duration_ms,
                             passed: report.passed,
                             exit_code: report.exit_code,
-                            output: report.output.clone(),
+                            output: context_output.clone(),
                             diagnostics: report.diagnostics.clone(),
+                            affected_files: affected_files.clone(),
+                            failure_origin: failure_origin.clone(),
+                            relevant_output: context_output.clone(),
                         },
                         collector,
                     )?;
-                    let summary = format!(
-                        "verification passed={} exit_code={:?} diagnostics={:?}\n{}",
-                        report.passed, report.exit_code, report.diagnostics, report.output
+                    let attribution = failure_origin
+                        .as_deref()
+                        .map(|origin| format!(" likely_origin={origin}"))
+                        .unwrap_or_default();
+                    let summary = bounded_context(
+                        &format!(
+                            "verification category={:?} command={} passed={} exit_code={:?} affected_files={:?}{} diagnostics={:?}\n{}",
+                            report.category,
+                            report.command,
+                            report.passed,
+                            report.exit_code,
+                            affected_files,
+                            attribution,
+                            report.diagnostics,
+                            context_output
+                        ),
+                        MAX_MODEL_TOOL_RESULT_BYTES,
                     );
                     context_input.tool_results.push(ToolContextResult {
                         name: "verification".to_owned(),
@@ -1754,18 +2126,26 @@ impl AgentRunner {
                     });
                     if report.passed {
                         unresolved_error_keys.remove(&failure_key);
+                        if matches!(
+                            report.category,
+                            VerificationCategory::Typecheck | VerificationCategory::Build
+                        ) {
+                            unresolved_error_keys.retain(|key, _| {
+                                !key.starts_with("verification:language-server diagnostics ")
+                            });
+                        }
                     } else {
                         let output = bounded_summary(&format!(
                             "{} {}",
                             report.diagnostics.join("; "),
-                            report.output
+                            context_output
                         ));
                         unresolved_error_keys
                             .insert(failure_key.clone(), format!("{failure_key} :: {output}"));
                         let signature = format!(
                             "{failure_key}:{}:{}",
                             report.exit_code.unwrap_or(-1),
-                            normalize_failure(&report.output)
+                            normalize_failure(&context_output)
                         );
                         let failures = repeated_failures.entry(signature).or_default();
                         *failures = failures.saturating_add(1);
@@ -1790,6 +2170,9 @@ impl AgentRunner {
                         passed: false,
                         exit_code: None,
                         summary: bounded_summary(&message),
+                        affected_files: Vec::new(),
+                        failure_origin: Some("unknown".to_owned()),
+                        relevant_output: bounded_context(&message, 8 * 1024),
                     },
                     200,
                 );
@@ -1806,6 +2189,9 @@ impl AgentRunner {
                         exit_code: None,
                         output: message.clone(),
                         diagnostics: vec![message.clone()],
+                        affected_files: Vec::new(),
+                        failure_origin: Some("unknown".to_owned()),
+                        relevant_output: bounded_context(&message, 8 * 1024),
                     },
                     collector,
                 )?;
@@ -1996,6 +2382,38 @@ fn bound_tool_result_output(output: &str, already_truncated: bool) -> (String, b
     (bounded, true)
 }
 
+fn quick_diagnostic_result(
+    result: &ToolResult,
+    changed_files: &[PathBuf],
+) -> Option<(String, bool, Vec<PathBuf>, String)> {
+    let diagnostics = result.metadata.get("diagnostics")?;
+    if diagnostics.get("status")?.as_str()? != "best_effort" {
+        return None;
+    }
+    let detail = diagnostics.get("detail")?.as_str()?.trim();
+    let normalized_detail = detail.to_ascii_lowercase();
+    if detail.is_empty()
+        || normalized_detail.contains("unavailable")
+        || normalized_detail.contains("failed:")
+        || normalized_detail.contains("timed out")
+        || normalized_detail.contains("returned no diagnostic details")
+    {
+        return None;
+    }
+    let path = changed_files.iter().find(|path| {
+        matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("rs" | "ts" | "tsx" | "js" | "jsx" | "py")
+        )
+    })?;
+    let path_display = path.to_string_lossy().replace('\\', "/");
+    let command = format!("language-server diagnostics {path_display}");
+    let failed = detail
+        .lines()
+        .any(|line| line.trim_start().to_ascii_lowercase().starts_with("error "));
+    Some((command, !failed, vec![path.clone()], detail.to_owned()))
+}
+
 struct ApprovedPolicy {
     base: Arc<dyn Policy>,
     approved: Arc<Mutex<HashSet<String>>>,
@@ -2059,9 +2477,15 @@ fn usage_tokens(usage: Option<&Usage>) -> u64 {
 #[cfg(test)]
 mod conformance_hardening_tests {
     use super::{
-        bound_tool_result_output, decimal_microusd, estimate_cost_microusd, tool_error_result,
+        apply_unrelated_verification_dispositions, bound_tool_result_output, complete_edit_diff,
+        decimal_microusd, estimate_cost_microusd, parse_unrelated_verification_directives,
+        quick_diagnostic_result, task_final_diff, tool_error_result,
     };
     use harness_models::{ModelPricing, Usage};
+    use harness_session::{TaskRun, TaskVerificationResult};
+    use std::collections::HashMap;
+    use std::process::Command;
+    use tempfile::tempdir;
 
     #[test]
     fn tool_errors_are_marked_and_large_utf8_results_are_bounded() {
@@ -2077,6 +2501,74 @@ mod conformance_hardening_tests {
     }
 
     #[test]
+    fn quick_language_server_diagnostics_are_structured_and_ignore_unavailable_data() {
+        let path = std::path::PathBuf::from("src/lib.rs");
+        let mut result = harness_tools::ToolResult::new("edited");
+        result.metadata.insert(
+            "diagnostics".to_owned(),
+            serde_json::json!({
+                "status": "best_effort",
+                "detail": "error 4:2: expected `;`"
+            }),
+        );
+        let failure = quick_diagnostic_result(&result, std::slice::from_ref(&path))
+            .expect("reported LSP errors should be recorded");
+        assert!(!failure.1);
+        assert_eq!(failure.2, vec![path.clone()]);
+        assert!(failure.0.contains("src/lib.rs"));
+
+        result.metadata.insert(
+            "diagnostics".to_owned(),
+            serde_json::json!({
+                "status": "best_effort",
+                "detail": "No diagnostics reported by the language server."
+            }),
+        );
+        let passed = quick_diagnostic_result(&result, std::slice::from_ref(&path))
+            .expect("empty diagnostic list is a successful quick check");
+        assert!(passed.1);
+
+        result.metadata.insert(
+            "diagnostics".to_owned(),
+            serde_json::json!({
+                "status": "best_effort",
+                "detail": "Quick diagnostics unavailable: language server is not running"
+            }),
+        );
+        assert!(quick_diagnostic_result(&result, &[path]).is_none());
+
+        result.metadata.insert(
+            "diagnostics".to_owned(),
+            serde_json::json!({
+                "status": "best_effort",
+                "detail": "rust-analyzer diagnostics failed: language server timed out"
+            }),
+        );
+        assert!(
+            quick_diagnostic_result(&result, &[std::path::PathBuf::from("src/lib.rs")]).is_none()
+        );
+    }
+
+    #[test]
+    fn complete_edit_diff_is_accepted_when_the_tool_result_is_not_truncated() {
+        let path = std::path::PathBuf::from("src/lib.rs");
+        let mut result = harness_tools::ToolResult::new("patched");
+        result.changed_files.push(path.clone());
+        result.metadata.insert(
+            "diff".to_owned(),
+            serde_json::json!("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new"),
+        );
+        let diff = complete_edit_diff(&result, std::slice::from_ref(&path))
+            .expect("edit diff is available");
+        assert!(diff.contains("+new"));
+
+        result
+            .metadata
+            .insert("diff_truncated".to_owned(), serde_json::json!(true));
+        assert!(complete_edit_diff(&result, &[path]).is_none());
+    }
+
+    #[test]
     fn estimated_cost_requires_complete_usage_and_trusted_pricing() {
         let pricing = ModelPricing {
             input_usd_per_million_tokens: Some("2.00".to_owned()),
@@ -2089,5 +2581,75 @@ mod conformance_hardening_tests {
         assert_eq!(decimal_microusd("0.25"), Some(250_000));
         assert_eq!(estimate_cost_microusd(None, Some(&pricing)), None);
         assert_eq!(estimate_cost_microusd(Some(&Usage::new(1, 1)), None), None);
+    }
+
+    #[test]
+    fn unrelated_verification_requires_an_exact_failed_command_and_keeps_audit_trail() {
+        let text = "The failure is from an unchanged legacy fixture.\n[UNRELATED_VERIFICATION] cargo test -p legacy :: its failing assertion is in tests/legacy.rs, outside the edited package";
+        let (message, dispositions) = parse_unrelated_verification_directives(text);
+        let mut task_run = TaskRun::new("fix the changed package");
+        task_run.verification_results.push(TaskVerificationResult {
+            command: "cargo test -p legacy".to_owned(),
+            category: "GeneralTest".to_owned(),
+            passed: false,
+            exit_code: Some(1),
+            summary: "assertion failed".to_owned(),
+            affected_files: Vec::new(),
+            failure_origin: Some("unrelated".to_owned()),
+            relevant_output: "tests/legacy.rs assertion failed".to_owned(),
+        });
+        let mut unresolved = HashMap::from([(
+            "verification:cargo test -p legacy".to_owned(),
+            "legacy test failed".to_owned(),
+        )]);
+
+        let mut validated = false;
+        apply_unrelated_verification_dispositions(
+            &mut task_run,
+            &mut unresolved,
+            &dispositions,
+            &mut validated,
+        );
+
+        assert!(message.contains("legacy fixture"));
+        assert!(unresolved.is_empty());
+        assert!(task_run.unresolved_errors.is_empty());
+        assert!(validated);
+        assert!(task_run.verification_results[0]
+            .summary
+            .contains("classified as unrelated"));
+        assert!(task_run.verification_results[0]
+            .summary
+            .contains("outside the edited package"));
+    }
+
+    #[test]
+    fn final_task_diff_includes_new_untracked_files() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path();
+        let run_git = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git command failed: {arguments:?}");
+        };
+        run_git(&["init", "--quiet"]);
+        run_git(&["config", "user.email", "verify@example.invalid"]);
+        run_git(&["config", "user.name", "Verification"]);
+        std::fs::write(root.join("tracked.txt"), "before\n").unwrap();
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "--quiet", "-m", "baseline"]);
+        std::fs::write(root.join("new.rs"), "pub fn added() {}\n").unwrap();
+        let git = super::GitClient::open(root).unwrap();
+        let direct_change = git.file_change("new.rs").unwrap();
+        assert!(!direct_change.patch.is_empty());
+
+        let diff = task_final_diff(root, &[std::path::PathBuf::from("new.rs")])
+            .expect("Git diff should be available");
+
+        assert!(diff.contains("new.rs"));
+        assert!(diff.contains("+pub fn added()"));
     }
 }

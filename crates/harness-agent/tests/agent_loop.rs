@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use harness_agent::{
@@ -17,8 +17,8 @@ use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine}
 use harness_session::{JsonlSessionStore, SessionStatus, SessionStore, TaskMode};
 use harness_tools::{CancellationToken, ToolRegistry};
 use harness_verification::{
-    VerificationCategory, VerificationPlan, VerificationReport, VerificationRequest,
-    VerificationStep, Verifier,
+    FailureOrigin, VerificationCategory, VerificationFailure, VerificationPlan, VerificationReport,
+    VerificationRequest, VerificationStep, Verifier,
 };
 use tempfile::tempdir;
 
@@ -147,6 +147,7 @@ impl Verifier for ScriptedVerifier {
                         "verification failure".to_owned()
                     },
                     diagnostics: Vec::new(),
+                    failure: None,
                 }
             })
             .collect())
@@ -744,7 +745,9 @@ fn failing_verification_is_repaired_before_task_is_marked_done() {
         .events
         .iter()
         .filter_map(|event| match &event.payload {
-            harness_session::EventPayload::VerificationResult { passed, .. } => Some(*passed),
+            harness_session::EventPayload::VerificationResult {
+                category, passed, ..
+            } if category == "Build" => Some(*passed),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -801,6 +804,181 @@ fn final_success_claim_cannot_override_a_failed_verification() {
     assert_eq!(
         state.task_run.unwrap().completion_status,
         harness_session::TaskCompletionStatus::Blocked
+    );
+}
+
+#[test]
+fn agent_can_finish_while_explicitly_attributing_an_unrelated_existing_failure() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            response(
+                "",
+                Some((
+                    "write_file",
+                    serde_json::json!({"path":"file.txt","content":"changed"}),
+                )),
+            ),
+            response(
+                "The requested file change is complete. The legacy test failure is unrelated.\n[UNRELATED_VERIFICATION] mock test command :: its assertion is in an unchanged legacy test fixture",
+                None,
+            ),
+        ],
+    ));
+    let (runner, sessions) = runner(
+        provider,
+        workspace,
+        Arc::new(AllowAllPolicy),
+        Arc::new(ApproveAll),
+    );
+    let runner = runner.with_verifier(Arc::new(ScriptedVerifier::new([false])));
+    let task = AgentTask {
+        verification_plan: Some(mock_verification_plan()),
+        ..task(workspace)
+    };
+
+    let outcome = runner.run(&task, &CancellationToken::new()).unwrap();
+    let state = sessions.load(&outcome.session_id).unwrap().state().unwrap();
+    let task_run = state.task_run.unwrap();
+
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
+    assert!(outcome.final_message.contains("legacy test failure"));
+    assert!(!outcome.final_message.contains("[UNRELATED_VERIFICATION]"));
+    assert!(task_run
+        .verification_results
+        .iter()
+        .any(|result| { !result.passed && result.failure_origin.as_deref() == Some("unrelated") }));
+}
+
+#[test]
+fn structured_failure_context_is_relevant_and_bounded_before_the_next_model_turn() {
+    struct LargeFailureVerifier(Mutex<usize>);
+
+    impl Verifier for LargeFailureVerifier {
+        fn verify(
+            &self,
+            request: &VerificationRequest,
+        ) -> Result<Vec<VerificationReport>, harness_core::Error> {
+            let mut runs = self.0.lock().unwrap();
+            let passed = *runs > 0;
+            *runs += 1;
+            Ok(request
+                .plan
+                .steps
+                .iter()
+                .map(|step| VerificationReport {
+                    category: step.category,
+                    command: format!("{} {}", step.command.program, step.command.args.join(" ")),
+                    duration_ms: 1,
+                    passed,
+                    exit_code: Some(if passed { 0 } else { 1 }),
+                    output: if passed {
+                        "tests passed".to_owned()
+                    } else {
+                        format!("{}raw-tail-sentinel", "full-log ".repeat(20_000))
+                    },
+                    diagnostics: if passed {
+                        Vec::new()
+                    } else {
+                        vec!["diagnostic-marker: expected fixed output".to_owned()]
+                    },
+                    failure: (!passed).then(|| VerificationFailure {
+                        category: step.category,
+                        command: format!(
+                            "{} {}",
+                            step.command.program,
+                            step.command.args.join(" ")
+                        ),
+                        exit_code: Some(1),
+                        diagnostics: vec!["diagnostic-marker: expected fixed output".to_owned()],
+                        relevant_output: format!(
+                            "diagnostic-marker: expected fixed output\n{}",
+                            "relevant excerpt ".repeat(1000)
+                        ),
+                        affected_files: vec![PathBuf::from("file.txt")],
+                        origin: FailureOrigin::Introduced,
+                    }),
+                })
+                .collect())
+        }
+    }
+
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    std::fs::write(workspace.join("file.txt"), "before").unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider::new(
+        requests.clone(),
+        vec![
+            response(
+                "",
+                Some((
+                    "write_file",
+                    serde_json::json!({"path":"file.txt","content":"broken"}),
+                )),
+            ),
+            response(
+                "",
+                Some((
+                    "write_file",
+                    serde_json::json!({"path":"file.txt","content":"fixed"}),
+                )),
+            ),
+            response("The fix is verified.", None),
+        ],
+    ));
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let runner = AgentRunner::new(
+        provider,
+        "recording",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace)),
+        sessions,
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    )
+    .with_verifier(Arc::new(LargeFailureVerifier(Mutex::new(0))));
+    let mut task = task(workspace);
+    task.verification_plan = Some(VerificationPlan {
+        steps: vec![VerificationStep {
+            category: VerificationCategory::Build,
+            command: harness_core::CommandSpec::new("mock-check", ["--quiet"]),
+            source: "context fixture".to_owned(),
+        }],
+    });
+
+    let outcome = runner.run(&task, &CancellationToken::new()).unwrap();
+    let requests = requests.lock().unwrap();
+    let repair_prompt = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            harness_models::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
+    assert!(repair_prompt.contains("category=Build"));
+    assert!(repair_prompt.contains("file.txt"));
+    assert!(repair_prompt.contains("likely_origin=introduced"));
+    assert!(repair_prompt.contains("diagnostic-marker"));
+    assert!(repair_prompt.contains("relevant verification output truncated"));
+    assert!(!repair_prompt.contains("raw-tail-sentinel"));
+    assert!(
+        repair_prompt.len() < 24 * 1024,
+        "failure context must stay bounded"
     );
 }
 

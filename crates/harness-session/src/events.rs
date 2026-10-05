@@ -191,6 +191,12 @@ pub struct TaskVerificationResult {
     pub passed: bool,
     pub exit_code: Option<i32>,
     pub summary: String,
+    #[serde(default)]
+    pub affected_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub failure_origin: Option<String>,
+    #[serde(default)]
+    pub relevant_output: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -214,6 +220,8 @@ pub struct TaskRun {
     pub commands_executed: Vec<String>,
     #[serde(default)]
     pub verification_results: Vec<TaskVerificationResult>,
+    #[serde(default)]
+    pub final_diff_inspected: bool,
     #[serde(default)]
     pub unresolved_errors: Vec<String>,
     #[serde(default)]
@@ -372,6 +380,12 @@ pub enum EventPayload {
         exit_code: Option<i32>,
         output: String,
         diagnostics: Vec<String>,
+        #[serde(default)]
+        affected_files: Vec<PathBuf>,
+        #[serde(default)]
+        failure_origin: Option<String>,
+        #[serde(default)]
+        relevant_output: String,
     },
     #[serde(rename = "session.resumed")]
     SessionResumed { reason: Option<String> },
