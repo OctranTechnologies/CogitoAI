@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use harness_context::{
-    ContextAssembly, ContextBudget, ContextBuilder, ContextCategory, ContextInput, ContextLimit,
-    ExplicitFile, ToolContextResult, WorkspaceMetadata,
+    ContextBudget, ContextBuilder, ContextCategory, ContextInput, ContextLimit, ExplicitFile,
+    ToolContextResult, WorkspaceMetadata,
 };
 use harness_core::InstructionFile;
 use harness_git::GitStatus;
@@ -206,9 +206,4 @@ fn validates_zero_budget() {
     let result = ContextBuilder::new(budget).build(&ContextInput::default());
 
     assert!(result.is_err());
-}
-
-#[allow(dead_code)]
-fn assembly_type_is_serializable(assembly: &ContextAssembly) -> serde_json::Value {
-    serde_json::to_value(assembly).unwrap()
 }

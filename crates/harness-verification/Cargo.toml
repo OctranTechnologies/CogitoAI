@@ -8,10 +8,8 @@ description = "Structured verification planning and execution for the CogitoAI h
 
 [dependencies]
 harness-core.workspace = true
-harness-session.workspace = true
 harness-tools.workspace = true
 serde.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -1776,7 +1776,6 @@ dependencies = [
  "rpassword",
  "serde_json",
  "tempfile",
- "zeroize",
 ]
 
 [[package]]
@@ -1788,7 +1787,6 @@ dependencies = [
  "harness-session",
  "harness-tools",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1910,11 +1908,9 @@ name = "harness-verification"
 version = "0.1.0"
 dependencies = [
  "harness-core",
- "harness-session",
  "harness-tools",
  "serde",
  "tempfile",
- "thiserror 2.0.21",
 ]
 
 [[package]]

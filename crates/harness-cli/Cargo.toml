@@ -23,7 +23,6 @@ serde_json.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 rpassword = "7"
-zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

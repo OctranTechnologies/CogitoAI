@@ -16,7 +16,7 @@ Solo software developers running CogitoAI against local repositories on their ow
 
 ## Product Purpose
 
-CogitoAI provides a model-agnostic coding-agent runtime with durable sessions, policy-governed tools, verification, checkpoints, and local RPC. The desktop application makes that engine operable and observable from a focused cross-platform workspace.
+CogitoAI is a model-agnostic software-engineering coding agent. It understands a repository, searches and reads relevant files, edits through policy-governed tools, runs verification, inspects the resulting diff, and repairs failures when needed. Durable sessions, checkpoints, and local RPC make that workflow recoverable and inspectable from the CLI or desktop application.
 
 ## Positioning
 

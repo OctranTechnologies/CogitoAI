@@ -4,6 +4,36 @@ For the crate map and step-by-step extension guides, see
 [development.md](development.md). For what the project is and how to run it, see
 the [README](../README.md).
 
+## Core coding loop
+
+The product is organized around one software-engineering task loop:
+
+```text
+UNDERSTAND
+    → PLAN when the task needs it
+    → SEARCH / READ
+    → EDIT
+    → VERIFY
+    → INSPECT DIFF
+    → REPAIR if verification or review finds a problem
+    → FINISH with the result and remaining caveats
+```
+
+`harness-agent` coordinates the loop without provider-specific branches. It
+builds bounded context with `harness-context`, requests normalized model output
+from `harness-models`, and routes tool calls through `harness-tools` and
+`harness-policy`. Mutations are recorded by `harness-session` and checkpointed
+through `harness-git`; configured checks run through `harness-verification`.
+The agent then gets verification results and the current workspace state for a
+repair turn when needed. Finishing leaves the user with the final response,
+session history, verification results, and inspectable changes. `harness-rpc`
+composes these capabilities into the shared local runtime used by both clients.
+
+Planning is a model judgment, not a separate workflow engine. Search, read,
+edit, verification, and repair are ordinary normalized model/tool turns under
+the same policy and event contracts. The desktop and CLI present the workflow;
+they do not implement agent behavior.
+
 ## Dependency direction
 
 The workspace separates contracts, capabilities, and composition. Dependencies

@@ -1,12 +1,18 @@
 # CogitoAI
 
-CogitoAI is a model-agnostic coding-agent harness. It gives an agent a controlled
-set of tools over a local workspace, records everything the agent does as an
-append-only event log, and lets you inspect, verify, and undo the result. When the
-workspace is a Git repository, recovery is precise and Git-aware.
+CogitoAI is a local-first software-engineering coding agent. It works in a
+repository through policy-controlled tools, keeps an auditable session history,
+verifies changes, and lets you inspect diffs and restore checkpoints. When the
+workspace is a Git repository, recovery is Git-aware.
 
 It ships as two clients over one runtime: a terminal CLI and a Tauri desktop
 application.
+
+Its central workflow is:
+
+**Understand → plan when needed → search/read → edit → verify → inspect the diff
+→ repair if needed → finish.** The runtime keeps this loop in one agent core;
+the CLI and desktop are two ways to operate and inspect the same local runtime.
 
 ## Project overview
 
@@ -28,10 +34,12 @@ provider is a first-class provider, not a test stub bolted on afterwards, which 
 what makes the whole system testable without a network.
 
 **Local first.** A persistent runtime process runs on your machine and the RPC
-transport binds to loopback. There is no cloud service and no telemetry. Credentials come
-from explicitly configured environment variables or the OS credential manager.
-They are never returned to a client, written to project configuration or session
-history, or included in logs. Your code does not leave the machine.
+transport binds to loopback. There is no CogitoAI cloud service or telemetry.
+Credentials come from explicitly configured environment variables or the OS
+credential manager. They are never returned to a client, written to project
+configuration or session history, or included in logs. When you use a hosted
+model provider, the prompt and selected workspace context are sent to that
+provider to generate a response; review the provider's data handling terms.
 
 **Deterministic execution control.** The model's freedom ends at the tool
 boundary. A model may only ask for an action; the runtime decides whether that
