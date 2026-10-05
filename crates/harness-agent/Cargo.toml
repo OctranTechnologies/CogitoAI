@@ -16,10 +16,10 @@ harness-session.workspace = true
 harness-tools.workspace = true
 harness-verification.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile = "3"
 
 [lints]

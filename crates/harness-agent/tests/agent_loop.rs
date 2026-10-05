@@ -15,9 +15,10 @@ use harness_models::{
 };
 use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
 use harness_session::{JsonlSessionStore, SessionStatus, SessionStore};
-use harness_tools::{CancellationToken, LocalProcessRunner, ToolRegistry};
+use harness_tools::{CancellationToken, ToolRegistry};
 use harness_verification::{
-    CommandVerifier, VerificationCategory, VerificationPlan, VerificationStep,
+    VerificationCategory, VerificationPlan, VerificationReport, VerificationRequest,
+    VerificationStep, Verifier,
 };
 use tempfile::tempdir;
 
@@ -72,7 +73,11 @@ fn respond_with_sse(stream: &mut TcpStream, events: &[serde_json::Value]) {
 }
 
 fn response(text: &str, tool: Option<(&str, serde_json::Value)>) -> ModelResponse {
-    let has_tool = tool.is_some();
+    response_many(text, tool.into_iter().collect())
+}
+
+fn response_many(text: &str, tools: Vec<(&str, serde_json::Value)>) -> ModelResponse {
+    let has_tool = !tools.is_empty();
     let mut response = ModelResponse {
         id: "scripted".to_owned(),
         model: "scripted".to_owned(),
@@ -83,13 +88,14 @@ fn response(text: &str, tool: Option<(&str, serde_json::Value)>) -> ModelRespons
                 text: text.to_owned(),
             }]
         },
-        tool_calls: tool
-            .map(|(name, arguments)| ToolCall {
-                id: format!("call-{name}"),
+        tool_calls: tools
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| ToolCall {
+                id: format!("call-{name}-{index}"),
                 name: name.to_owned(),
                 arguments,
             })
-            .into_iter()
             .collect(),
         finish_reason: if has_tool {
             harness_models::FinishReason::ToolCalls
@@ -100,6 +106,51 @@ fn response(text: &str, tool: Option<(&str, serde_json::Value)>) -> ModelRespons
     };
     response.model = "scripted".to_owned();
     response
+}
+
+struct ScriptedVerifier {
+    results: Mutex<VecDeque<bool>>,
+}
+
+impl ScriptedVerifier {
+    fn new(results: impl IntoIterator<Item = bool>) -> Self {
+        Self {
+            results: Mutex::new(results.into_iter().collect()),
+        }
+    }
+}
+
+impl Verifier for ScriptedVerifier {
+    fn verify(
+        &self,
+        request: &VerificationRequest,
+    ) -> Result<Vec<VerificationReport>, harness_core::Error> {
+        let mut results = self
+            .results
+            .lock()
+            .expect("verification script lock poisoned");
+        Ok(request
+            .plan
+            .steps
+            .iter()
+            .map(|step| {
+                let passed = results.pop_front().unwrap_or(true);
+                VerificationReport {
+                    category: step.category,
+                    command: "mock test command".to_owned(),
+                    duration_ms: 1,
+                    passed,
+                    exit_code: Some(if passed { 0 } else { 7 }),
+                    output: if passed {
+                        "tests passed".to_owned()
+                    } else {
+                        "verification failure".to_owned()
+                    },
+                    diagnostics: Vec::new(),
+                }
+            })
+            .collect())
+    }
 }
 
 struct RecordingProvider {
@@ -196,6 +247,16 @@ fn task(workspace: &Path) -> AgentTask {
     }
 }
 
+fn mock_verification_plan() -> VerificationPlan {
+    VerificationPlan {
+        steps: vec![VerificationStep {
+            category: VerificationCategory::Build,
+            command: harness_core::CommandSpec::new("mock-test", ["--quiet"]),
+            source: "test fixture".to_owned(),
+        }],
+    }
+}
+
 fn runner(
     provider: Arc<ScriptedMockProvider>,
     workspace: &Path,
@@ -244,12 +305,19 @@ fn mock_agent_reads_edits_runs_observes_and_finishes() {
     ));
     let policy = Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace));
     let (runner, sessions) = runner(provider, workspace, policy, Arc::new(ApproveAll));
+    let runner = runner.with_verifier(Arc::new(ScriptedVerifier::new([true])));
+    let task = AgentTask {
+        verification_plan: Some(mock_verification_plan()),
+        ..task(workspace)
+    };
 
-    let outcome = runner
-        .run(&task(workspace), &CancellationToken::new())
-        .unwrap();
+    let outcome = runner.run(&task, &CancellationToken::new()).unwrap();
 
     assert_eq!(outcome.final_message, "All done");
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
     assert_eq!(outcome.turns, 4);
     assert_eq!(outcome.tool_calls, 3);
     assert_eq!(
@@ -257,13 +325,31 @@ fn mock_agent_reads_edits_runs_observes_and_finishes() {
         "after\n"
     );
     let session = sessions.load(&outcome.session_id).unwrap();
-    assert_eq!(session.state().unwrap().status, SessionStatus::Completed);
+    let state = session.state().unwrap();
+    assert_eq!(state.status, SessionStatus::Completed);
+    let task_run = state.task_run.expect("persisted task run");
+    assert_eq!(task_run.original_goal, "Read, edit, run, and finish");
+    assert_eq!(
+        task_run.completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
+    assert!(task_run.relevant_files.contains(&"file.txt".into()));
+    assert!(task_run
+        .changed_files
+        .iter()
+        .any(|path| path.ends_with("file.txt")));
+    assert!(task_run
+        .commands_executed
+        .iter()
+        .any(|command| command == "echo command-ok"));
+    assert!(task_run.unresolved_errors.is_empty());
     let event_types = session
         .events
         .iter()
         .map(|event| event.event_type)
         .collect::<Vec<_>>();
     assert!(event_types.contains(&harness_session::EventType::ToolRequested));
+    assert!(event_types.contains(&harness_session::EventType::TaskRunUpdated));
     assert!(event_types.contains(&harness_session::EventType::PolicyDecision));
     assert!(event_types.contains(&harness_session::EventType::FileChanged));
     assert!(event_types.contains(&harness_session::EventType::ProcessExited));
@@ -326,6 +412,10 @@ fn cancellation_records_failed_session_before_model_call() {
     let session_id = sessions.recent(1).unwrap()[0].id.clone();
     let session = sessions.load(&session_id).unwrap();
     assert_eq!(session.state().unwrap().status, SessionStatus::Failed);
+    assert_eq!(
+        session.state().unwrap().task_run.unwrap().completion_status,
+        harness_session::TaskCompletionStatus::Cancelled
+    );
 }
 
 #[test]
@@ -367,7 +457,7 @@ fn turn_limit_stops_before_extra_tool_execution() {
 }
 
 #[test]
-fn verification_failure_is_persisted_and_agent_continues() {
+fn failing_verification_is_repaired_before_task_is_marked_done() {
     let temporary = tempdir().unwrap();
     let workspace = temporary.path();
     std::fs::write(workspace.join("file.txt"), "before").unwrap();
@@ -378,42 +468,307 @@ fn verification_failure_is_persisted_and_agent_continues() {
                 "",
                 Some((
                     "write_file",
-                    serde_json::json!({ "path": "file.txt", "content": "after" }),
+                    serde_json::json!({ "path": "file.txt", "content": "broken" }),
                 )),
             ),
-            response("Finished after verification", None),
+            response(
+                "The test failed; repairing the file now.",
+                Some((
+                    "write_file",
+                    serde_json::json!({ "path": "file.txt", "content": "fixed" }),
+                )),
+            ),
+            response("Fixed the issue and the test passes.", None),
         ],
     ));
     let policy = Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace));
     let (runner, sessions) = runner(provider, workspace, policy, Arc::new(ApproveAll));
-    let failing_command = if cfg!(windows) {
-        "echo verification failure & exit /B 7"
-    } else {
-        "echo 'verification failure'; exit 7"
-    };
     let plan = VerificationPlan {
         steps: vec![VerificationStep {
             category: VerificationCategory::Build,
-            command: if cfg!(windows) {
-                harness_core::CommandSpec::new("cmd", ["/C", failing_command])
-            } else {
-                harness_core::CommandSpec::new("sh", ["-c", failing_command])
-            },
+            command: harness_core::CommandSpec::new("mock-test", ["file.txt"]),
             source: "test".to_owned(),
         }],
     };
     let mut task = task(workspace);
     task.verification_plan = Some(plan);
-    let runner = runner.with_verifier(Arc::new(CommandVerifier::new(Arc::new(LocalProcessRunner))));
+    let runner = runner.with_verifier(Arc::new(ScriptedVerifier::new([false, true])));
 
     let outcome = runner.run(&task, &CancellationToken::new()).unwrap();
 
-    assert_eq!(outcome.final_message, "Finished after verification");
+    assert_eq!(
+        outcome.final_message,
+        "Fixed the issue and the test passes."
+    );
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("file.txt")).unwrap(),
+        "fixed"
+    );
     let session = sessions.load(&outcome.session_id).unwrap();
-    assert!(session.events.iter().any(|event| {
-        event.event_type == harness_session::EventType::VerificationResult
-            && matches!(&event.payload, harness_session::EventPayload::VerificationResult { output, .. } if output.contains("verification failure"))
-    }));
+    let results = session
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            harness_session::EventPayload::VerificationResult { passed, .. } => Some(*passed),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results, vec![false, true]);
+    assert_eq!(
+        session.state().unwrap().task_run.unwrap().completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
+}
+
+#[test]
+fn final_success_claim_cannot_override_a_failed_verification() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            response(
+                "",
+                Some((
+                    "write_file",
+                    serde_json::json!({ "path": "file.txt", "content": "changed" }),
+                )),
+            ),
+            response("Everything is fixed and all tests pass.", None),
+            response("Done; the tests pass.", None),
+            response("The task is complete.", None),
+        ],
+    ));
+    let (runner, sessions) = runner(
+        provider,
+        workspace,
+        Arc::new(AllowAllPolicy),
+        Arc::new(ApproveAll),
+    );
+    let runner = runner.with_verifier(Arc::new(ScriptedVerifier::new([false])));
+    let task = AgentTask {
+        verification_plan: Some(mock_verification_plan()),
+        ..task(workspace)
+    };
+
+    let outcome = runner.run(&task, &CancellationToken::new()).unwrap();
+
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Blocked
+    );
+    assert!(outcome.final_message.starts_with("Blocked:"));
+    assert!(outcome
+        .remaining_work
+        .iter()
+        .any(|item| item.contains("verification")));
+    let state = sessions.load(&outcome.session_id).unwrap().state().unwrap();
+    assert_eq!(
+        state.task_run.unwrap().completion_status,
+        harness_session::TaskCompletionStatus::Blocked
+    );
+}
+
+#[test]
+fn multi_file_feature_persists_plan_and_acceptance_criteria() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            response_many(
+                "Plan: add the module and its test\n- create the implementation\n- add a test",
+                vec![
+                    (
+                        "write_file",
+                        serde_json::json!({ "path": "src/module.rs", "content": "pub fn answer() -> u8 { 42 }\n" }),
+                    ),
+                    (
+                        "write_file",
+                        serde_json::json!({ "path": "tests/module.rs", "content": "#[test] fn answer_is_42() { assert_eq!(my_crate::answer(), 42); }\n" }),
+                    ),
+                ],
+            ),
+            response("Added the module and test.", None),
+        ],
+    ));
+    let policy = Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace));
+    let (runner, sessions) = runner(provider, workspace, policy, Arc::new(ApproveAll));
+    let runner = runner.with_verifier(Arc::new(ScriptedVerifier::new([true, true])));
+    let task = AgentTask {
+        user_task: "Add answer() and a test.\nAcceptance criteria:\n- answer() returns 42\n- test covers answer()".to_owned(),
+        acceptance_criteria: vec![
+            "answer() returns 42".to_owned(),
+            "test covers answer()".to_owned(),
+        ],
+        verification_plan: Some(mock_verification_plan()),
+        ..task(workspace)
+    };
+
+    let outcome = runner.run(&task, &CancellationToken::new()).unwrap();
+
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
+    let state = sessions.load(&outcome.session_id).unwrap().state().unwrap();
+    let task_run = state.task_run.unwrap();
+    assert_eq!(task_run.acceptance_criteria, task.acceptance_criteria);
+    assert!(task_run
+        .current_plan
+        .iter()
+        .any(|item| item.contains("create the implementation")));
+    assert!(task_run
+        .changed_files
+        .iter()
+        .any(|path| path.ends_with("module.rs")));
+    assert!(task_run
+        .changed_files
+        .iter()
+        .any(|path| path.ends_with("tests/module.rs")));
+    assert!(workspace.join("src/module.rs").exists());
+    assert!(workspace.join("tests/module.rs").exists());
+}
+
+#[test]
+fn failed_command_is_reported_to_model_and_can_be_repaired() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let missing_command = "harness_missing_dependency_for_deterministic_test_6d91";
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            response(
+                "",
+                Some(("shell", serde_json::json!({ "command": missing_command }))),
+            ),
+            response(
+                "The command was unavailable; using a portable check.",
+                Some(("shell", serde_json::json!({ "command": "echo recovered" }))),
+            ),
+            response("The task is complete after the fallback check.", None),
+        ],
+    ));
+    let policy = Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace));
+    let (runner, sessions) = runner(provider, workspace, policy, Arc::new(ApproveAll));
+    let outcome = runner
+        .run(&task(workspace), &CancellationToken::new())
+        .unwrap();
+
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Done
+    );
+    let state = sessions.load(&outcome.session_id).unwrap().state().unwrap();
+    let task_run = state.task_run.unwrap();
+    assert!(task_run.unresolved_errors.is_empty());
+    assert!(task_run
+        .commands_executed
+        .iter()
+        .any(|command| command == missing_command));
+    assert!(task_run
+        .commands_executed
+        .iter()
+        .any(|command| command == "echo recovered"));
+}
+
+#[test]
+fn impossible_and_clarification_tasks_do_not_claim_success() {
+    for (text, expected) in [
+        (
+            "[BLOCKED] The requested dependency is not available and no equivalent exists.",
+            harness_session::TaskCompletionStatus::Blocked,
+        ),
+        (
+            "[USER_INPUT_REQUIRED] Should the migration preserve the legacy endpoint?",
+            harness_session::TaskCompletionStatus::UserInputRequired,
+        ),
+    ] {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path();
+        let provider = Arc::new(ScriptedMockProvider::new(
+            "scripted",
+            vec![response(text, None)],
+        ));
+        let (runner, sessions) = runner(
+            provider,
+            workspace,
+            Arc::new(AllowAllPolicy),
+            Arc::new(ApproveAll),
+        );
+        let outcome = runner
+            .run(&task(workspace), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(outcome.completion_status, expected);
+        assert_ne!(
+            outcome.completion_status,
+            harness_session::TaskCompletionStatus::Done
+        );
+        assert!(outcome.final_message.contains(
+            if expected == harness_session::TaskCompletionStatus::Blocked {
+                "requested dependency"
+            } else {
+                "legacy endpoint"
+            }
+        ));
+        let state = sessions.load(&outcome.session_id).unwrap().state().unwrap();
+        assert_eq!(state.task_run.unwrap().completion_status, expected);
+    }
+}
+
+#[test]
+fn repeated_identical_command_failure_is_stopped_as_blocked() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let command = "harness_missing_dependency_for_repeat_guard_331a";
+    let failure_response = || {
+        response(
+            "",
+            Some(("shell", serde_json::json!({ "command": command }))),
+        )
+    };
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            failure_response(),
+            failure_response(),
+            response("should not finish", None),
+        ],
+    ));
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let runner = AgentRunner::new(
+        provider,
+        "scripted",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace)),
+        sessions.clone(),
+        ContextBuilder::default(),
+        AgentLimits {
+            max_repeated_tool_calls: 8,
+            max_repeated_failures: 2,
+            ..AgentLimits::default()
+        },
+        Arc::new(ApproveAll),
+    );
+
+    let outcome = runner
+        .run(&task(workspace), &CancellationToken::new())
+        .unwrap();
+
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Blocked
+    );
+    assert!(outcome.final_message.starts_with("Blocked:"));
+    let state = sessions.load(&outcome.session_id).unwrap().state().unwrap();
+    assert_eq!(
+        state.task_run.unwrap().completion_status,
+        harness_session::TaskCompletionStatus::Blocked
+    );
 }
 
 #[test]
@@ -848,7 +1203,8 @@ fn gemini_native_flow_reads_patches_and_returns_tool_results_to_the_model() {
         ContextBuilder::default(),
         AgentLimits::default(),
         Arc::new(ApproveAll),
-    );
+    )
+    .with_verifier(Arc::new(ScriptedVerifier::new([true])));
 
     let outcome = runner
         .run(
@@ -856,6 +1212,7 @@ fn gemini_native_flow_reads_patches_and_returns_tool_results_to_the_model() {
                 workspace_root: workspace.to_path_buf(),
                 user_task: "Read readme.txt, change before to after, and report the result"
                     .to_owned(),
+                verification_plan: Some(mock_verification_plan()),
                 ..AgentTask::default()
             },
             &CancellationToken::new(),

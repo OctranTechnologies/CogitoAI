@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -7,13 +7,14 @@ use harness_context::{ContextBuilder, ContextInput, ToolContextResult, Workspace
 use harness_core::{Error, SessionId};
 use harness_git::CheckpointStore;
 use harness_models::{
-    Message, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ReasoningConfig, Role,
-    Usage,
+    Message, ModelPricing, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError,
+    ReasoningConfig, Role, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest};
 use harness_session::{
     CompactState, ConversationMessage as SessionConversationMessage, EventBus, EventPayload,
-    HarnessEvent, MessageRole, SessionStore,
+    HarnessEvent, MessageRole, SessionStore, TaskCompletionStatus, TaskPhase, TaskRun,
+    TaskVerificationResult,
 };
 use harness_tools::{CancellationToken, ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{VerificationPlan, VerificationRequest, Verifier};
@@ -26,6 +27,23 @@ pub struct AgentLimits {
     pub max_tool_calls: u32,
     pub max_runtime: Duration,
     pub max_model_tokens: u64,
+    /// Estimated micro-USD. Enforced only when both usage and model pricing are known.
+    #[serde(default)]
+    pub max_estimated_cost_microusd: Option<u64>,
+    /// Maximum executions of the same tool with identical arguments per task.
+    #[serde(default = "default_repeated_call_limit")]
+    pub max_repeated_tool_calls: u32,
+    /// Maximum times the same failure may recur before the run is blocked.
+    #[serde(default = "default_repeated_failure_limit")]
+    pub max_repeated_failures: u32,
+}
+
+fn default_repeated_call_limit() -> u32 {
+    3
+}
+
+fn default_repeated_failure_limit() -> u32 {
+    3
 }
 
 impl Default for AgentLimits {
@@ -35,6 +53,55 @@ impl Default for AgentLimits {
             max_tool_calls: 32,
             max_runtime: Duration::from_secs(600),
             max_model_tokens: 100_000,
+            max_estimated_cost_microusd: None,
+            max_repeated_tool_calls: default_repeated_call_limit(),
+            max_repeated_failures: default_repeated_failure_limit(),
+        }
+    }
+}
+
+impl AgentLimits {
+    /// Reads optional per-runtime safeguards. Invalid values are ignored so a
+    /// malformed limit cannot prevent the application from starting.
+    pub fn from_env() -> Self {
+        let mut limits = Self::default();
+        apply_env_limit("COGITO_AGENT_MAX_TURNS", &mut limits.max_turns);
+        apply_env_limit("COGITO_AGENT_MAX_TOOL_CALLS", &mut limits.max_tool_calls);
+        apply_env_duration("COGITO_AGENT_MAX_RUNTIME_SECONDS", &mut limits.max_runtime);
+        apply_env_limit(
+            "COGITO_AGENT_MAX_MODEL_TOKENS",
+            &mut limits.max_model_tokens,
+        );
+        apply_env_limit(
+            "COGITO_AGENT_MAX_REPEATED_TOOL_CALLS",
+            &mut limits.max_repeated_tool_calls,
+        );
+        apply_env_limit(
+            "COGITO_AGENT_MAX_REPEATED_FAILURES",
+            &mut limits.max_repeated_failures,
+        );
+        if let Ok(value) = std::env::var("COGITO_AGENT_MAX_COST_USD") {
+            limits.max_estimated_cost_microusd = decimal_microusd(&value);
+        }
+        limits
+    }
+}
+
+fn apply_env_limit<T>(name: &str, target: &mut T)
+where
+    T: std::str::FromStr,
+{
+    if let Ok(value) = std::env::var(name) {
+        if let Ok(parsed) = value.parse() {
+            *target = parsed;
+        }
+    }
+}
+
+fn apply_env_duration(name: &str, target: &mut Duration) {
+    if let Ok(value) = std::env::var(name) {
+        if let Ok(seconds) = value.parse::<u64>() {
+            *target = Duration::from_secs(seconds);
         }
     }
 }
@@ -124,10 +191,297 @@ fn bounded_summary(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
+fn push_bounded<T>(values: &mut Vec<T>, value: T, limit: usize) {
+    values.push(value);
+    if values.len() > limit {
+        values.drain(..values.len() - limit);
+    }
+}
+
+fn push_unique_bounded<T: Eq>(values: &mut Vec<T>, value: T, limit: usize) {
+    if !values.contains(&value) {
+        push_bounded(values, value, limit);
+    }
+}
+
+fn coding_agent_instructions(existing: &str) -> String {
+    let guidance = "\
+You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Make focused changes, run relevant checks, read their complete result, inspect the final diff, and repair failures before finishing. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
+    if existing.trim().is_empty() {
+        guidance.to_owned()
+    } else {
+        format!("{}\n\n{guidance}", existing.trim())
+    }
+}
+
+fn append_acceptance_criteria(instructions: &mut String, criteria: &[String]) {
+    if criteria.is_empty() {
+        return;
+    }
+    instructions.push_str("\n\nTreat these acceptance criteria as required for completion:");
+    for criterion in criteria {
+        instructions.push_str("\n- ");
+        instructions.push_str(criterion);
+    }
+    instructions.push_str(
+        "\nIf any criterion cannot be met, do not claim completion; explain it with [BLOCKED] or ask for the specific decision with [USER_INPUT_REQUIRED].",
+    );
+}
+
+fn append_prior_task_state(instructions: &mut String, previous: &TaskRun) {
+    instructions
+        .push_str("\n\nThis is a resumed task. Continue from the runtime's persisted state:");
+    instructions.push_str(&format!("\nOriginal goal: {}", previous.original_goal));
+    if !previous.current_plan.is_empty() {
+        instructions.push_str("\nCurrent plan:");
+        for step in &previous.current_plan {
+            instructions.push_str("\n- ");
+            instructions.push_str(step);
+        }
+    }
+    if !previous.changed_files.is_empty() {
+        instructions.push_str("\nFiles already changed:");
+        for path in &previous.changed_files {
+            instructions.push_str("\n- ");
+            instructions.push_str(&path.display().to_string());
+        }
+    }
+    if !previous.unresolved_errors.is_empty() {
+        instructions.push_str("\nUnresolved errors:");
+        for error in &previous.unresolved_errors {
+            instructions.push_str("\n- ");
+            instructions.push_str(error);
+        }
+    }
+    if !previous.remaining_work.is_empty() {
+        instructions.push_str("\nRemaining work:");
+        for item in &previous.remaining_work {
+            instructions.push_str("\n- ");
+            instructions.push_str(item);
+        }
+    }
+}
+
+fn extract_acceptance_criteria(goal: &str) -> Vec<String> {
+    let lines = goal.lines().collect::<Vec<_>>();
+    let mut criteria = Vec::new();
+    let mut in_section = false;
+    for line in lines {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("acceptance criteria") || lower == "criteria:" {
+            in_section = true;
+            continue;
+        }
+        if in_section && trimmed.is_empty() {
+            continue;
+        }
+        if in_section && !is_list_item(trimmed) {
+            in_section = false;
+        }
+        if (in_section || trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]"))
+            && is_list_item(trimmed)
+        {
+            let item = trimmed
+                .trim_start_matches(|character: char| {
+                    matches!(character, '-' | '*' | ' ' | '[' | ']' | 'x' | 'X')
+                })
+                .trim();
+            if !item.is_empty() {
+                push_unique_bounded(&mut criteria, bounded_summary(item), 32);
+            }
+        }
+    }
+    criteria
+}
+
+fn is_list_item(line: &str) -> bool {
+    line.starts_with("- ")
+        || line.starts_with("* ")
+        || line.starts_with("+ ")
+        || line.starts_with("- [ ]")
+        || line.starts_with("- [x]")
+        || line.split_once('.').is_some_and(|(number, _)| {
+            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+fn extract_plan(text: &str) -> Option<Vec<String>> {
+    let mut found = false;
+    let mut plan = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !found {
+            if let Some((_, remainder)) = trimmed.split_once(':') {
+                if trimmed[..trimmed.find(':').unwrap_or_default()].eq_ignore_ascii_case("plan") {
+                    found = true;
+                    if !remainder.trim().is_empty() {
+                        plan.push(bounded_summary(remainder.trim()));
+                    }
+                    continue;
+                }
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.ends_with(':') && !is_list_item(trimmed) {
+            break;
+        }
+        let item = trimmed.trim_start_matches(['-', '*', '+', ' ']).trim();
+        if !item.is_empty() {
+            push_unique_bounded(&mut plan, bounded_summary(item), 16);
+        }
+    }
+    found.then_some(plan)
+}
+
+fn parse_completion_directive(text: &str) -> (Option<TaskCompletionStatus>, String) {
+    let trimmed = text.trim();
+    for (marker, status) in [
+        (
+            "[USER_INPUT_REQUIRED]",
+            TaskCompletionStatus::UserInputRequired,
+        ),
+        ("[BLOCKED]", TaskCompletionStatus::Blocked),
+    ] {
+        if let Some(message) = trimmed.strip_prefix(marker) {
+            return (Some(status), message.trim().to_owned());
+        }
+    }
+    (None, text.to_owned())
+}
+
+fn tool_call_key(name: &str, arguments: &serde_json::Value) -> String {
+    format!(
+        "{name}:{}",
+        serde_json::to_string(arguments).unwrap_or_else(|_| "<invalid-json>".to_owned())
+    )
+}
+
+fn normalize_failure(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn collect_relevant_files(task_run: &mut TaskRun, arguments: &serde_json::Value) {
+    fn visit(task_run: &mut TaskRun, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "path" | "file" | "file_path" | "target_file") {
+                        if let Some(path) = value.as_str().filter(|path| !path.trim().is_empty()) {
+                            push_unique_bounded(
+                                &mut task_run.relevant_files,
+                                PathBuf::from(path),
+                                200,
+                            );
+                        }
+                    } else {
+                        visit(task_run, value);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    visit(task_run, item);
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(task_run, arguments);
+}
+
+fn phase_for_tool(name: &str, arguments: &serde_json::Value) -> TaskPhase {
+    let name = name.to_ascii_lowercase();
+    if name.contains("diff") || name.contains("git_status") {
+        return TaskPhase::InspectDiff;
+    }
+    if name.contains("write") || name.contains("patch") || name.contains("edit") {
+        return TaskPhase::Edit;
+    }
+    if name == "shell" {
+        let command = arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ["test", "check", "lint", "build", "fmt", "format"]
+            .iter()
+            .any(|word| command.contains(word))
+        {
+            return TaskPhase::Verify;
+        }
+        if command.contains("git diff") {
+            return TaskPhase::InspectDiff;
+        }
+    }
+    TaskPhase::SearchRead
+}
+
+fn is_validation_command(command: &str) -> bool {
+    command
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .take(5)
+        .map(str::to_ascii_lowercase)
+        .any(|word| {
+            matches!(
+                word.as_str(),
+                "test"
+                    | "tests"
+                    | "check"
+                    | "lint"
+                    | "build"
+                    | "format"
+                    | "fmt"
+                    | "typecheck"
+                    | "verify"
+                    | "compile"
+                    | "pytest"
+                    | "vitest"
+                    | "jest"
+            )
+        })
+}
+
+fn estimate_cost_microusd(usage: Option<&Usage>, pricing: Option<&ModelPricing>) -> Option<u64> {
+    let usage = usage?;
+    let pricing = pricing?;
+    let input_tokens = u64::from(usage.input_tokens?);
+    let output_tokens = u64::from(usage.output_tokens?);
+    let input_rate = decimal_microusd(pricing.input_usd_per_million_tokens.as_deref()?)?;
+    let output_rate = decimal_microusd(pricing.output_usd_per_million_tokens.as_deref()?)?;
+    Some(
+        input_rate
+            .saturating_mul(input_tokens)
+            .saturating_add(output_rate.saturating_mul(output_tokens))
+            / 1_000_000,
+    )
+}
+
+fn decimal_microusd(value: &str) -> Option<u64> {
+    let (whole, fraction) = value.trim().split_once('.').unwrap_or((value.trim(), ""));
+    let whole = whole.parse::<u64>().ok()?;
+    let fraction = fraction.chars().take(6).collect::<String>();
+    let fraction_value = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<u64>().ok()? * 10_u64.pow(6_u32.saturating_sub(fraction.len() as u32))
+    };
+    whole.checked_mul(1_000_000)?.checked_add(fraction_value)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentTask {
     pub workspace_root: PathBuf,
     pub user_task: String,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
     pub system_instructions: String,
     pub workspace: WorkspaceMetadata,
     pub instructions: Vec<harness_core::InstructionFile>,
@@ -146,6 +500,9 @@ pub struct AgentOutcome {
     pub turns: u32,
     pub tool_calls: u32,
     pub model_tokens: u64,
+    pub estimated_cost_microusd: Option<u64>,
+    pub completion_status: TaskCompletionStatus,
+    pub remaining_work: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -300,6 +657,33 @@ impl AgentRunner {
             .state()
             .map_err(|error| AgentError::Core(error.to_string()))?;
         let session_id = session.id.clone();
+        let mut task_run = previous_state
+            .task_run
+            .clone()
+            .filter(|run| run.completion_status != TaskCompletionStatus::Done)
+            .unwrap_or_else(|| TaskRun::new(task.user_task.clone()));
+        let resumed_task_state = task.resume_session.as_ref().map(|_| task_run.clone());
+        if task_run.original_goal.is_empty() {
+            task_run.original_goal.clone_from(&task.user_task);
+        }
+        if !task.acceptance_criteria.is_empty() {
+            task_run.acceptance_criteria = task.acceptance_criteria.clone();
+        } else if task_run.acceptance_criteria.is_empty() {
+            task_run.acceptance_criteria = extract_acceptance_criteria(&task.user_task);
+        }
+        task_run.completion_status = TaskCompletionStatus::InProgress;
+        task_run.current_phase = TaskPhase::Understand;
+        task_run.remaining_work.clear();
+        if task.resume_session.is_some() {
+            task_run
+                .unresolved_errors
+                .retain(|error| !error.starts_with("runtime:guard:"));
+        }
+        let mut system_instructions = coding_agent_instructions(&task.system_instructions);
+        append_acceptance_criteria(&mut system_instructions, &task_run.acceptance_criteria);
+        if let Some(previous) = &resumed_task_state {
+            append_prior_task_state(&mut system_instructions, previous);
+        }
         let checkpoint_id = if let Some(checkpoints) = &self.checkpoints {
             Some(
                 checkpoints
@@ -336,7 +720,7 @@ impl AgentRunner {
             approved: Arc::clone(&approved),
         };
         let mut context_input = ContextInput {
-            system_instructions: task.system_instructions.clone(),
+            system_instructions,
             workspace: task.workspace.clone(),
             instructions: task.instructions.clone(),
             user_request: task.user_task.clone(),
@@ -361,9 +745,21 @@ impl AgentRunner {
             },
             &collector,
         )?;
+        self.update_task_run(&session_id, &collector, &task_run)?;
         let mut turns = 0;
         let mut tool_calls = 0;
         let mut model_tokens = 0;
+        let mut estimated_cost_microusd = Some(0_u64);
+        let mut repeated_tool_calls = HashMap::<String, u32>::new();
+        let mut repeated_failures = HashMap::<String, u32>::new();
+        let mut unresolved_error_keys = task_run
+            .unresolved_errors
+            .iter()
+            .filter_map(|error| error.split_once(" :: "))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<HashMap<_, _>>();
+        let mut no_progress_final_responses = 0_u32;
+        let mut validation_since_last_edit = task_run.changed_files.is_empty();
         // Keep the latest canonical call/result batch for native model
         // protocols that require explicit tool-result messages. The rebuilt
         // context carries older observations without retaining an unbounded
@@ -378,8 +774,16 @@ impl AgentRunner {
                 cancellation,
                 &session_id,
                 &collector,
+                &mut task_run,
+                estimated_cost_microusd,
             )?;
             turns += 1;
+            task_run.current_phase = if task_run.current_plan.is_empty() {
+                TaskPhase::Understand
+            } else {
+                TaskPhase::Plan
+            };
+            self.update_task_run(&session_id, &collector, &task_run)?;
             let mut assembly = match self.context_builder.build(&context_input) {
                 Ok(assembly) => assembly,
                 Err(error) => {
@@ -453,12 +857,44 @@ impl AgentRunner {
             ) {
                 Ok(response) => response,
                 Err(_) if cancellation.is_cancelled() => {
-                    return self.fail(session_id, collector, AgentError::Cancelled);
+                    task_run.completion_status = TaskCompletionStatus::Cancelled;
+                    task_run.current_phase = TaskPhase::Finish;
+                    return self.abort_with_task_run(
+                        session_id,
+                        collector,
+                        &task_run,
+                        AgentError::Cancelled,
+                    );
                 }
-                Err(error) => return self.fail(session_id, collector, AgentError::Model(error)),
+                Err(error) => {
+                    let error = AgentError::Model(error);
+                    task_run.unresolved_errors.push(format!(
+                        "runtime:provider :: {}",
+                        bounded_summary(&error.to_string())
+                    ));
+                    task_run.completion_status = TaskCompletionStatus::Blocked;
+                    task_run.current_phase = TaskPhase::Finish;
+                    return self.abort_with_task_run(session_id, collector, &task_run, error);
+                }
             };
             self.flush(&session_id, &collector)?;
+            if unresolved_error_keys.remove("runtime:provider").is_some() {
+                task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+            }
+            if let Some(plan) = extract_plan(&response.text()).filter(|plan| !plan.is_empty()) {
+                task_run.current_plan = plan;
+                task_run.current_phase = TaskPhase::Plan;
+                self.update_task_run(&session_id, &collector, &task_run)?;
+            }
             model_tokens += usage_tokens(response.usage.as_ref());
+            let response_cost = estimate_cost_microusd(
+                response.usage.as_ref(),
+                descriptor.metadata.pricing.as_ref(),
+            );
+            estimated_cost_microusd = match (estimated_cost_microusd, response_cost) {
+                (Some(total), Some(cost)) => Some(total.saturating_add(cost)),
+                _ => None,
+            };
             self.emit(
                 &session_id,
                 EventPayload::ModelResponse {
@@ -474,6 +910,12 @@ impl AgentRunner {
                 &collector,
             )?;
             if !response.text().is_empty() {
+                context_input.conversation.push(SessionConversationMessage {
+                    role: MessageRole::Assistant,
+                    text: response.text(),
+                });
+            }
+            if !response.text().is_empty() && !response.tool_calls.is_empty() {
                 self.emit(
                     &session_id,
                     EventPayload::AssistantMessage {
@@ -481,10 +923,6 @@ impl AgentRunner {
                     },
                     &collector,
                 )?;
-                context_input.conversation.push(SessionConversationMessage {
-                    role: MessageRole::Assistant,
-                    text: response.text(),
-                });
             }
             self.check_limits(
                 started_at,
@@ -494,29 +932,129 @@ impl AgentRunner {
                 cancellation,
                 &session_id,
                 &collector,
+                &mut task_run,
+                estimated_cost_microusd,
             )?;
             if !response.tool_calls.is_empty() && turns >= self.limits.max_turns {
-                return self.fail(
+                task_run.completion_status = TaskCompletionStatus::ResourceLimitReached;
+                task_run.current_phase = TaskPhase::Finish;
+                return self.abort_with_task_run(
                     session_id,
                     collector,
+                    &task_run,
                     AgentError::LimitExceeded {
                         limit: "max_turns".to_owned(),
                     },
                 );
             }
             if response.tool_calls.is_empty() {
+                let (directive, final_message) = parse_completion_directive(&response.text());
+                task_run.current_plan = extract_plan(&response.text())
+                    .filter(|plan| !plan.is_empty())
+                    .unwrap_or_else(|| task_run.current_plan.clone());
+                if directive == Some(TaskCompletionStatus::UserInputRequired) {
+                    task_run.current_phase = TaskPhase::Finish;
+                    task_run.completion_status = TaskCompletionStatus::UserInputRequired;
+                    task_run.remaining_work = vec![final_message.clone()];
+                    self.emit(
+                        &session_id,
+                        EventPayload::AssistantMessage {
+                            text: final_message.clone(),
+                        },
+                        &collector,
+                    )?;
+                    return self.finish_task_run(
+                        session_id,
+                        collector,
+                        task_run,
+                        final_message,
+                        turns,
+                        tool_calls,
+                        model_tokens,
+                        estimated_cost_microusd,
+                    );
+                }
+                if directive == Some(TaskCompletionStatus::Blocked) {
+                    let reason = if final_message.is_empty() {
+                        "The task cannot be completed with the available information.".to_owned()
+                    } else {
+                        final_message.clone()
+                    };
+                    task_run.current_phase = TaskPhase::Finish;
+                    return self.finish_blocked_task(
+                        session_id,
+                        collector,
+                        task_run,
+                        reason,
+                        turns,
+                        tool_calls,
+                        model_tokens,
+                        estimated_cost_microusd,
+                    );
+                }
+                if !task_run.changed_files.is_empty() && !validation_since_last_edit {
+                    let key = "verification:after_last_edit".to_owned();
+                    unresolved_error_keys.entry(key.clone()).or_insert_with(|| {
+                        format!(
+                            "{key} :: No successful relevant verification has run since the most recent edit. Run the appropriate test, build, lint, format, or typecheck command before finishing."
+                        )
+                    });
+                    task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+                }
+                if !task_run.unresolved_errors.is_empty() {
+                    no_progress_final_responses = no_progress_final_responses.saturating_add(1);
+                    task_run.current_phase = TaskPhase::Repair;
+                    task_run.remaining_work = task_run.unresolved_errors.clone();
+                    if no_progress_final_responses >= self.limits.max_repeated_failures.max(1) {
+                        let reason = format!(
+                            "The model stopped making progress with unresolved verification or tool errors: {}",
+                            task_run.unresolved_errors.join("; ")
+                        );
+                        return self.finish_blocked_task(
+                            session_id,
+                            collector,
+                            task_run,
+                            reason,
+                            turns,
+                            tool_calls,
+                            model_tokens,
+                            estimated_cost_microusd,
+                        );
+                    }
+                    context_input.tool_results.push(ToolContextResult {
+                        name: "task_completion_check".to_owned(),
+                        result: tool_error_result(
+                            "task_completion_check".to_owned(),
+                            format!(
+                                "Do not report completion. Resolve or explain these outstanding issues, revise your approach, and continue with tools when possible: {}. If the task is impossible, return [BLOCKED] followed by the reason; if a user decision is needed, return [USER_INPUT_REQUIRED] followed by one concise question.",
+                                task_run.unresolved_errors.join("; ")
+                            ),
+                        ),
+                        is_shell: false,
+                    });
+                    self.update_task_run(&session_id, &collector, &task_run)?;
+                    continue;
+                }
+                task_run.current_phase = TaskPhase::Finish;
+                task_run.completion_status = TaskCompletionStatus::Done;
+                task_run.remaining_work.clear();
                 self.emit(
                     &session_id,
-                    EventPayload::SessionCompleted { reason: None },
+                    EventPayload::AssistantMessage {
+                        text: final_message.clone(),
+                    },
                     &collector,
                 )?;
-                return Ok(AgentOutcome {
+                return self.finish_task_run(
                     session_id,
-                    final_message: response.text(),
+                    collector,
+                    task_run,
+                    final_message,
                     turns,
                     tool_calls,
                     model_tokens,
-                });
+                    estimated_cost_microusd,
+                );
             }
             let mut next_model_history = Vec::with_capacity(response.tool_calls.len() + 1);
             next_model_history.push(Message {
@@ -529,12 +1067,22 @@ impl AgentRunner {
             });
             for tool_call in response.tool_calls {
                 if cancellation.is_cancelled() {
-                    return self.fail(session_id, collector, AgentError::Cancelled);
-                }
-                if tool_calls >= self.limits.max_tool_calls {
-                    return self.fail(
+                    task_run.completion_status = TaskCompletionStatus::Cancelled;
+                    task_run.current_phase = TaskPhase::Finish;
+                    return self.abort_with_task_run(
                         session_id,
                         collector,
+                        &task_run,
+                        AgentError::Cancelled,
+                    );
+                }
+                if tool_calls >= self.limits.max_tool_calls {
+                    task_run.completion_status = TaskCompletionStatus::ResourceLimitReached;
+                    task_run.current_phase = TaskPhase::Finish;
+                    return self.abort_with_task_run(
+                        session_id,
+                        collector,
+                        &task_run,
                         AgentError::LimitExceeded {
                             limit: "max_tool_calls".to_owned(),
                         },
@@ -542,6 +1090,49 @@ impl AgentRunner {
                 }
                 tool_calls += 1;
                 let is_shell = tool_call.name == "shell";
+                let tool_error_key = format!("tool:{}", tool_call.name);
+                let call_key = tool_call_key(&tool_call.name, &tool_call.arguments);
+                let repeated = repeated_tool_calls.entry(call_key.clone()).or_default();
+                *repeated = repeated.saturating_add(1);
+                if *repeated > self.limits.max_repeated_tool_calls.max(1) {
+                    let message = format!(
+                        "Stopped a repeated identical tool call after {} attempts: {}",
+                        repeated.saturating_sub(1),
+                        tool_call.name
+                    );
+                    unresolved_error_keys.insert(
+                        "runtime:guard:tool_call".to_owned(),
+                        format!("runtime:guard:tool_call :: {message}"),
+                    );
+                    task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+                    task_run.remaining_work = task_run.unresolved_errors.clone();
+                    task_run.completion_status = TaskCompletionStatus::Blocked;
+                    task_run.current_phase = TaskPhase::Finish;
+                    return self.finish_blocked_task(
+                        session_id,
+                        collector,
+                        task_run,
+                        message,
+                        turns,
+                        tool_calls,
+                        model_tokens,
+                        estimated_cost_microusd,
+                    );
+                }
+                task_run.current_phase = phase_for_tool(&tool_call.name, &tool_call.arguments);
+                collect_relevant_files(&mut task_run, &tool_call.arguments);
+                if is_shell {
+                    if let Some(command) =
+                        tool_call.arguments.get("command").and_then(|v| v.as_str())
+                    {
+                        push_bounded(
+                            &mut task_run.commands_executed,
+                            bounded_summary(command),
+                            200,
+                        );
+                    }
+                }
+                self.update_task_run(&session_id, &collector, &task_run)?;
                 let request = ToolRequest::new(tool_call.name.clone(), tool_call.arguments.clone());
                 let execution = ToolExecutionContext {
                     session_id: &session_id,
@@ -553,13 +1144,103 @@ impl AgentRunner {
                 };
                 let mut result = match self.execute_tool(&execution, request) {
                     Ok(result) => result,
-                    Err(error) => return self.fail(session_id, collector, error),
+                    Err(error) => {
+                        unresolved_error_keys.insert(
+                            tool_error_key.clone(),
+                            format!(
+                                "{tool_error_key} :: {}",
+                                bounded_summary(&error.to_string())
+                            ),
+                        );
+                        task_run.unresolved_errors =
+                            unresolved_error_keys.values().cloned().collect();
+                        task_run.completion_status = TaskCompletionStatus::Blocked;
+                        task_run.current_phase = TaskPhase::Finish;
+                        return self.abort_with_task_run(session_id, collector, &task_run, error);
+                    }
                 };
                 let (bounded_output, output_truncated) =
                     bound_tool_result_output(&result.output, result.truncated);
                 result.output = bounded_output;
                 result.truncated = output_truncated;
                 let changed_files = result.changed_files.clone();
+                if result.is_error {
+                    let error = format!("{tool_error_key} :: {}", bounded_summary(&result.output));
+                    unresolved_error_keys.insert(tool_error_key, error);
+                    let signature = format!("{}:{}", call_key, normalize_failure(&result.output));
+                    let failures = repeated_failures.entry(signature).or_default();
+                    *failures = failures.saturating_add(1);
+                    task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+                    task_run.current_phase = TaskPhase::Repair;
+                    if *failures >= self.limits.max_repeated_failures.max(1) {
+                        let reason = format!(
+                            "The same tool failure repeated {} times: {}",
+                            failures,
+                            bounded_summary(&result.output)
+                        );
+                        task_run.remaining_work = task_run.unresolved_errors.clone();
+                        return self.finish_blocked_task(
+                            session_id,
+                            collector,
+                            task_run,
+                            reason,
+                            turns,
+                            tool_calls,
+                            model_tokens,
+                            estimated_cost_microusd,
+                        );
+                    }
+                } else {
+                    unresolved_error_keys.remove(&tool_error_key);
+                    task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+                    no_progress_final_responses = 0;
+                    if !changed_files.is_empty() {
+                        task_run.current_phase = TaskPhase::Verify;
+                    }
+                }
+                if is_shell {
+                    if let Some(command) =
+                        tool_call.arguments.get("command").and_then(|v| v.as_str())
+                    {
+                        if is_validation_command(command) {
+                            let passed = !result.is_error;
+                            let exit_code = result
+                                .metadata
+                                .get("exit_code")
+                                .and_then(serde_json::Value::as_i64)
+                                .and_then(|code| i32::try_from(code).ok());
+                            push_bounded(
+                                &mut task_run.verification_results,
+                                TaskVerificationResult {
+                                    command: bounded_summary(command),
+                                    category: "agent_command".to_owned(),
+                                    passed,
+                                    exit_code,
+                                    summary: bounded_summary(&result.output),
+                                },
+                                200,
+                            );
+                            let key = format!("verification:{command}");
+                            if passed {
+                                unresolved_error_keys.remove(&key);
+                                unresolved_error_keys.remove("verification:after_last_edit");
+                                validation_since_last_edit = true;
+                            } else {
+                                unresolved_error_keys.insert(
+                                    key.clone(),
+                                    format!("{key} :: {}", bounded_summary(&result.output)),
+                                );
+                                validation_since_last_edit = false;
+                            }
+                        }
+                    }
+                }
+                for path in &changed_files {
+                    push_unique_bounded(&mut task_run.changed_files, path.clone(), 200);
+                }
+                if !changed_files.is_empty() {
+                    validation_since_last_edit = false;
+                }
                 if let (Some(checkpoints), Some(checkpoint_id)) =
                     (&self.checkpoints, &checkpoint_id)
                 {
@@ -579,7 +1260,8 @@ impl AgentRunner {
                     result,
                     is_shell,
                 });
-                self.run_verification_if_needed(
+                let verification_results_before = task_run.verification_results.len();
+                let verification_repeated_failure = self.run_verification_if_needed(
                     &session_id,
                     &task.workspace_root,
                     task.verification_plan.as_ref(),
@@ -588,10 +1270,148 @@ impl AgentRunner {
                     &mut context_input,
                     &collector,
                     cancellation,
+                    &mut task_run,
+                    &mut unresolved_error_keys,
+                    &mut repeated_failures,
+                    self.limits.max_repeated_failures,
                 )?;
+                if task_run.verification_results.len() > verification_results_before {
+                    validation_since_last_edit = task_run.verification_results
+                        [verification_results_before..]
+                        .iter()
+                        .all(|result| result.passed);
+                    if validation_since_last_edit {
+                        unresolved_error_keys.remove("verification:after_last_edit");
+                        no_progress_final_responses = 0;
+                    }
+                }
+                task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+                task_run.remaining_work = task_run.unresolved_errors.clone();
+                self.update_task_run(&session_id, &collector, &task_run)?;
+                if verification_repeated_failure {
+                    let reason = format!(
+                        "The same verification failure repeated {} times.",
+                        self.limits.max_repeated_failures.max(1)
+                    );
+                    task_run.completion_status = TaskCompletionStatus::Blocked;
+                    task_run.current_phase = TaskPhase::Finish;
+                    return self.finish_blocked_task(
+                        session_id,
+                        collector,
+                        task_run,
+                        reason,
+                        turns,
+                        tool_calls,
+                        model_tokens,
+                        estimated_cost_microusd,
+                    );
+                }
             }
             model_history = next_model_history;
         }
+    }
+
+    fn update_task_run(
+        &self,
+        session_id: &SessionId,
+        collector: &Arc<Mutex<Vec<HarnessEvent>>>,
+        task_run: &TaskRun,
+    ) -> Result<(), AgentError> {
+        self.emit(
+            session_id,
+            EventPayload::TaskRunUpdated {
+                task_run: task_run.clone(),
+            },
+            collector,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_task_run(
+        &self,
+        session_id: SessionId,
+        collector: Arc<Mutex<Vec<HarnessEvent>>>,
+        task_run: TaskRun,
+        final_message: String,
+        turns: u32,
+        tool_calls: u32,
+        model_tokens: u64,
+        estimated_cost_microusd: Option<u64>,
+    ) -> Result<AgentOutcome, AgentError> {
+        self.update_task_run(&session_id, &collector, &task_run)?;
+        let reason = match task_run.completion_status {
+            TaskCompletionStatus::Done => None,
+            TaskCompletionStatus::Blocked => Some("blocked".to_owned()),
+            TaskCompletionStatus::UserInputRequired => Some("user_input_required".to_owned()),
+            TaskCompletionStatus::ResourceLimitReached => Some("resource_limit_reached".to_owned()),
+            TaskCompletionStatus::Cancelled => Some("cancelled".to_owned()),
+            TaskCompletionStatus::InProgress => Some("incomplete".to_owned()),
+        };
+        self.emit(
+            &session_id,
+            EventPayload::SessionCompleted { reason },
+            &collector,
+        )?;
+        Ok(AgentOutcome {
+            session_id,
+            final_message,
+            turns,
+            tool_calls,
+            model_tokens,
+            estimated_cost_microusd,
+            completion_status: task_run.completion_status,
+            remaining_work: task_run.remaining_work,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_blocked_task(
+        &self,
+        session_id: SessionId,
+        collector: Arc<Mutex<Vec<HarnessEvent>>>,
+        mut task_run: TaskRun,
+        reason: String,
+        turns: u32,
+        tool_calls: u32,
+        model_tokens: u64,
+        estimated_cost_microusd: Option<u64>,
+    ) -> Result<AgentOutcome, AgentError> {
+        task_run.current_phase = TaskPhase::Finish;
+        task_run.completion_status = TaskCompletionStatus::Blocked;
+        task_run.remaining_work = if task_run.unresolved_errors.is_empty() {
+            vec![bounded_summary(&reason)]
+        } else {
+            task_run.unresolved_errors.clone()
+        };
+        let final_message = format!("Blocked: {}", bounded_summary(&reason));
+        self.emit(
+            &session_id,
+            EventPayload::AssistantMessage {
+                text: final_message.clone(),
+            },
+            &collector,
+        )?;
+        self.finish_task_run(
+            session_id,
+            collector,
+            task_run,
+            final_message,
+            turns,
+            tool_calls,
+            model_tokens,
+            estimated_cost_microusd,
+        )
+    }
+
+    fn abort_with_task_run<T>(
+        &self,
+        session_id: SessionId,
+        collector: Arc<Mutex<Vec<HarnessEvent>>>,
+        task_run: &TaskRun,
+        error: AgentError,
+    ) -> Result<T, AgentError> {
+        let _ = self.update_task_run(&session_id, &collector, task_run);
+        self.fail(session_id, collector, error)
     }
 
     fn compact_context(
@@ -644,16 +1464,20 @@ impl AgentRunner {
         context_input: &mut ContextInput,
         collector: &Arc<Mutex<Vec<HarnessEvent>>>,
         cancellation: &CancellationToken,
-    ) -> Result<(), AgentError> {
+        task_run: &mut TaskRun,
+        unresolved_error_keys: &mut HashMap<String, String>,
+        repeated_failures: &mut HashMap<String, u32>,
+        repeated_failure_limit: u32,
+    ) -> Result<bool, AgentError> {
         if changed_files.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let (Some(plan), Some(verifier)) = (plan, verifier) else {
-            return Ok(());
+            return Ok(false);
         };
         let plan = plan.targeted();
         if plan.steps.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         self.emit(
             session_id,
@@ -674,6 +1498,27 @@ impl AgentRunner {
         match verifier.verify_cancellable(&request, cancellation) {
             Ok(reports) => {
                 for report in reports {
+                    let failure_key = format!("verification:{}", report.command);
+                    push_bounded(
+                        &mut task_run.commands_executed,
+                        bounded_summary(&report.command),
+                        200,
+                    );
+                    push_bounded(
+                        &mut task_run.verification_results,
+                        TaskVerificationResult {
+                            command: report.command.clone(),
+                            category: format!("{:?}", report.category),
+                            passed: report.passed,
+                            exit_code: report.exit_code,
+                            summary: bounded_summary(&format!(
+                                "{} {}",
+                                report.diagnostics.join("; "),
+                                report.output
+                            )),
+                        },
+                        200,
+                    );
                     self.emit(
                         session_id,
                         EventPayload::VerificationResult {
@@ -696,10 +1541,50 @@ impl AgentRunner {
                         result: ToolResult::new(summary),
                         is_shell: false,
                     });
+                    if report.passed {
+                        unresolved_error_keys.remove(&failure_key);
+                    } else {
+                        let output = bounded_summary(&format!(
+                            "{} {}",
+                            report.diagnostics.join("; "),
+                            report.output
+                        ));
+                        unresolved_error_keys
+                            .insert(failure_key.clone(), format!("{failure_key} :: {output}"));
+                        let signature = format!(
+                            "{failure_key}:{}:{}",
+                            report.exit_code.unwrap_or(-1),
+                            normalize_failure(&report.output)
+                        );
+                        let failures = repeated_failures.entry(signature).or_default();
+                        *failures = failures.saturating_add(1);
+                        if *failures >= repeated_failure_limit.max(1) {
+                            task_run.unresolved_errors =
+                                unresolved_error_keys.values().cloned().collect();
+                            return Ok(true);
+                        }
+                    }
                 }
             }
             Err(error) => {
                 let message = error.to_string();
+                let failure_key = "verification:runner".to_owned();
+                let failure = format!("{failure_key} :: {}", bounded_summary(&message));
+                unresolved_error_keys.insert(failure_key.clone(), failure);
+                push_bounded(
+                    &mut task_run.verification_results,
+                    TaskVerificationResult {
+                        command: "verification".to_owned(),
+                        category: "runner".to_owned(),
+                        passed: false,
+                        exit_code: None,
+                        summary: bounded_summary(&message),
+                    },
+                    200,
+                );
+                let signature = format!("{failure_key}:{}", normalize_failure(&message));
+                let failures = repeated_failures.entry(signature).or_default();
+                *failures = failures.saturating_add(1);
                 self.emit(
                     session_id,
                     EventPayload::VerificationResult {
@@ -718,9 +1603,14 @@ impl AgentRunner {
                     result: ToolResult::new(message),
                     is_shell: false,
                 });
+                if *failures >= repeated_failure_limit.max(1) {
+                    task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+                    return Ok(true);
+                }
             }
         }
-        Ok(())
+        task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
+        Ok(false)
     }
 
     fn execute_tool(
@@ -773,21 +1663,48 @@ impl AgentRunner {
         cancellation: &CancellationToken,
         session_id: &SessionId,
         collector: &Arc<Mutex<Vec<HarnessEvent>>>,
+        task_run: &mut TaskRun,
+        estimated_cost_microusd: Option<u64>,
     ) -> Result<(), AgentError> {
         if cancellation.is_cancelled() {
-            return self.fail(session_id.clone(), collector.clone(), AgentError::Cancelled);
-        }
-        let exceeded = turns > self.limits.max_turns
-            || tool_calls > self.limits.max_tool_calls
-            || (self.limits.max_model_tokens > 0 && model_tokens > self.limits.max_model_tokens)
-            || (self.limits.max_runtime != Duration::ZERO
-                && started_at.elapsed() > self.limits.max_runtime);
-        if exceeded {
-            return self.fail(
+            task_run.completion_status = TaskCompletionStatus::Cancelled;
+            task_run.current_phase = TaskPhase::Finish;
+            return self.abort_with_task_run(
                 session_id.clone(),
                 collector.clone(),
+                task_run,
+                AgentError::Cancelled,
+            );
+        }
+        let reason = if turns > self.limits.max_turns {
+            Some("max_turns")
+        } else if tool_calls > self.limits.max_tool_calls {
+            Some("max_tool_calls")
+        } else if self.limits.max_model_tokens > 0 && model_tokens > self.limits.max_model_tokens {
+            Some("max_model_tokens")
+        } else if self.limits.max_runtime != Duration::ZERO
+            && started_at.elapsed() > self.limits.max_runtime
+        {
+            Some("max_runtime")
+        } else if self
+            .limits
+            .max_estimated_cost_microusd
+            .is_some_and(|limit| estimated_cost_microusd.is_some_and(|cost| cost > limit))
+        {
+            Some("max_estimated_cost")
+        } else {
+            None
+        };
+        if let Some(limit) = reason {
+            task_run.completion_status = TaskCompletionStatus::ResourceLimitReached;
+            task_run.current_phase = TaskPhase::Finish;
+            task_run.remaining_work = vec![format!("Task stopped at configured limit: {limit}")];
+            return self.abort_with_task_run(
+                session_id.clone(),
+                collector.clone(),
+                task_run,
                 AgentError::LimitExceeded {
-                    limit: "agent safety/resource limit".to_owned(),
+                    limit: limit.to_owned(),
                 },
             );
         }
@@ -930,7 +1847,10 @@ fn usage_tokens(usage: Option<&Usage>) -> u64 {
 
 #[cfg(test)]
 mod conformance_hardening_tests {
-    use super::{bound_tool_result_output, tool_error_result};
+    use super::{
+        bound_tool_result_output, decimal_microusd, estimate_cost_microusd, tool_error_result,
+    };
+    use harness_models::{ModelPricing, Usage};
 
     #[test]
     fn tool_errors_are_marked_and_large_utf8_results_are_bounded() {
@@ -943,5 +1863,20 @@ mod conformance_hardening_tests {
         assert!(truncated);
         assert!(bounded.len() <= 16 * 1024);
         assert!(bounded.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn estimated_cost_requires_complete_usage_and_trusted_pricing() {
+        let pricing = ModelPricing {
+            input_usd_per_million_tokens: Some("2.00".to_owned()),
+            output_usd_per_million_tokens: Some("4".to_owned()),
+        };
+        assert_eq!(
+            estimate_cost_microusd(Some(&Usage::new(1_000_000, 500_000)), Some(&pricing)),
+            Some(4_000_000)
+        );
+        assert_eq!(decimal_microusd("0.25"), Some(250_000));
+        assert_eq!(estimate_cost_microusd(None, Some(&pricing)), None);
+        assert_eq!(estimate_cost_microusd(Some(&Usage::new(1, 1)), None), None);
     }
 }

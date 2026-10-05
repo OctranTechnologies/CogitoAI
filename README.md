@@ -50,6 +50,14 @@ timeout and an output cap, and a cancelled or failed run still closes its sessio
 cleanly. The same task produces the same event stream whether a person or a script
 is watching.
 
+**Task-aware completion.** The runtime persists a `TaskRun` snapshot in the
+session event log: the original goal, known acceptance criteria, plan, files,
+commands, verification results, unresolved errors, remaining work, and completion
+status. Failed commands and tests return to the model as errors so it can revise
+and retry. The runtime does not mark a task done while those recorded failures
+remain unresolved; repeated identical calls and repeated failures become
+`blocked`. A model can request a decision with `[USER_INPUT_REQUIRED]`.
+
 **CLI and desktop over one runtime.** Both clients use the shared loopback RPC
 bootstrap for agent runs and drive the same agent core, policy engine, and session
 store. They reuse a healthy runtime or start a detached runtime process when none
@@ -470,6 +478,8 @@ Everything in this list is implemented and covered by tests.
 **Agent and tools**
 
 - Single-agent loop with tool calling, streaming deltas, and usage accounting.
+- Runtime-owned task state with persisted plans, verification feedback, completion
+  gating, and repeated-call/failure safeguards.
 - Seven tools: `read_file`, `write_file`, `apply_patch`, `list_directory`, `glob`,
   `grep`, and `shell`.
 - Path containment: every tool resolves paths against the workspace root, so `..`
@@ -490,10 +500,18 @@ Everything in this list is implemented and covered by tests.
 
 - Verification plans derived from detected manifests, with formatter, lint,
   typecheck, build, targeted test, general test, and Git-diff steps.
-- Failed verification is fed back into the model, so the agent can correct its own
-  work and re-verify.
+- Failed verification is fed back into the model, and completion stays blocked
+  until recorded failures are resolved or the runtime stops the task as blocked
+  or resource-limited.
 - Git-aware checkpoints and precise, conflict-refusing undo.
 - Compaction of long sessions with the full history preserved.
+
+Persistent runtime limits can be tuned with `COGITO_AGENT_MAX_TURNS`,
+`COGITO_AGENT_MAX_TOOL_CALLS`, `COGITO_AGENT_MAX_RUNTIME_SECONDS`,
+`COGITO_AGENT_MAX_MODEL_TOKENS`, `COGITO_AGENT_MAX_COST_USD`,
+`COGITO_AGENT_MAX_REPEATED_TOOL_CALLS`, and `COGITO_AGENT_MAX_REPEATED_FAILURES`.
+Cost is only estimated or enforced when usage and provider pricing metadata are
+both available; otherwise it remains unknown.
 
 **Clients**
 
@@ -936,9 +954,10 @@ writes real files, so point it at a scratch repository.
 This is v0. The following are **not** implemented, and no part of this repository
 should be read as promising them:
 
-- **No Jev decision layer.** There is no separate decision, planning, or
-  adjudication stage. A single agent loop runs from task to completion; the
-  verification-correction loop is the only structured retry.
+- **No Jev decision layer.** There is no separate decision or adjudication
+  service. Planning, repair, and completion checks happen inside the single
+  provider-neutral agent loop, with runtime safeguards around repeated calls,
+  failures, and resource limits.
 - **No subagents.** There is no multi-agent orchestration, delegation, or
   parallelism. `harness-agent` runs exactly one agent per task.
 - **No MCP.** There is no Model Context Protocol client or server, and no external

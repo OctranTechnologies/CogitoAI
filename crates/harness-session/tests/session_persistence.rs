@@ -446,6 +446,9 @@ fn serializes_every_event_type_with_schema_compatibility() {
             summary: "summary".to_owned(),
             state: CompactState::default(),
         },
+        EventPayload::TaskRunUpdated {
+            task_run: harness_session::TaskRun::new("add a test"),
+        },
         EventPayload::SessionCompleted { reason: None },
         EventPayload::SessionFailed {
             error: "failed".to_owned(),

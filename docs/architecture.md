@@ -34,6 +34,30 @@ edit, verification, and repair are ordinary normalized model/tool turns under
 the same policy and event contracts. The desktop and CLI present the workflow;
 they do not implement agent behavior.
 
+The runtime owns a provider-neutral `TaskRun` snapshot for each active task.
+`harness-agent` updates it as the run moves through understand, plan, search/read,
+edit, verify, diff inspection, repair, and finish. The session reducer restores
+the latest snapshot from `task.run.updated` events, including the original goal,
+known acceptance criteria, files, commands, verification results, unresolved
+errors, remaining work, and terminal status. The desktop and CLI render events;
+they do not decide whether work is complete.
+
+Completion is gated on unresolved tool and verification errors. A failed command
+or test is returned as an error observation to the model, which may revise its
+approach and continue. Repeated identical tool calls and repeated failures stop
+as `blocked`; configured turn, token, runtime, and known-cost limits stop as
+`resource_limit_reached`; explicit `[USER_INPUT_REQUIRED]` and `[BLOCKED]`
+prefixes let the model request a decision or report an impossible task. A task
+is `done` only after the model returns a final response with no outstanding
+runtime-recorded errors. Cost stays unknown unless the provider supplies both
+token usage and trustworthy pricing metadata.
+
+Agent safeguards can be tuned in the runtime environment with
+`COGITO_AGENT_MAX_TURNS`, `COGITO_AGENT_MAX_TOOL_CALLS`,
+`COGITO_AGENT_MAX_RUNTIME_SECONDS`, `COGITO_AGENT_MAX_MODEL_TOKENS`,
+`COGITO_AGENT_MAX_COST_USD`, `COGITO_AGENT_MAX_REPEATED_TOOL_CALLS`, and
+`COGITO_AGENT_MAX_REPEATED_FAILURES`. Invalid values fall back to defaults.
+
 ## Dependency direction
 
 The workspace separates contracts, capabilities, and composition. Dependencies

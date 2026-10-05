@@ -132,8 +132,17 @@ impl Tool for ShellTool {
             output.push_str("\nprocess timed out");
         } else if result.cancelled {
             output.push_str("\nprocess cancelled");
+        } else if !result.success {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&format!(
+                "command failed with exit code {:?}",
+                result.exit_code
+            ));
         }
         let mut tool_result = ToolResult::new(output);
+        tool_result.is_error = !result.success;
         tool_result
             .metadata
             .insert("exit_code".to_owned(), json!(result.exit_code));

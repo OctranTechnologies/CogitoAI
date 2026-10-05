@@ -22,6 +22,9 @@ use harness_rpc::{
 };
 use harness_session::{EventBus, JsonlSessionStore, SessionStore};
 use harness_tools::{CancellationToken, ToolRegistry};
+use harness_verification::{
+    VerificationCategory, VerificationPlan, VerificationReport, VerificationRequest, Verifier,
+};
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
@@ -32,6 +35,32 @@ impl AgentRuntime for DummyAgent {
         Err(Error::InvalidRequest {
             reason: "the RPC agent runner is required".to_owned(),
         })
+    }
+}
+
+/// RPC loopback fixtures use a deterministic verifier so edit scenarios exercise
+/// the complete task lifecycle without spawning platform-specific processes.
+struct PassingVerifier;
+
+impl Verifier for PassingVerifier {
+    fn verify(
+        &self,
+        request: &VerificationRequest,
+    ) -> Result<Vec<VerificationReport>, harness_core::Error> {
+        Ok(request
+            .plan
+            .steps
+            .iter()
+            .map(|step| VerificationReport {
+                category: step.category,
+                command: format!("{} {}", step.command.program, step.command.args.join(" ")),
+                duration_ms: 0,
+                passed: true,
+                exit_code: Some(0),
+                output: "mock verification passed".to_owned(),
+                diagnostics: Vec::new(),
+            })
+            .collect())
     }
 }
 
@@ -93,7 +122,8 @@ fn setup(
         Arc::new(RpcApprovalHandler::new(approvals)),
     )
     .with_event_bus(event_bus)
-    .with_checkpoints(Arc::clone(&checkpoints));
+    .with_checkpoints(Arc::clone(&checkpoints))
+    .with_verifier(Arc::new(PassingVerifier));
     let runtime = Arc::new(
         Runtime::new(
             Arc::new(DummyAgent),
@@ -430,6 +460,16 @@ fn task(root: &Path, session: Option<SessionId>) -> AgentTask {
         system_instructions: "Use tools safely.".to_owned(),
         workspace: WorkspaceMetadata::default(),
         resume_session: session,
+        verification_plan: Some(VerificationPlan {
+            steps: vec![harness_verification::VerificationStep {
+                category: VerificationCategory::GeneralTest,
+                command: harness_core::CommandSpec {
+                    program: "mock-check".to_owned(),
+                    args: Vec::new(),
+                },
+                source: "deterministic RPC test fixture".to_owned(),
+            }],
+        }),
         ..AgentTask::default()
     }
 }
@@ -538,6 +578,9 @@ fn drives_a_complete_mock_session_through_rpc() {
                 assert_eq!(notification.params["run_id"], run_id);
                 completed = true;
                 break;
+            }
+            ServerMessage::Notification(notification) if notification.method == "agent.failed" => {
+                panic!("RPC agent run failed: {}", notification.params);
             }
             ServerMessage::Notification(_) | ServerMessage::Response(_) => {}
         }
@@ -660,6 +703,9 @@ fn exposes_checkpoints_file_views_and_diffs_and_restores_through_the_runtime() {
             {
                 completed = true;
                 break;
+            }
+            ServerMessage::Notification(notification) if notification.method == "agent.failed" => {
+                panic!("RPC agent run failed: {}", notification.params);
             }
             _ => {}
         }
@@ -1425,6 +1471,9 @@ fn approval_requests_are_resolved_by_the_client() {
                 assert_eq!(notification.params["run_id"], run_id);
                 completed = true;
                 break;
+            }
+            if notification.method == "agent.failed" {
+                panic!("RPC agent run failed: {}", notification.params);
             }
         }
     }

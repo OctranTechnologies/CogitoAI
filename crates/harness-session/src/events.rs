@@ -110,6 +110,8 @@ pub enum EventType {
     SessionResumed,
     #[serde(rename = "context.compacted")]
     ContextCompacted,
+    #[serde(rename = "task.run.updated")]
+    TaskRunUpdated,
     #[serde(rename = "session.completed")]
     SessionCompleted,
     #[serde(rename = "session.failed")]
@@ -127,6 +129,77 @@ pub struct CompactState {
     pub failed_attempts: Vec<String>,
     pub test_status: Vec<String>,
     pub remaining_work: Vec<String>,
+}
+
+/// Provider-neutral state for one coding task, persisted as snapshots in the
+/// session event log so clients can recover the runtime's current understanding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    #[default]
+    Understand,
+    Plan,
+    SearchRead,
+    Edit,
+    Verify,
+    InspectDiff,
+    Repair,
+    Finish,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCompletionStatus {
+    #[default]
+    InProgress,
+    Done,
+    Blocked,
+    UserInputRequired,
+    ResourceLimitReached,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskVerificationResult {
+    pub command: String,
+    pub category: String,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskRun {
+    pub original_goal: String,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub current_phase: TaskPhase,
+    #[serde(default)]
+    pub current_plan: Vec<String>,
+    #[serde(default)]
+    pub relevant_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub changed_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub commands_executed: Vec<String>,
+    #[serde(default)]
+    pub verification_results: Vec<TaskVerificationResult>,
+    #[serde(default)]
+    pub unresolved_errors: Vec<String>,
+    #[serde(default)]
+    pub remaining_work: Vec<String>,
+    #[serde(default)]
+    pub completion_status: TaskCompletionStatus,
+}
+
+impl TaskRun {
+    pub fn new(goal: impl Into<String>) -> Self {
+        Self {
+            original_goal: goal.into(),
+            ..Self::default()
+        }
+    }
 }
 
 impl CompactState {
@@ -280,6 +353,8 @@ pub enum EventPayload {
         #[serde(default)]
         state: CompactState,
     },
+    #[serde(rename = "task.run.updated")]
+    TaskRunUpdated { task_run: TaskRun },
     #[serde(rename = "session.completed")]
     SessionCompleted { reason: Option<String> },
     #[serde(rename = "session.failed")]
@@ -315,6 +390,7 @@ impl EventPayload {
             Self::VerificationResult { .. } => EventType::VerificationResult,
             Self::SessionResumed { .. } => EventType::SessionResumed,
             Self::ContextCompacted { .. } => EventType::ContextCompacted,
+            Self::TaskRunUpdated { .. } => EventType::TaskRunUpdated,
             Self::SessionCompleted { .. } => EventType::SessionCompleted,
             Self::SessionFailed { .. } => EventType::SessionFailed,
         }

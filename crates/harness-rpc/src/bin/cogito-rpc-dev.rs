@@ -100,7 +100,7 @@ impl AgentRunnerFactory for DevRunnerFactory {
                 policy,
                 Arc::clone(&self.sessions),
                 ContextBuilder::default(),
-                AgentLimits::default(),
+                AgentLimits::from_env(),
                 Arc::new(RpcApprovalHandler::new(Arc::clone(&self.approvals))),
             )
             .with_event_bus(self.event_bus.clone())
@@ -165,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&policy),
         Arc::clone(&sessions),
         ContextBuilder::default(),
-        AgentLimits::default(),
+        AgentLimits::from_env(),
         Arc::new(RpcApprovalHandler::new(Arc::clone(&approvals))),
     )
     .with_event_bus(event_bus.clone())

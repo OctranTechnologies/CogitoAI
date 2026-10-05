@@ -12,7 +12,8 @@ pub mod events;
 
 pub use bus::{EventBus, EventSubscriber, EventSubscription};
 pub use events::{
-    CompactState, EventId, EventPayload, EventType, FileChange, HarnessEvent, Timestamp,
+    CompactState, EventId, EventPayload, EventType, FileChange, HarnessEvent, TaskCompletionStatus,
+    TaskPhase, TaskRun, TaskVerificationResult, Timestamp,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -68,6 +69,8 @@ pub struct SessionState {
     pub context_compactions: usize,
     pub continuation: Option<CompactState>,
     pub working_messages: Vec<ConversationMessage>,
+    #[serde(default)]
+    pub task_run: Option<TaskRun>,
     pub last_event_id: Option<EventId>,
 }
 
@@ -451,6 +454,7 @@ pub fn reconstruct_state(
         context_compactions: 0,
         continuation: None,
         working_messages: Vec::new(),
+        task_run: None,
         last_event_id: None,
     };
     let mut terminal = false;
@@ -519,6 +523,9 @@ pub fn reconstruct_state(
                     .into_iter()
                     .rev()
                     .collect();
+            }
+            EventPayload::TaskRunUpdated { task_run } => {
+                state.task_run = Some(task_run.clone());
             }
             EventPayload::SessionResumed { .. } => {}
             EventPayload::SessionCompleted { .. } => {
