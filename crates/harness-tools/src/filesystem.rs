@@ -1,12 +1,14 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use globset::Glob;
 use harness_policy::{OperationKind, Permission};
 use regex::RegexBuilder;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{
     CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
@@ -14,9 +16,13 @@ use super::{
 };
 
 const MAX_FILE_BYTES: u64 = 256 * 1024;
+const MAX_EDIT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DIFF_BYTES: usize = 16 * 1024;
 const MAX_RESULTS: usize = 200;
 const MAX_SCAN_FILES: usize = 20_000;
 const MAX_SCAN_DEPTH: usize = 16;
+
+static EDIT_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct ShellTool {
     runner: Arc<dyn ProcessRunner>,
@@ -174,10 +180,14 @@ impl Tool for ReadFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".to_owned(),
-            description: "Read a UTF-8 text file from the workspace".to_owned(),
+            description: "Read a UTF-8 text file from the workspace. For a large file, request a bounded 1-based start_line/end_line range.".to_owned(),
             arguments_schema: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string" } },
+                "properties": {
+                    "path": { "type": "string" },
+                    "start_line": { "type": "integer", "minimum": 1 },
+                    "end_line": { "type": "integer", "minimum": 1 }
+                },
                 "required": ["path"],
                 "additionalProperties": false
             }),
@@ -199,14 +209,78 @@ impl Tool for ReadFileTool {
     ) -> Result<ToolResult, ToolError> {
         let path = required_path(&request, "read_file")?;
         let (root, resolved) = resolve_existing(context, &path, "read_file")?;
-        let text = read_text(&resolved, "read_file")?;
+        let start = request
+            .arguments
+            .get("start_line")
+            .map(|_| required_line(&request, "start_line", "read_file"))
+            .transpose()?;
+        let end = request
+            .arguments
+            .get("end_line")
+            .map(|_| required_line(&request, "end_line", "read_file"))
+            .transpose()?;
+        if start.is_some() != end.is_some() {
+            return Err(invalid_arguments(
+                "read_file",
+                "start_line and end_line must be provided together",
+            ));
+        }
+        let size = file_size(&resolved);
+        if size > MAX_FILE_BYTES && start.is_none() {
+            return Err(ToolError::FileTooLarge {
+                path: resolved,
+                limit: MAX_FILE_BYTES,
+            });
+        }
+        let read_limit = if start.is_some() {
+            MAX_EDIT_FILE_BYTES
+        } else {
+            MAX_FILE_BYTES
+        };
+        let (bytes, full_text) = read_text_snapshot(&resolved, "read_file", read_limit)?;
+        let text = if let (Some(start), Some(end)) = (start, end) {
+            if end < start {
+                return Err(invalid_arguments(
+                    "read_file",
+                    "end_line must be greater than or equal to start_line",
+                ));
+            }
+            let ranges = line_byte_ranges(&full_text);
+            if start > ranges.len() || end > ranges.len() {
+                return Err(invalid_arguments(
+                    "read_file",
+                    "requested line range is outside the file",
+                ));
+            }
+            let selected = &full_text[ranges[start - 1].0..ranges[end - 1].1];
+            if selected.len() as u64 > MAX_FILE_BYTES {
+                return Err(ToolError::FileTooLarge {
+                    path: resolved,
+                    limit: MAX_FILE_BYTES,
+                });
+            }
+            selected.to_owned()
+        } else {
+            full_text
+        };
         let mut result = ToolResult::new(text);
         result
             .metadata
             .insert("path".to_owned(), json!(relative_string(&root, &resolved)));
         result
             .metadata
-            .insert("bytes".to_owned(), json!(file_size(&resolved)));
+            .insert("bytes".to_owned(), json!(bytes.len()));
+        result
+            .metadata
+            .insert("revision".to_owned(), json!(content_revision(&bytes)));
+        if let Some(start) = start {
+            result
+                .metadata
+                .insert("start_line".to_owned(), json!(start));
+        }
+        if let Some(end) = end {
+            result.metadata.insert("end_line".to_owned(), json!(end));
+        }
         Ok(result)
     }
 }
@@ -217,12 +291,13 @@ impl Tool for WriteFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".to_owned(),
-            description: "Create or replace a UTF-8 text file in the workspace".to_owned(),
+            description: "Create or replace a UTF-8 text file atomically. If the file was read this session, its revision is checked before writing; prefer apply_patch or replace_text for focused edits.".to_owned(),
             arguments_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "content": { "type": "string" }
+                    "content": { "type": "string" },
+                    "expected_revision": { "type": "string", "description": "Revision returned by read_file; the runtime also supplies this automatically when available." }
                 },
                 "required": ["path", "content"],
                 "additionalProperties": false
@@ -244,23 +319,62 @@ impl Tool for WriteFileTool {
         request: ToolRequest,
     ) -> Result<ToolResult, ToolError> {
         let path = required_path(&request, "write_file")?;
-        let content = required_string(&request, "content", "write_file")?;
-        if content.len() as u64 > MAX_FILE_BYTES {
+        let content = required_text(&request, "content", "write_file")?;
+        if content.len() as u64 > MAX_EDIT_FILE_BYTES {
             return Err(ToolError::FileTooLarge {
                 path: PathBuf::from(path),
-                limit: MAX_FILE_BYTES,
+                limit: MAX_EDIT_FILE_BYTES,
             });
         }
-        let existed = context.working_directory.join(&path).exists();
         let (root, resolved) = resolve_for_write(context, &path, "write_file")?;
         if resolved.exists() && !resolved.is_file() {
             return Err(ToolError::NotFile { path: resolved });
         }
+        let _guard = EDIT_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = if resolved.exists() {
+            Some(load_editable(&resolved, "write_file")?)
+        } else {
+            None
+        };
+        let expected = optional_string(&request, "expected_revision", "")?;
+        if let (Some(original), true) = (&original, !expected.is_empty()) {
+            if content_revision(&original.raw) != expected {
+                return Ok(conflict_result(
+                    &root,
+                    &resolved,
+                    "stale",
+                    "The file changed after it was read. Read the latest contents before editing.",
+                ));
+            }
+        }
+        let expected_snapshot = original.as_ref().map(|value| value.raw.clone());
+        let existed = original.is_some();
+        let eol = original
+            .as_ref()
+            .map(|value| value.eol.as_str())
+            .unwrap_or("\n");
+        let bom = original.as_ref().is_some_and(|value| value.bom);
+        let content = encode_new_text(&content, eol, bom);
+        ensure_edit_not_cancelled(context)?;
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| io_error("create parent directory", error))?;
         }
-        fs::write(&resolved, &content).map_err(|error| io_error("write file", error))?;
+        let committed = if let Some(snapshot) = expected_snapshot.as_deref() {
+            atomic_replace(&resolved, Some(snapshot), content.as_bytes())?
+        } else {
+            atomic_create(&resolved, content.as_bytes())?
+        };
+        if !committed {
+            return Ok(conflict_result(
+                &root,
+                &resolved,
+                "concurrent_modification",
+                "The destination changed while the write was being prepared.",
+            ));
+        }
         context.emit(harness_session::EventPayload::FileChanged {
             path: resolved.clone(),
             change: if existed {
@@ -269,13 +383,8 @@ impl Tool for WriteFileTool {
                 harness_session::FileChange::Added
             },
         });
-        let mut result = ToolResult::new(format!("wrote {}", relative_string(&root, &resolved)));
-        result
-            .metadata
-            .insert("path".to_owned(), json!(relative_string(&root, &resolved)));
-        result
-            .metadata
-            .insert("bytes".to_owned(), json!(content.len()));
+        let old = original.as_ref().map(|value| value.raw.as_slice());
+        let mut result = edit_result(&root, &resolved, old, Some(content.as_bytes()), "wrote");
         result.changed_files.push(resolved);
         Ok(result)
     }
@@ -287,13 +396,14 @@ impl Tool for ApplyPatchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "apply_patch".to_owned(),
-            description: "Replace one exact source context in a UTF-8 workspace file".to_owned(),
+            description: "Apply a focused exact-context patch to a UTF-8 workspace file. Context must occur exactly once; stale revisions and ambiguous matches are rejected. Returns a bounded unified diff.".to_owned(),
             arguments_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
                     "old_text": { "type": "string", "minLength": 1 },
-                    "new_text": { "type": "string" }
+                    "new_text": { "type": "string" },
+                    "expected_revision": { "type": "string" }
                 },
                 "required": ["path", "old_text", "new_text"],
                 "additionalProperties": false
@@ -315,39 +425,296 @@ impl Tool for ApplyPatchTool {
         request: ToolRequest,
     ) -> Result<ToolResult, ToolError> {
         let path = required_path(&request, "apply_patch")?;
-        let old_text = required_string(&request, "old_text", "apply_patch")?;
-        let new_text = required_string(&request, "new_text", "apply_patch")?;
-        if old_text.is_empty() {
-            return Err(invalid_arguments(
-                "apply_patch",
-                "old_text must not be empty",
-            ));
+        replace_exact(context, &request, &path, "apply_patch")
+    }
+}
+
+pub struct CreateFileTool;
+
+impl Tool for CreateFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "create_file".to_owned(),
+            description:
+                "Create a new UTF-8 file atomically. Fails if the destination already exists."
+                    .to_owned(),
+            arguments_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path", "content"], "additionalProperties": false
+            }),
         }
-        let (root, resolved) = resolve_existing(context, &path, "apply_patch")?;
-        let source = read_text(&resolved, "apply_patch")?;
-        if source.matches(&old_text).count() != 1 {
-            return Err(ToolError::PatchConflict { path: resolved });
-        }
-        let updated = source.replacen(&old_text, &new_text, 1);
-        if updated.len() as u64 > MAX_FILE_BYTES {
+    }
+    fn required_permission(&self) -> Permission {
+        Permission::WriteWorkspace
+    }
+    fn operation(&self) -> OperationKind {
+        OperationKind::Write
+    }
+    fn execute(
+        &self,
+        context: &ToolContext<'_>,
+        request: ToolRequest,
+    ) -> Result<ToolResult, ToolError> {
+        let path = required_path(&request, "create_file")?;
+        let content = required_text(&request, "content", "create_file")?;
+        if content.len() as u64 > MAX_EDIT_FILE_BYTES {
             return Err(ToolError::FileTooLarge {
-                path: resolved,
-                limit: MAX_FILE_BYTES,
+                path: PathBuf::from(path),
+                limit: MAX_EDIT_FILE_BYTES,
             });
         }
-        fs::write(&resolved, updated).map_err(|error| io_error("apply patch", error))?;
+        let (root, resolved) = resolve_for_write(context, &path, "create_file")?;
+        let _guard = EDIT_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if resolved.exists() {
+            return Ok(conflict_result(
+                &root,
+                &resolved,
+                "stale",
+                "The destination already exists. Read it and use a focused edit instead.",
+            ));
+        }
+        ensure_edit_not_cancelled(context)?;
+        if let Some(parent) = resolved.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| io_error("create parent directory", error))?;
+        }
+        atomic_create(&resolved, content.as_bytes())?;
         context.emit(harness_session::EventPayload::FileChanged {
             path: resolved.clone(),
-            change: harness_session::FileChange::Modified,
+            change: harness_session::FileChange::Added,
         });
-        let mut result = ToolResult::new(format!("patched {}", relative_string(&root, &resolved)));
-        result
-            .metadata
-            .insert("path".to_owned(), json!(relative_string(&root, &resolved)));
-        result
-            .metadata
-            .insert("bytes".to_owned(), json!(file_size(&resolved)));
+        let mut result = edit_result(&root, &resolved, None, Some(content.as_bytes()), "created");
         result.changed_files.push(resolved);
+        Ok(result)
+    }
+}
+
+pub struct ReplaceTextTool;
+impl Tool for ReplaceTextTool {
+    fn spec(&self) -> ToolSpec {
+        let mut spec = ApplyPatchTool.spec();
+        spec.name = "replace_text".to_owned();
+        spec.description =
+            "Replace one exact text range. The old text must match exactly once.".to_owned();
+        spec
+    }
+    fn required_permission(&self) -> Permission {
+        Permission::WriteWorkspace
+    }
+    fn operation(&self) -> OperationKind {
+        OperationKind::Patch
+    }
+    fn execute(
+        &self,
+        context: &ToolContext<'_>,
+        request: ToolRequest,
+    ) -> Result<ToolResult, ToolError> {
+        let path = required_path(&request, "replace_text")?;
+        replace_exact(context, &request, &path, "replace_text")
+    }
+}
+
+pub struct ReplaceRangeTool;
+impl Tool for ReplaceRangeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "replace_range".to_owned(),
+            description: "Replace an inclusive 1-based line range after verifying expected_text. Use read_file revision to reject stale edits.".to_owned(),
+            arguments_schema: json!({
+                "type":"object","properties":{
+                    "path":{"type":"string"},"start_line":{"type":"integer","minimum":1},
+                    "end_line":{"type":"integer","minimum":1},"expected_text":{"type":"string"},
+                    "new_text":{"type":"string"},"expected_revision":{"type":"string"}
+                },"required":["path","start_line","end_line","expected_text","new_text"],"additionalProperties":false
+            }),
+        }
+    }
+    fn required_permission(&self) -> Permission {
+        Permission::WriteWorkspace
+    }
+    fn operation(&self) -> OperationKind {
+        OperationKind::Patch
+    }
+    fn execute(
+        &self,
+        context: &ToolContext<'_>,
+        request: ToolRequest,
+    ) -> Result<ToolResult, ToolError> {
+        let path = required_path(&request, "replace_range")?;
+        let start = required_line(&request, "start_line", "replace_range")?;
+        let end = required_line(&request, "end_line", "replace_range")?;
+        if end < start {
+            return Err(invalid_arguments(
+                "replace_range",
+                "end_line must be greater than or equal to start_line",
+            ));
+        }
+        let expected_text = required_text(&request, "expected_text", "replace_range")?;
+        let new_text = required_text(&request, "new_text", "replace_range")?;
+        let (root, resolved) = resolve_existing(context, &path, "replace_range")?;
+        let _guard = EDIT_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = load_editable(&resolved, "replace_range")?;
+        if let Some(conflict) = stale_revision(&request, &root, &resolved, &original) {
+            return Ok(conflict);
+        }
+        let (mapping_text, offsets) = normalized_offset_map(&original.text);
+        let lines = line_byte_ranges(&mapping_text);
+        if start > lines.len() || end > lines.len() {
+            return Ok(conflict_result(
+                &root,
+                &resolved,
+                "stale",
+                "The requested line range no longer exists.",
+            ));
+        }
+        let start_offset = lines[start - 1].0;
+        let end_offset = lines[end - 1].1;
+        let expected = normalize_eol(&expected_text);
+        if mapping_text.get(start_offset..end_offset) != Some(expected.as_str()) {
+            return Ok(conflict_result(&root, &resolved, "stale", "The selected lines differ from expected_text. Read the latest file before editing."));
+        }
+        let raw_start = offsets[start_offset];
+        let raw_end = offsets[end_offset];
+        let replacement = normalize_eol(&new_text).replace('\n', &original.eol);
+        let updated_text = format!(
+            "{}{}{}",
+            &original.text[..raw_start],
+            replacement,
+            &original.text[raw_end..]
+        );
+        commit_existing(
+            context,
+            &root,
+            &resolved,
+            original,
+            updated_text,
+            "replaced range",
+        )
+    }
+}
+
+pub struct DeleteFileTool;
+impl Tool for DeleteFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delete_file".to_owned(),
+            description: "Delete a workspace file after checking its read revision.".to_owned(),
+            arguments_schema: json!({"type":"object","properties":{"path":{"type":"string"},"expected_revision":{"type":"string"}},"required":["path"],"additionalProperties":false}),
+        }
+    }
+    fn required_permission(&self) -> Permission {
+        Permission::WriteWorkspace
+    }
+    fn operation(&self) -> OperationKind {
+        OperationKind::Write
+    }
+    fn execute(
+        &self,
+        context: &ToolContext<'_>,
+        request: ToolRequest,
+    ) -> Result<ToolResult, ToolError> {
+        let path = required_path(&request, "delete_file")?;
+        let (root, resolved) = resolve_existing(context, &path, "delete_file")?;
+        let _guard = EDIT_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = load_editable(&resolved, "delete_file")?;
+        if let Some(conflict) = stale_revision(&request, &root, &resolved, &original) {
+            return Ok(conflict);
+        }
+        if read_limited(&resolved, "verify delete", MAX_EDIT_FILE_BYTES)? != original.raw {
+            return Ok(conflict_result(
+                &root,
+                &resolved,
+                "concurrent_modification",
+                "The file changed during deletion. No change was made.",
+            ));
+        }
+        ensure_edit_not_cancelled(context)?;
+        fs::remove_file(&resolved).map_err(|error| io_error("delete file", error))?;
+        context.emit(harness_session::EventPayload::FileChanged {
+            path: resolved.clone(),
+            change: harness_session::FileChange::Deleted,
+        });
+        let mut result = edit_result(&root, &resolved, Some(&original.raw), None, "deleted");
+        result.changed_files.push(resolved);
+        Ok(result)
+    }
+}
+
+pub struct RenameFileTool;
+impl Tool for RenameFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "rename_file".to_owned(),
+            description:
+                "Move or rename a workspace file atomically. The destination must not exist."
+                    .to_owned(),
+            arguments_schema: json!({"type":"object","properties":{"source_path":{"type":"string"},"destination_path":{"type":"string"},"expected_revision":{"type":"string"}},"required":["source_path","destination_path"],"additionalProperties":false}),
+        }
+    }
+    fn required_permission(&self) -> Permission {
+        Permission::WriteWorkspace
+    }
+    fn operation(&self) -> OperationKind {
+        OperationKind::Write
+    }
+    fn execute(
+        &self,
+        context: &ToolContext<'_>,
+        request: ToolRequest,
+    ) -> Result<ToolResult, ToolError> {
+        let source = required_string(&request, "source_path", "rename_file")?;
+        let destination = required_string(&request, "destination_path", "rename_file")?;
+        let (root, from) = resolve_existing(context, &source, "rename_file")?;
+        let (_, to) = resolve_for_write(context, &destination, "rename_file")?;
+        if !from.is_file() {
+            return Err(ToolError::NotFile { path: from });
+        }
+        let _guard = EDIT_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = load_editable(&from, "rename_file")?;
+        if let Some(conflict) = stale_revision(&request, &root, &from, &original) {
+            return Ok(conflict);
+        }
+        if to.exists() {
+            return Ok(conflict_result(
+                &root,
+                &to,
+                "stale",
+                "The destination already exists.",
+            ));
+        }
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| io_error("create move destination", error))?;
+        }
+        if read_limited(&from, "verify move", MAX_EDIT_FILE_BYTES)? != original.raw {
+            return Ok(conflict_result(
+                &root,
+                &from,
+                "concurrent_modification",
+                "The source changed while preparing the move.",
+            ));
+        }
+        ensure_edit_not_cancelled(context)?;
+        fs::rename(&from, &to).map_err(|error| io_error("move file", error))?;
+        context.emit(harness_session::EventPayload::FileChanged {
+            path: from.clone(),
+            change: harness_session::FileChange::Deleted,
+        });
+        context.emit(harness_session::EventPayload::FileChanged {
+            path: to.clone(),
+            change: harness_session::FileChange::Added,
+        });
+        let mut result = rename_result(&root, &from, &to, &original.raw);
+        result.changed_files.extend([from, to]);
         Ok(result)
     }
 }
@@ -700,6 +1067,15 @@ fn required_string(request: &ToolRequest, key: &str, tool: &str) -> Result<Strin
         .ok_or_else(|| invalid_arguments(tool, &format!("{key} must be a non-empty string")))
 }
 
+fn required_text(request: &ToolRequest, key: &str, tool: &str) -> Result<String, ToolError> {
+    request
+        .arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_arguments(tool, &format!("{key} must be a string")))
+}
+
 fn optional_string(request: &ToolRequest, key: &str, default: &str) -> Result<String, ToolError> {
     request
         .arguments
@@ -829,27 +1205,526 @@ fn ensure_inside(root: &Path, path: &Path, requested: &str) -> Result<(), ToolEr
     }
 }
 
+struct EditableFile {
+    raw: Vec<u8>,
+    text: String,
+    bom: bool,
+    eol: String,
+}
+
+pub(crate) fn content_revision(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
+fn load_editable(path: &Path, tool: &str) -> Result<EditableFile, ToolError> {
+    let metadata = fs::metadata(path).map_err(|error| io_error("inspect editable file", error))?;
+    if !metadata.is_file() {
+        return Err(ToolError::NotFile {
+            path: path.to_path_buf(),
+        });
+    }
+    if metadata.len() > MAX_EDIT_FILE_BYTES {
+        return Err(ToolError::FileTooLarge {
+            path: path.to_path_buf(),
+            limit: MAX_EDIT_FILE_BYTES,
+        });
+    }
+    let raw = read_limited(path, tool, MAX_EDIT_FILE_BYTES)?;
+    if raw.contains(&0) {
+        return Err(ToolError::BinaryFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let bom = raw.starts_with(&[0xEF, 0xBB, 0xBF]);
+    let text_bytes = if bom { &raw[3..] } else { &raw[..] };
+    let text = String::from_utf8(text_bytes.to_vec()).map_err(|_| ToolError::BinaryFile {
+        path: path.to_path_buf(),
+    })?;
+    let crlf = text.matches("\r\n").count();
+    let lf = text
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .saturating_sub(crlf);
+    let eol = if crlf > 0 && crlf >= lf { "\r\n" } else { "\n" }.to_owned();
+    Ok(EditableFile {
+        raw,
+        text,
+        bom,
+        eol,
+    })
+}
+
+fn normalize_eol(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+fn encode_new_text(text: &str, eol: &str, bom: bool) -> String {
+    let normalized = normalize_eol(text);
+    let converted = if eol == "\r\n" {
+        normalized.replace('\n', "\r\n")
+    } else {
+        normalized
+    };
+    if bom {
+        format!("\u{feff}{converted}")
+    } else {
+        converted
+    }
+}
+
+/// Maps byte offsets in an LF-normalized string back to the original text.
+fn normalized_offset_map(text: &str) -> (String, Vec<usize>) {
+    let bytes = text.as_bytes();
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut offsets = Vec::with_capacity(bytes.len() + 1);
+    offsets.push(0);
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+            offsets.push(index);
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+            offsets.push(index);
+        }
+    }
+    (
+        String::from_utf8(normalized).expect("normalizing line endings preserves UTF-8"),
+        offsets,
+    )
+}
+
+fn line_byte_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let end = offset + line.len();
+        ranges.push((offset, end));
+        offset = end;
+    }
+    ranges
+}
+
+fn stale_revision(
+    request: &ToolRequest,
+    root: &Path,
+    path: &Path,
+    original: &EditableFile,
+) -> Option<ToolResult> {
+    let expected = request
+        .arguments
+        .get("expected_revision")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !expected.is_empty() && expected != content_revision(&original.raw) {
+        Some(conflict_result(
+            root,
+            path,
+            "stale",
+            "The file changed after it was read. Read the latest contents before editing.",
+        ))
+    } else {
+        None
+    }
+}
+
+fn replace_exact(
+    context: &ToolContext<'_>,
+    request: &ToolRequest,
+    relative: &str,
+    tool: &str,
+) -> Result<ToolResult, ToolError> {
+    let old_text = optional_string(request, "old_text", "")?;
+    let new_text = required_text(request, "new_text", tool)?;
+    if old_text.is_empty() {
+        return Err(invalid_arguments(tool, "old_text must not be empty"));
+    }
+    let (root, path) = resolve_existing(context, relative, tool)?;
+    let _guard = EDIT_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let original = load_editable(&path, tool)?;
+    if let Some(conflict) = stale_revision(request, &root, &path, &original) {
+        return Ok(conflict);
+    }
+    let (normalized, offsets) = normalized_offset_map(&original.text);
+    let old_normalized = normalize_eol(&old_text);
+    let matches = normalized
+        .match_indices(&old_normalized)
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(conflict_result(
+            &root,
+            &path,
+            "stale",
+            "Patch context no longer matches. Read the latest file before editing.",
+        ));
+    }
+    if matches.len() != 1 {
+        return Ok(conflict_result(
+            &root,
+            &path,
+            "ambiguous",
+            "Patch context matches more than once. Include more surrounding lines.",
+        ));
+    }
+    let start = matches[0];
+    let end = start + old_normalized.len();
+    let raw_start = offsets[start];
+    let raw_end = offsets[end];
+    let replacement = normalize_eol(&new_text).replace('\n', &original.eol);
+    let updated = format!(
+        "{}{}{}",
+        &original.text[..raw_start],
+        replacement,
+        &original.text[raw_end..]
+    );
+    commit_existing(context, &root, &path, original, updated, "patched")
+}
+
+fn commit_existing(
+    context: &ToolContext<'_>,
+    root: &Path,
+    path: &Path,
+    original: EditableFile,
+    updated_text: String,
+    verb: &str,
+) -> Result<ToolResult, ToolError> {
+    let bom_bytes = if original.bom { 3 } else { 0 };
+    if updated_text.len() as u64 + bom_bytes > MAX_EDIT_FILE_BYTES {
+        return Err(ToolError::FileTooLarge {
+            path: path.to_path_buf(),
+            limit: MAX_EDIT_FILE_BYTES,
+        });
+    }
+    ensure_edit_not_cancelled(context)?;
+    let new_text = encode_new_text(&updated_text, &original.eol, original.bom);
+    let new_bytes = new_text.as_bytes();
+    if !atomic_replace(path, Some(&original.raw), new_bytes)? {
+        return Ok(conflict_result(
+            root,
+            path,
+            "concurrent_modification",
+            "The file changed while the edit was being prepared. No edit was applied.",
+        ));
+    }
+    context.emit(harness_session::EventPayload::FileChanged {
+        path: path.to_path_buf(),
+        change: harness_session::FileChange::Modified,
+    });
+    let mut result = edit_result(root, path, Some(&original.raw), Some(new_bytes), verb);
+    result.changed_files.push(path.to_path_buf());
+    Ok(result)
+}
+
+fn ensure_edit_not_cancelled(context: &ToolContext<'_>) -> Result<(), ToolError> {
+    if context
+        .cancellation
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        Err(ToolError::Process {
+            message: "edit cancelled before commit".to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn atomic_replace(path: &Path, expected: Option<&[u8]>, bytes: &[u8]) -> Result<bool, ToolError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_arguments("edit", "target has no parent directory"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| io_error("create atomic temporary file", error))?;
+    temporary
+        .write_all(bytes)
+        .map_err(|error| io_error("write atomic temporary file", error))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| io_error("flush atomic temporary file", error))?;
+    if let Ok(metadata) = fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(|error| io_error("preserve file permissions", error))?;
+    }
+    if let Some(expected) = expected {
+        match read_limited(path, "verify atomic edit", MAX_EDIT_FILE_BYTES) {
+            Ok(current) if current == expected => {}
+            _ => return Ok(false),
+        }
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| io_error("atomically replace file", error.error))?;
+    Ok(true)
+}
+
+fn atomic_create(path: &Path, bytes: &[u8]) -> Result<bool, ToolError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_arguments("create_file", "target has no parent directory"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| io_error("create atomic temporary file", error))?;
+    temporary
+        .write_all(bytes)
+        .map_err(|error| io_error("write atomic temporary file", error))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| io_error("flush atomic temporary file", error))?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(io_error("atomically create file", error.error)),
+    }
+}
+
+fn conflict_result(root: &Path, path: &Path, status: &str, detail: &str) -> ToolResult {
+    let relative = relative_string(root, path);
+    let mut result = ToolResult::new(format!("Edit conflict ({status}) for {relative}: {detail}"));
+    result.is_error = true;
+    result.metadata.insert("file".to_owned(), json!(relative));
+    result.metadata.insert("lines_changed".to_owned(), json!(0));
+    result.metadata.insert("insertions".to_owned(), json!(0));
+    result.metadata.insert("deletions".to_owned(), json!(0));
+    result
+        .metadata
+        .insert("conflict_status".to_owned(), json!(status));
+    result
+        .metadata
+        .insert("diagnostics".to_owned(), json!({"status":"not_run"}));
+    result
+}
+
+fn edit_result(
+    root: &Path,
+    path: &Path,
+    old: Option<&[u8]>,
+    new: Option<&[u8]>,
+    verb: &str,
+) -> ToolResult {
+    let relative = relative_string(root, path);
+    let (diff, insertions, deletions, truncated) = unified_diff(&relative, &relative, old, new);
+    let mut result = ToolResult::new(format!("{verb} {relative}\n{diff}"));
+    result.truncated = truncated;
+    result.metadata.insert("file".to_owned(), json!(relative));
+    result
+        .metadata
+        .insert("lines_changed".to_owned(), json!(insertions.max(deletions)));
+    result
+        .metadata
+        .insert("insertions".to_owned(), json!(insertions));
+    result
+        .metadata
+        .insert("deletions".to_owned(), json!(deletions));
+    result
+        .metadata
+        .insert("conflict_status".to_owned(), json!("none"));
+    result.metadata.insert("diff".to_owned(), json!(diff));
+    result
+        .metadata
+        .insert("diff_truncated".to_owned(), json!(truncated));
+    result
+        .metadata
+        .insert("bytes".to_owned(), json!(new.map_or(0, <[u8]>::len)));
+    if let Some(new) = new {
+        result
+            .metadata
+            .insert("revision".to_owned(), json!(content_revision(new)));
+    }
+    result
+}
+
+fn rename_result(root: &Path, from: &Path, to: &Path, contents: &[u8]) -> ToolResult {
+    let old_name = relative_string(root, from);
+    let new_name = relative_string(root, to);
+    let _ = contents;
+    let diff = format!("--- a/{old_name}\n+++ b/{new_name}\n");
+    let (diff, _, _, truncated) = bound_diff(diff);
+    let mut result = ToolResult::new(format!("moved {old_name} → {new_name}\n{diff}"));
+    result.truncated = truncated;
+    result.metadata.insert("file".to_owned(), json!(new_name));
+    result
+        .metadata
+        .insert("old_file".to_owned(), json!(old_name));
+    result.metadata.insert("lines_changed".to_owned(), json!(0));
+    result.metadata.insert("insertions".to_owned(), json!(0));
+    result.metadata.insert("deletions".to_owned(), json!(0));
+    result
+        .metadata
+        .insert("conflict_status".to_owned(), json!("none"));
+    result.metadata.insert("diff".to_owned(), json!(diff));
+    result
+        .metadata
+        .insert("diff_truncated".to_owned(), json!(truncated));
+    result
+        .metadata
+        .insert("revision".to_owned(), json!(content_revision(contents)));
+    result
+}
+
+fn unified_diff(
+    path_old: &str,
+    path_new: &str,
+    old: Option<&[u8]>,
+    new: Option<&[u8]>,
+) -> (String, usize, usize, bool) {
+    let old_text = old
+        .map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .trim_start_matches('\u{feff}')
+                .to_owned()
+        })
+        .unwrap_or_default();
+    let new_text = new
+        .map(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .trim_start_matches('\u{feff}')
+                .to_owned()
+        })
+        .unwrap_or_default();
+    let old_lines = normalize_eol(&old_text)
+        .split_inclusive('\n')
+        .map(|line| line.trim_end_matches('\n').to_owned())
+        .collect::<Vec<_>>();
+    let new_lines = normalize_eol(&new_text)
+        .split_inclusive('\n')
+        .map(|line| line.trim_end_matches('\n').to_owned())
+        .collect::<Vec<_>>();
+    let mut prefix = 0;
+    while prefix < old_lines.len().min(new_lines.len()) && old_lines[prefix] == new_lines[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix
+        < old_lines
+            .len()
+            .saturating_sub(prefix)
+            .min(new_lines.len().saturating_sub(prefix))
+        && old_lines[old_lines.len() - suffix - 1] == new_lines[new_lines.len() - suffix - 1]
+    {
+        suffix += 1;
+    }
+    let old_end = old_lines.len().saturating_sub(suffix);
+    let new_end = new_lines.len().saturating_sub(suffix);
+    let deletions = old_end.saturating_sub(prefix);
+    let insertions = new_end.saturating_sub(prefix);
+    let start = prefix.saturating_sub(3);
+    let old_hunk_end = (old_end + 3).min(old_lines.len());
+    let new_hunk_end = (new_end + 3).min(new_lines.len());
+    let old_count = old_hunk_end.saturating_sub(start);
+    let new_count = new_hunk_end.saturating_sub(start);
+    let old_header = if old.is_some() {
+        format!("a/{path_old}")
+    } else {
+        "/dev/null".to_owned()
+    };
+    let new_header = if new.is_some() {
+        format!("b/{path_new}")
+    } else {
+        "/dev/null".to_owned()
+    };
+    let mut diff = format!("--- {old_header}\n+++ {new_header}\n");
+    if old_lines != new_lines {
+        diff.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            start + 1,
+            old_count,
+            start + 1,
+            new_count
+        ));
+        for line in &old_lines[start..prefix] {
+            diff.push_str(&format!(" {line}\n"));
+        }
+        for line in &old_lines[prefix..old_end] {
+            diff.push_str(&format!("-{line}\n"));
+        }
+        for line in &new_lines[prefix..new_end] {
+            diff.push_str(&format!("+{line}\n"));
+        }
+        for line in &old_lines[old_end..old_hunk_end] {
+            diff.push_str(&format!(" {line}\n"));
+        }
+    }
+    let (diff, _, _, truncated) = bound_diff(diff);
+    (diff, insertions, deletions, truncated)
+}
+
+fn bound_diff(mut diff: String) -> (String, usize, usize, bool) {
+    if diff.len() <= MAX_DIFF_BYTES {
+        return (diff, 0, 0, false);
+    }
+    let mut end = MAX_DIFF_BYTES;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    diff.truncate(end);
+    diff.push_str(
+        "\n... unified diff truncated; inspect the file or run git diff for the full change ...\n",
+    );
+    (diff, 0, 0, true)
+}
+
+fn required_line(request: &ToolRequest, key: &str, tool: &str) -> Result<usize, ToolError> {
+    request
+        .arguments
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| invalid_arguments(tool, &format!("{key} must be a positive integer")))
+}
+
 fn read_text(path: &Path, tool: &str) -> Result<String, ToolError> {
+    read_text_snapshot(path, tool, MAX_FILE_BYTES).map(|(_, text)| text)
+}
+
+fn read_text_snapshot(path: &Path, tool: &str, limit: u64) -> Result<(Vec<u8>, String), ToolError> {
     if !path.is_file() {
         return Err(ToolError::NotFile {
             path: path.to_path_buf(),
         });
     }
-    if file_size(path) > MAX_FILE_BYTES {
+    if file_size(path) > limit {
         return Err(ToolError::FileTooLarge {
             path: path.to_path_buf(),
-            limit: MAX_FILE_BYTES,
+            limit,
         });
     }
-    let bytes = fs::read(path).map_err(|error| io_error(&format!("read {tool} file"), error))?;
+    let bytes = read_limited(path, tool, limit)?;
     if bytes.contains(&0) {
         return Err(ToolError::BinaryFile {
             path: path.to_path_buf(),
         });
     }
-    String::from_utf8(bytes).map_err(|_| ToolError::BinaryFile {
+    let text = String::from_utf8(bytes.clone()).map_err(|_| ToolError::BinaryFile {
         path: path.to_path_buf(),
-    })
+    })?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
+    Ok((bytes, text))
+}
+
+fn read_limited(path: &Path, tool: &str, limit: u64) -> Result<Vec<u8>, ToolError> {
+    let file =
+        fs::File::open(path).map_err(|error| io_error(&format!("read {tool} file"), error))?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(&format!("read {tool} file"), error))?;
+    if bytes.len() as u64 > limit {
+        return Err(ToolError::FileTooLarge {
+            path: path.to_path_buf(),
+            limit,
+        });
+    }
+    Ok(bytes)
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -921,5 +1796,23 @@ fn truncate_line(line: &str) -> &str {
             end -= 1;
         }
         &line[..end]
+    }
+}
+
+#[cfg(test)]
+mod editing_engine_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn atomic_commit_rejects_a_concurrent_external_change() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("source.txt");
+        fs::write(&path, "read version\n").unwrap();
+        let snapshot = fs::read(&path).unwrap();
+        fs::write(&path, "concurrent version\n").unwrap();
+
+        assert!(!atomic_replace(&path, Some(&snapshot), b"agent version\n").unwrap());
+        assert_eq!(fs::read_to_string(path).unwrap(), "concurrent version\n");
     }
 }

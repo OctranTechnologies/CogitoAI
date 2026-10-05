@@ -128,9 +128,10 @@ change, not a refactor.
    response payload, an event, or a log line.
 5. **Sessions are append-only.** Add new event variants rather than mutating or
    removing existing ones, and keep `schema_version` handling in mind.
-6. **Every privileged operation is event-sourced and checkpointed.** If a tool
-   mutates a file, the agent must record it with `record_harness_change`
-   immediately, or undo cannot attribute it.
+6. **Every privileged operation is event-sourced and checkpointed.** The task
+   checkpoint is created before the first tool call; after a file edit, the agent
+   records each changed path with `record_harness_change` immediately, or undo
+   cannot attribute it.
 
 ## Adding a model provider
 
@@ -239,6 +240,20 @@ Successful filesystem writes call `update_changed` before returning to the next
 model turn. Add fixtures for each language parser or package-manifest shape you
 change, and verify that a renamed/removed declaration disappears from the next
 query.
+
+The standard editing tools share a bounded atomic edit path. `read_file` returns
+a SHA-256 revision, and the registry carries the latest revision for that
+session and path into later edits. `create_file`, `apply_patch`, `replace_text`,
+`replace_range`, `write_file`, `delete_file`, and `rename_file` all resolve paths
+inside the open workspace. Existing-file replacements stage a same-directory
+temporary file and commit only if the source snapshot is still current. Exact
+patches reject missing or repeated context. UTF-8 BOMs and CRLF/LF line endings
+are preserved; binary files and files above the 8 MiB edit limit are rejected.
+Results include bounded unified diffs and insertion/deletion counts, and the
+repository index is refreshed before the next model turn. For Rust, TypeScript,
+JavaScript, and Python files, a best-effort language-server diagnostic request
+uses a short startup/response budget; unavailable or slow servers never roll
+back a successful edit.
 
 The index currently uses deterministic declaration patterns rather than a
 Tree-sitter grammar. Keep extraction explicitly approximate, and prefer an LSP

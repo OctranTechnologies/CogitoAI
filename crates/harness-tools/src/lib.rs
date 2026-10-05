@@ -5,7 +5,7 @@ mod repository_index;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use harness_core::{Error, Id, SessionId};
 use harness_policy::{OperationKind, Permission, Policy, PolicyDecision, PolicyRequest};
@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
 pub use filesystem::{
-    ApplyPatchTool, GlobTool, GrepTool, ListDirectoryTool, ReadFileTool, ShellTool, WriteFileTool,
+    ApplyPatchTool, CreateFileTool, DeleteFileTool, GlobTool, GrepTool, ListDirectoryTool,
+    ReadFileTool, RenameFileTool, ReplaceRangeTool, ReplaceTextTool, ShellTool, WriteFileTool,
 };
 pub use process::{
     CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
@@ -137,6 +138,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     repository_index: Option<Arc<RepositoryIndexService>>,
+    read_revisions: Mutex<BTreeMap<String, String>>,
 }
 
 impl ToolRegistry {
@@ -151,8 +153,13 @@ impl ToolRegistry {
     pub fn with_workspace_tools_cancellation(cancellation: CancellationToken) -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(ReadFileTool));
+        registry.register(Box::new(CreateFileTool));
         registry.register(Box::new(WriteFileTool));
         registry.register(Box::new(ApplyPatchTool));
+        registry.register(Box::new(ReplaceTextTool));
+        registry.register(Box::new(ReplaceRangeTool));
+        registry.register(Box::new(DeleteFileTool));
+        registry.register(Box::new(RenameFileTool));
         registry.register(Box::new(ListDirectoryTool));
         registry.register(Box::new(GlobTool));
         registry.register(Box::new(GrepTool));
@@ -184,7 +191,7 @@ impl ToolRegistry {
     pub fn execute(
         &self,
         context: &ToolContext<'_>,
-        request: ToolRequest,
+        mut request: ToolRequest,
     ) -> Result<ToolResult, Error> {
         let tool_name = request.name.clone();
         context.emit(EventPayload::ToolRequested {
@@ -202,6 +209,7 @@ impl ToolRegistry {
             });
             return Err(error);
         };
+        self.attach_read_revision(context, &tool_name, &mut request);
         let policy_request = build_policy_request(context, &tool_name, tool.as_ref(), &request);
         let evaluation = context.policy.evaluate(&policy_request);
         context.emit(EventPayload::PolicyDecision {
@@ -230,6 +238,51 @@ impl ToolRegistry {
                 });
             }
             PolicyDecision::Allow => {
+                if tool_name == "rename_file" {
+                    let destination_request = build_policy_request_for_path(
+                        context,
+                        &tool_name,
+                        tool.as_ref(),
+                        request
+                            .arguments
+                            .get("destination_path")
+                            .and_then(serde_json::Value::as_str),
+                    );
+                    let destination_evaluation = context.policy.evaluate(&destination_request);
+                    context.emit(EventPayload::PolicyDecision {
+                        tool: tool_name.clone(),
+                        action: destination_evaluation.decision.to_string(),
+                        reason: destination_evaluation.reason.clone(),
+                        rule: destination_evaluation.rule.clone(),
+                        operation: destination_request.operation_name().to_owned(),
+                        mode: format!("{:?}", destination_request.mode).to_ascii_lowercase(),
+                    });
+                    match destination_evaluation.decision {
+                        PolicyDecision::Deny => {
+                            let error = Error::PermissionDenied {
+                                capability: format!(
+                                    "{} destination",
+                                    destination_request.operation_name()
+                                ),
+                            };
+                            context.emit(EventPayload::ToolDenied {
+                                tool: tool_name,
+                                reason: error.to_string(),
+                            });
+                            return Err(error);
+                        }
+                        PolicyDecision::Ask => {
+                            return Err(Error::PermissionRequired {
+                                capability: format!(
+                                    "{} destination",
+                                    destination_request.operation_name()
+                                ),
+                                reason: destination_evaluation.reason,
+                            });
+                        }
+                        PolicyDecision::Allow => {}
+                    }
+                }
                 context.emit(EventPayload::ToolApproved {
                     tool: tool_name.clone(),
                     reason: Some(evaluation.rule),
@@ -241,7 +294,8 @@ impl ToolRegistry {
         });
         let result = tool.execute(context, request);
         match result {
-            Ok(result) => {
+            Ok(mut result) => {
+                self.update_read_revisions(context, &tool_name, &result);
                 if !result.changed_files.is_empty() {
                     if let Some(index) = &self.repository_index {
                         // A successful write updates the in-memory index before
@@ -249,6 +303,56 @@ impl ToolRegistry {
                         // still lazily rebuild the index if this update fails.
                         let _ =
                             index.update_changed(context.working_directory, &result.changed_files);
+                        let diagnostic_path = result.changed_files.iter().find(|path| {
+                            path.is_file()
+                                && matches!(
+                                    path.extension().and_then(|extension| extension.to_str()),
+                                    Some("rs" | "ts" | "tsx" | "js" | "jsx" | "py")
+                                )
+                        });
+                        if let Some(path) = diagnostic_path {
+                            let workspace = fs::canonicalize(context.working_directory)
+                                .unwrap_or_else(|_| context.working_directory.to_path_buf());
+                            let relative = path
+                                .strip_prefix(&workspace)
+                                .unwrap_or(path)
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            let diagnostic_tool = RepositoryTool::new(
+                                RepositoryAction::GetDiagnostics,
+                                Arc::clone(index),
+                            );
+                            let diagnostic = diagnostic_tool.execute(
+                                context,
+                                ToolRequest::new(
+                                    "get_diagnostics",
+                                    serde_json::json!({"path": relative, "quick": true}),
+                                ),
+                            );
+                            let detail = diagnostic
+                                .map(|diagnostic| diagnostic.output)
+                                .unwrap_or_else(|error| {
+                                    format!("Quick diagnostics unavailable: {error}")
+                                });
+                            result.metadata.insert(
+                                "diagnostics".to_owned(),
+                                serde_json::json!({"status":"best_effort","detail":detail}),
+                            );
+                            if !detail.is_empty() {
+                                result.output.push_str("\nDiagnostics: ");
+                                result
+                                    .output
+                                    .push_str(&detail.chars().take(1_500).collect::<String>());
+                            }
+                        } else {
+                            result.metadata.insert(
+                                "diagnostics".to_owned(),
+                                serde_json::json!({
+                                    "status": "repository_index_refreshed",
+                                    "detail": "Changed files are ready for symbol and outline queries."
+                                }),
+                            );
+                        }
                     }
                 }
                 context.emit(EventPayload::ToolOutput {
@@ -298,6 +402,114 @@ impl ToolRegistry {
             .find(|tool| tool.spec().name == name)
             .map(|tool| tool.operation())
     }
+
+    fn revision_key(&self, context: &ToolContext<'_>, path: &str) -> String {
+        let workspace = fs::canonicalize(context.working_directory)
+            .unwrap_or_else(|_| context.working_directory.to_path_buf());
+        let session = context
+            .session_id
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let path = path.replace('\\', "/");
+        #[cfg(windows)]
+        let path = path.to_ascii_lowercase();
+        format!("{}\0{session}\0{path}", workspace.to_string_lossy())
+    }
+
+    fn attach_read_revision(
+        &self,
+        context: &ToolContext<'_>,
+        tool_name: &str,
+        request: &mut ToolRequest,
+    ) {
+        if !matches!(
+            tool_name,
+            "write_file"
+                | "apply_patch"
+                | "replace_text"
+                | "replace_range"
+                | "delete_file"
+                | "rename_file"
+        ) {
+            return;
+        }
+        let Some(arguments) = request.arguments.as_object_mut() else {
+            return;
+        };
+        if arguments.contains_key("expected_revision") {
+            return;
+        }
+        let source = if tool_name == "rename_file" {
+            arguments.get("source_path")
+        } else {
+            arguments.get("path")
+        }
+        .and_then(serde_json::Value::as_str);
+        let Some(source) = source else { return };
+        let key = self.revision_key(context, source);
+        if let Some(revision) = self
+            .read_revisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+        {
+            arguments.insert("expected_revision".to_owned(), serde_json::json!(revision));
+        }
+    }
+
+    fn update_read_revisions(
+        &self,
+        context: &ToolContext<'_>,
+        tool_name: &str,
+        result: &ToolResult,
+    ) {
+        if result.is_error {
+            return;
+        }
+        let mut revisions = self
+            .read_revisions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tool_name == "read_file" {
+            if let (Some(path), Some(revision)) = (
+                result
+                    .metadata
+                    .get("path")
+                    .and_then(serde_json::Value::as_str),
+                result
+                    .metadata
+                    .get("revision")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                revisions.insert(self.revision_key(context, path), revision.to_owned());
+            }
+            return;
+        }
+        if let Some(path) = result
+            .metadata
+            .get("old_file")
+            .and_then(serde_json::Value::as_str)
+        {
+            revisions.remove(&self.revision_key(context, path));
+        }
+        if let Some(path) = result
+            .metadata
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+        {
+            let key = self.revision_key(context, path);
+            if let Some(revision) = result
+                .metadata
+                .get("revision")
+                .and_then(serde_json::Value::as_str)
+            {
+                revisions.insert(key, revision.to_owned());
+            } else {
+                revisions.remove(&key);
+            }
+        }
+    }
 }
 
 fn build_policy_request(
@@ -330,6 +542,25 @@ fn build_policy_request(
         workspace_root,
         path,
         command,
+        mode: context.policy.mode(),
+    }
+}
+
+fn build_policy_request_for_path(
+    context: &ToolContext<'_>,
+    tool_name: &str,
+    tool: &dyn Tool,
+    relative_path: Option<&str>,
+) -> PolicyRequest {
+    let workspace_root = fs::canonicalize(context.working_directory)
+        .unwrap_or_else(|_| context.working_directory.to_path_buf());
+    let path = relative_path.map(|path| workspace_root.join(path));
+    PolicyRequest {
+        tool_name: tool_name.to_owned(),
+        operation: tool.operation(),
+        workspace_root,
+        path,
+        command: None,
         mode: context.policy.mode(),
     }
 }

@@ -578,7 +578,7 @@ impl Tool for RepositoryTool {
             RepositoryAction::GetDiagnostics => (
                 "get_diagnostics",
                 "Request file diagnostics from a supported language-server executable when available",
-                json!({"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}),
+                json!({"type":"object","properties":{"path":{"type":"string"},"quick":{"type":"boolean"}},"additionalProperties":false}),
             ),
             RepositoryAction::GetFileOutline => (
                 "get_file_outline",
@@ -658,8 +658,19 @@ impl RepositoryTool {
         let contents = fs::read_to_string(&source)
             .map_err(|error| index_io_error("read diagnostic file", error))?;
         let language = language_for(&source).unwrap_or_default();
-        let diagnostics =
-            query_language_server(&root, &source, &language, &contents, context.cancellation)?;
+        let quick = request
+            .arguments
+            .get("quick")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let diagnostics = query_language_server(
+            &root,
+            &source,
+            &language,
+            &contents,
+            context.cancellation,
+            quick,
+        )?;
         Ok(ToolResult::new(diagnostics))
     }
 
@@ -807,6 +818,7 @@ fn query_language_server(
     language: &str,
     contents: &str,
     cancellation: Option<&CancellationToken>,
+    quick: bool,
 ) -> Result<String, ToolError> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return Err(ToolError::Process {
@@ -869,7 +881,24 @@ fn query_language_server(
         contents,
         cancellation,
     };
-    let startup_result = initialize_lsp(program, &mut stdin, &receiver, &document);
+    let startup_timeout = if quick {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_secs(5)
+    };
+    let diagnostics_timeout = if quick {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_secs(4)
+    };
+    let startup_result = initialize_lsp(
+        program,
+        &mut stdin,
+        &receiver,
+        &document,
+        startup_timeout,
+        diagnostics_timeout,
+    );
     let response = match startup_result {
         Ok(response) => response,
         Err(message) => {
@@ -900,6 +929,8 @@ fn initialize_lsp(
     stdin: &mut ChildStdin,
     receiver: &Receiver<Value>,
     document: &LspDocument<'_>,
+    startup_timeout: Duration,
+    diagnostics_timeout: Duration,
 ) -> Result<String, String> {
     let root_uri = file_uri(document.root);
     send_lsp_message(
@@ -919,7 +950,7 @@ fn initialize_lsp(
             }
         }),
     )?;
-    let init_deadline = Instant::now() + Duration::from_secs(5);
+    let init_deadline = Instant::now() + startup_timeout;
     loop {
         let message = receive_lsp(receiver, init_deadline, document.cancellation)?;
         if message.get("id").and_then(Value::as_i64) == Some(1) {
@@ -951,7 +982,7 @@ fn initialize_lsp(
             "params":{"textDocument":{"uri":document.uri}}
         }),
     )?;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + diagnostics_timeout;
     loop {
         let message = match receive_lsp(receiver, deadline, document.cancellation) {
             Ok(message) => message,
@@ -2123,6 +2154,7 @@ mod tests {
             "rust",
             "",
             Some(&cancellation),
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("diagnostics request cancelled"));

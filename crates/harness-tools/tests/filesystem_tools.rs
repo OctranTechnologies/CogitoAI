@@ -55,7 +55,9 @@ fn reads_writes_patches_lists_globs_and_greps() {
         json!({ "path": "notes.txt", "content": "alpha\nbeta\n" }),
     )
     .unwrap();
-    assert_eq!(write.output, "wrote notes.txt");
+    assert!(write.output.starts_with("wrote notes.txt\n--- /dev/null"));
+    assert_eq!(write.metadata["conflict_status"], "none");
+    assert_eq!(write.metadata["insertions"], 2);
     assert_eq!(write.changed_files.len(), 1);
 
     let patch = execute(
@@ -65,7 +67,12 @@ fn reads_writes_patches_lists_globs_and_greps() {
         json!({ "path": "notes.txt", "old_text": "alpha", "new_text": "gamma" }),
     )
     .unwrap();
-    assert_eq!(patch.output, "patched notes.txt");
+    assert!(patch
+        .output
+        .starts_with("patched notes.txt\n--- a/notes.txt"));
+    assert_eq!(patch.metadata["conflict_status"], "none");
+    assert_eq!(patch.metadata["insertions"], 1);
+    assert_eq!(patch.metadata["deletions"], 1);
     assert_eq!(
         fs::read_to_string(workspace.join("notes.txt")).unwrap(),
         "gamma\nbeta\n"
@@ -116,8 +123,9 @@ fn rejects_patch_conflicts_missing_files_and_path_traversal() {
         "apply_patch",
         json!({ "path": "file.txt", "old_text": "missing", "new_text": "value" }),
     )
-    .unwrap_err();
-    assert!(conflict.to_string().contains("patch context did not match"));
+    .unwrap();
+    assert!(conflict.is_error);
+    assert_eq!(conflict.metadata["conflict_status"], "stale");
 
     let missing = execute(
         &registry,
@@ -344,8 +352,13 @@ fn emits_file_change_lifecycle_events() {
         registry.names(),
         vec![
             "read_file",
+            "create_file",
             "write_file",
             "apply_patch",
+            "replace_text",
+            "replace_range",
+            "delete_file",
+            "rename_file",
             "list_directory",
             "glob",
             "grep",
@@ -478,6 +491,20 @@ fn every_mutable_tool_is_checked_by_policy() {
             "apply_patch",
             json!({ "path": "file.txt", "old_text": "before", "new_text": "after" }),
         ),
+        request("create_file", json!({"path":"new.txt","content":""})),
+        request(
+            "replace_text",
+            json!({"path":"file.txt","old_text":"before","new_text":"after"}),
+        ),
+        request(
+            "replace_range",
+            json!({"path":"file.txt","start_line":1,"end_line":1,"expected_text":"before","new_text":"after"}),
+        ),
+        request("delete_file", json!({"path":"file.txt"})),
+        request(
+            "rename_file",
+            json!({"source_path":"file.txt","destination_path":"other.txt"}),
+        ),
         request("shell", json!({ "command": "echo denied" })),
     ];
 
@@ -491,4 +518,303 @@ fn every_mutable_tool_is_checked_by_policy() {
         fs::read_to_string(workspace.join("file.txt")).unwrap(),
         "before"
     );
+}
+
+#[test]
+fn detects_a_stale_revision_even_when_the_patch_text_is_still_present() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    fs::write(root.join("source.txt"), "keep this line\nold value\n").unwrap();
+    let registry = ToolRegistry::with_workspace_tools();
+    execute(&registry, root, "read_file", json!({"path":"source.txt"})).unwrap();
+    fs::write(
+        root.join("source.txt"),
+        "keep this line\nold value\nexternal update\n",
+    )
+    .unwrap();
+
+    let result = execute(
+        &registry,
+        root,
+        "apply_patch",
+        json!({"path":"source.txt","old_text":"old value","new_text":"new value"}),
+    )
+    .unwrap();
+    assert!(result.is_error);
+    assert_eq!(result.metadata["conflict_status"], "stale");
+    assert_eq!(
+        fs::read_to_string(root.join("source.txt")).unwrap(),
+        "keep this line\nold value\nexternal update\n"
+    );
+}
+
+#[test]
+fn sequential_edits_refresh_the_session_revision() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    fs::write(root.join("source.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+    let registry = ToolRegistry::with_workspace_tools();
+    execute(&registry, root, "read_file", json!({"path":"source.rs"})).unwrap();
+    let broken = execute(
+        &registry,
+        root,
+        "write_file",
+        json!({"path":"source.rs","content":"BROKEN pub fn value() -> u32 { 2 }\n"}),
+    )
+    .unwrap();
+    assert!(!broken.is_error, "{broken:?}");
+    let fixed = execute(
+        &registry,
+        root,
+        "write_file",
+        json!({"path":"source.rs","content":"pub fn value() -> u32 { 2 }\n"}),
+    )
+    .unwrap();
+    assert!(!fixed.is_error, "{fixed:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("source.rs")).unwrap(),
+        "pub fn value() -> u32 { 2 }\n"
+    );
+}
+
+#[test]
+fn rejects_ambiguous_text_and_supports_crlf_and_unicode_edits() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let registry = ToolRegistry::with_workspace_tools();
+    fs::write(root.join("ambiguous.txt"), "same\nsame\n").unwrap();
+    let ambiguous = execute(
+        &registry,
+        root,
+        "replace_text",
+        json!({"path":"ambiguous.txt","old_text":"same","new_text":"unique"}),
+    )
+    .unwrap();
+    assert!(ambiguous.is_error);
+    assert_eq!(ambiguous.metadata["conflict_status"], "ambiguous");
+
+    fs::write(root.join("windows.txt"), "before\r\n雪と café\r\nafter\r\n").unwrap();
+    let changed = execute(
+        &registry,
+        root,
+        "apply_patch",
+        json!({"path":"windows.txt","old_text":"雪と café\nafter\n","new_text":"雪と 東京\nnext\n"}),
+    )
+    .unwrap();
+    assert!(!changed.is_error);
+    let bytes = fs::read(root.join("windows.txt")).unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.clone()).unwrap(),
+        "before\r\n雪と 東京\r\nnext\r\n"
+    );
+    assert!(!bytes
+        .windows(2)
+        .any(|pair| pair[1] == b'\n' && pair[0] != b'\r'));
+}
+
+#[test]
+fn replaces_a_verified_line_range_and_preserves_utf8_bom_and_crlf() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let registry = ToolRegistry::with_workspace_tools();
+    fs::write(
+        root.join("range.txt"),
+        b"\xEF\xBB\xBFfirst\r\nsecond\r\nthird\r\n",
+    )
+    .unwrap();
+    let read = execute(
+        &registry,
+        root,
+        "read_file",
+        json!({"path":"range.txt","start_line":2,"end_line":2}),
+    )
+    .unwrap();
+    assert_eq!(read.output, "second\r\n");
+    assert!(read.metadata["revision"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+
+    let changed = execute(
+        &registry,
+        root,
+        "replace_range",
+        json!({"path":"range.txt","start_line":2,"end_line":2,"expected_text":"second\n","new_text":"updated\n"}),
+    )
+    .unwrap();
+    assert!(!changed.is_error);
+    assert_eq!(
+        fs::read(root.join("range.txt")).unwrap(),
+        b"\xEF\xBB\xBFfirst\r\nupdated\r\nthird\r\n"
+    );
+}
+
+#[test]
+fn creates_empty_files_deletes_and_renames_with_structured_results() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let registry = ToolRegistry::with_workspace_tools();
+    let empty = execute(
+        &registry,
+        root,
+        "create_file",
+        json!({"path":"empty.txt","content":""}),
+    )
+    .unwrap();
+    assert!(!empty.is_error);
+    assert_eq!(fs::read(root.join("empty.txt")).unwrap(), b"");
+    assert_eq!(empty.metadata["insertions"], 0);
+
+    execute(
+        &registry,
+        root,
+        "create_file",
+        json!({"path":"old.txt","content":"hello\n"}),
+    )
+    .unwrap();
+    let moved = execute(
+        &registry,
+        root,
+        "rename_file",
+        json!({"source_path":"old.txt","destination_path":"nested/new.txt"}),
+    )
+    .unwrap();
+    assert!(!moved.is_error);
+    assert!(!root.join("old.txt").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("nested/new.txt")).unwrap(),
+        "hello\n"
+    );
+
+    let deleted = execute(
+        &registry,
+        root,
+        "delete_file",
+        json!({"path":"nested/new.txt"}),
+    )
+    .unwrap();
+    assert!(!deleted.is_error);
+    assert_eq!(deleted.metadata["deletions"], 1);
+    assert!(!root.join("nested/new.txt").exists());
+}
+
+#[test]
+fn rejects_binary_mutation_and_keeps_large_edit_results_bounded() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let registry = ToolRegistry::with_workspace_tools();
+    fs::write(root.join("binary.bin"), [0, 1, 2, 3]).unwrap();
+    let binary = execute(&registry, root, "delete_file", json!({"path":"binary.bin"})).unwrap_err();
+    assert!(binary.to_string().contains("binary"));
+
+    let content = format!("{}needle{}", "a".repeat(1_500_000), "z".repeat(1_500_000));
+    let created = execute(
+        &registry,
+        root,
+        "create_file",
+        json!({"path":"large.txt","content":content}),
+    )
+    .unwrap();
+    assert!(created.truncated);
+    assert!(created.output.len() < 20_000);
+    assert_eq!(
+        fs::metadata(root.join("large.txt")).unwrap().len(),
+        3_000_006
+    );
+}
+
+#[test]
+fn large_files_can_be_read_and_edited_by_bounded_line_range() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let registry = ToolRegistry::with_workspace_tools();
+    let contents = (0..40_000)
+        .map(|line| format!("line {line:05} payload\r\n"))
+        .collect::<String>();
+    fs::write(root.join("many-lines.txt"), contents).unwrap();
+    let read = execute(
+        &registry,
+        root,
+        "read_file",
+        json!({"path":"many-lines.txt","start_line":20_000,"end_line":20_001}),
+    )
+    .unwrap();
+    assert_eq!(read.output, "line 19999 payload\r\nline 20000 payload\r\n");
+    assert!(read.metadata["revision"].as_str().is_some());
+
+    let changed = execute(
+        &registry,
+        root,
+        "replace_range",
+        json!({"path":"many-lines.txt","start_line":20_000,"end_line":20_000,"expected_text":"line 19999 payload\n","new_text":"updated payload\n"}),
+    )
+    .unwrap();
+    assert!(!changed.is_error);
+    let updated = fs::read_to_string(root.join("many-lines.txt")).unwrap();
+    assert!(updated.contains("updated payload\r\nline 20000 payload\r\n"));
+}
+
+#[test]
+fn file_mutation_tools_reject_workspace_traversal() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(temporary.path().join("outside.txt"), "outside").unwrap();
+    let registry = ToolRegistry::with_workspace_tools();
+    let cases = [
+        (
+            "create_file",
+            json!({"path":"../outside.txt","content":"x"}),
+        ),
+        (
+            "replace_range",
+            json!({"path":"../outside.txt","start_line":1,"end_line":1,"expected_text":"outside","new_text":"changed"}),
+        ),
+        ("delete_file", json!({"path":"../outside.txt"})),
+        (
+            "rename_file",
+            json!({"source_path":"../outside.txt","destination_path":"inside.txt"}),
+        ),
+    ];
+    for (name, arguments) in cases {
+        let error = execute(&registry, &workspace, name, arguments).unwrap_err();
+        assert!(
+            error.to_string().contains("outside the workspace"),
+            "{name}: {error}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("outside.txt")).unwrap(),
+        "outside"
+    );
+}
+
+#[test]
+fn rename_checks_policy_for_both_source_and_destination() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    fs::write(root.join("source.txt"), "safe\n").unwrap();
+    let registry = ToolRegistry::with_workspace_tools();
+    let policy = PolicyEngine::new(ExecutionMode::Auto, root);
+    let context = ToolContext {
+        policy: &policy,
+        working_directory: root,
+        cancellation: None,
+        event_bus: None,
+        session_id: None,
+        correlation_id: None,
+    };
+    let result = registry.execute(
+        &context,
+        request(
+            "rename_file",
+            json!({"source_path":"source.txt","destination_path":".env"}),
+        ),
+    );
+    assert!(matches!(
+        result,
+        Err(harness_core::Error::PermissionDenied { .. })
+    ));
+    assert!(root.join("source.txt").exists());
+    assert!(!root.join(".env").exists());
 }

@@ -14,10 +14,9 @@ globset.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
+sha2 = "0.10"
 tempfile = "3"
+thiserror.workspace = true
 
 [[bench]]
 name = "repository_index"

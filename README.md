@@ -106,6 +106,15 @@ request; the runtime decides. Every privileged call is evaluated by the same
 desktop can reach nothing without going through `harness-rpc`, which links no tool,
 provider, or policy implementation of its own.
 
+File edits use focused create, patch, exact-text/range replacement, delete, and
+move operations. Edits are staged atomically, checked against the file revision
+the session read, and returned with a bounded unified diff. Exact patches refuse
+ambiguous context; UTF-8 BOMs and CRLF/LF endings are preserved. The agent creates
+a task checkpoint before editing, so its changes remain available to review and
+undo without disturbing unrelated dirty Git work. The runtime also refreshes its
+repository index and requests best-effort quick diagnostics when a supported
+language server is available.
+
 
 See [`docs/architecture.md`](docs/architecture.md) for crate responsibilities and
 dependency direction, and [`docs/development.md`](docs/development.md) for a crate

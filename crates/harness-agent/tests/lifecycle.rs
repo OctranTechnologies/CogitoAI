@@ -457,6 +457,69 @@ fn a_session_survives_a_restart_and_resumes() {
 }
 
 #[test]
+fn rename_edit_is_checkpointed_and_undo_preserves_unrelated_dirty_work() {
+    let temporary = sample_repository();
+    let root = temporary.path().to_path_buf();
+    let original = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    fs::write(root.join("user-notes.txt"), "pre-existing untracked work\n").unwrap();
+    let harness = fixture(
+        &root,
+        ExecutionMode::Normal,
+        vec![
+            tool_call(
+                "rename_file",
+                serde_json::json!({
+                    "source_path":"src/lib.rs",
+                    "destination_path":"src/value.rs"
+                }),
+            ),
+            final_answer("Renamed the source file and verified it."),
+        ],
+    );
+    let session = harness.sessions.create(&root).unwrap();
+    harness
+        .runner
+        .run(
+            &task_for(&root, "Rename src/lib.rs to src/value.rs.", &session.id),
+            &harness_tools::CancellationToken::new(),
+        )
+        .expect("rename task should complete");
+
+    assert!(!root.join("src/lib.rs").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("src/value.rs")).unwrap(),
+        original
+    );
+    let checkpoint = harness
+        .checkpoints
+        .list()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("task checkpoint");
+    assert!(checkpoint
+        .recorded_changes
+        .iter()
+        .any(|path| path == "src/lib.rs"));
+    assert!(checkpoint
+        .recorded_changes
+        .iter()
+        .any(|path| path == "src/value.rs"));
+
+    let report = harness.checkpoints.undo(&checkpoint.id).unwrap();
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        original
+    );
+    assert!(!root.join("src/value.rs").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("user-notes.txt")).unwrap(),
+        "pre-existing untracked work\n"
+    );
+}
+
+#[test]
 fn safe_mode_asks_before_an_edit() {
     let temporary = sample_repository();
     let root = temporary.path();
