@@ -207,3 +207,18 @@ fn validates_zero_budget() {
 
     assert!(result.is_err());
 }
+
+#[test]
+fn workspace_repository_map_is_rendered_as_initial_context() {
+    let mut input = input();
+    input.workspace.details.insert(
+        "repository_map".to_owned(),
+        "Top-level: crates, apps\nPackages: crates/harness-tools (harness-tools)\nKey symbols:\n- src/lib.rs:1 function run".to_owned(),
+    );
+    let assembly = ContextBuilder::default().build(&input).unwrap();
+    assert!(assembly
+        .prompt
+        .contains("repository_map: Top-level: crates, apps"));
+    assert!(assembly.prompt.contains("harness-tools"));
+    assert!(assembly.prompt.contains("function run"));
+}

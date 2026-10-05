@@ -18,7 +18,7 @@ the crates above it in this table and never the reverse.
 | `harness-models` | Model boundary: `ModelRequest`, `ModelResponse`, content blocks, tool definitions and calls, streaming deltas, `ModelCapabilities`, `ProviderError`, `ModelProvider` trait, mock and OpenAI providers | `harness-core` |
 | `harness-policy` | `OperationKind`, `Permission`, `ExecutionMode`, `PolicyRule`, `PolicyEngine`, built-in workspace and credential protections | `harness-core` |
 | `harness-session` | Event model, `EventBus`, `SessionStore` trait, `JsonlSessionStore`, compaction records | `harness-core` |
-| `harness-tools` | `Tool` trait, `ToolRegistry`, `ToolContext`, `ToolResult`, the seven workspace tools, `LocalProcessRunner`, `CancellationToken` | `harness-core`, `harness-policy`, `harness-session` |
+| `harness-tools` | `Tool` trait, `ToolRegistry`, `ToolContext`, `ToolResult`, filesystem/process tools, `RepositoryIndexService` and repository queries | `harness-core`, `harness-policy`, `harness-session` |
 | `harness-git` | `GitClient`, status and diffs, `Checkpoint`/`CheckpointStore` trait, `ShadowCheckpointStore`, runtime-state path exclusion | `harness-core`, `harness-session` |
 | `harness-context` | Context assembly from workspace description, instructions, and Git state | `harness-core`, `harness-git`, `harness-session`, `harness-tools` |
 | `harness-verification` | `VerificationPlan`, `VerificationStep`, `VerificationReport`, `Verifier` trait, `CommandVerifier` | `harness-core`, `harness-session`, `harness-tools` |
@@ -228,6 +228,33 @@ To add one:
 If the tool mutates a file, the agent must call
 `CheckpointStore::record_harness_change` after the write, or undo will not be able
 to restore it.
+
+## Repository index and search
+
+The standard workspace registry registers the eight repository queries from
+`crates/harness-tools/src/repository_index.rs`. Keep their results concise and
+bounded; the index itself must not be appended to model context. The same lazy
+`RepositoryIndexService` supplies the startup repo map and model-facing tools.
+Successful filesystem writes call `update_changed` before returning to the next
+model turn. Add fixtures for each language parser or package-manifest shape you
+change, and verify that a renamed/removed declaration disappears from the next
+query.
+
+The index currently uses deterministic declaration patterns rather than a
+Tree-sitter grammar. Keep extraction explicitly approximate, and prefer an LSP
+diagnostic query for compiler-level feedback where one of the supported server
+programs is available. Text search should continue to use ripgrep with a bounded
+native fallback so packaged runtimes remain usable without an `rg` executable.
+
+Run the synthetic 10,002-file performance fixture from the workspace root with:
+
+```bash
+cargo bench -p harness-tools --bench repository_index
+```
+
+It reports index startup, indexed symbol lookup, ripgrep search, and single-file
+incremental update timings. The benchmark is a local performance aid, not a
+machine-specific CI threshold.
 
 ## Adding a policy rule
 

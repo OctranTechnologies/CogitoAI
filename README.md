@@ -480,8 +480,25 @@ Everything in this list is implemented and covered by tests.
 - Single-agent loop with tool calling, streaming deltas, and usage accounting.
 - Runtime-owned task state with persisted plans, verification feedback, completion
   gating, and repeated-call/failure safeguards.
-- Seven tools: `read_file`, `write_file`, `apply_patch`, `list_directory`, `glob`,
-  `grep`, and `shell`.
+- Fifteen bounded tools: file and process operations plus repository intelligence
+  (`search_files`, `search_text`, `find_symbol`, `find_references`,
+  `goto_definition`, `get_diagnostics`, `get_file_outline`, and `get_repo_tree`).
+- A lazy per-workspace repository index records source languages, declarations,
+  imports/exports, package ownership, test files, and configuration files. It is
+  queried incrementally; the full index is never added to model context. Text
+  searches use ripgrep when installed and a bounded local scan otherwise.
+- Initial task context includes a compact root/package overview alongside
+  project instructions and Git state. The index refreshes changed files after
+  harness edits. Symbol extraction is deterministic and lightweight; it is not
+  a compiler or a substitute for a language server.
+- The startup repo map is capped at 4 KB and contains only top-level entries,
+  package names, selected exported symbols, and concise import relationships.
+  Rust, Python, TypeScript/JavaScript, and Go declarations have dedicated
+  extractors; other recognized languages retain file/language metadata and
+  conservative common declarations.
+- `get_diagnostics` starts an on-demand language server when a supported server
+  executable is available (`rust-analyzer`, `typescript-language-server`, or
+  `pyright-langserver`). If none is installed, it reports that clearly.
 - Path containment: every tool resolves paths against the workspace root, so `..`
   segments, absolute paths, and symlinks cannot escape it.
 - Bounded reads and command execution, with per-command timeouts.
@@ -760,6 +777,13 @@ Rust, from the repository root:
 cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+```
+
+To measure repository-index startup, search, and single-file update costs against
+a synthetic 10,002-file monorepo fixture:
+
+```bash
+cargo bench -p harness-tools --bench repository_index
 ```
 
 Frontend, from `apps/desktop`:

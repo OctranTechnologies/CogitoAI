@@ -79,6 +79,34 @@ Agent safeguards can be tuned in the runtime environment with
 `COGITO_AGENT_MAX_COST_USD`, `COGITO_AGENT_MAX_REPEATED_TOOL_CALLS`, and
 `COGITO_AGENT_MAX_REPEATED_FAILURES`. Invalid values fall back to defaults.
 
+## Repository intelligence
+
+The standard `ToolRegistry` owns a lazy `RepositoryIndexService` per workspace.
+It indexes bounded file metadata, language, common declarations, imports and
+exports, package ownership, test/configuration classification, and lightweight
+module relationships. It does not store full file contents. Text searches use
+`rg` when available and a capped filesystem scanner otherwise; reference
+queries are textual identifier matches unless a language server is available.
+
+At the beginning of a task, the agent asks that same service for a compact repo
+map with top-level entries, packages, selected exported symbols, and imports.
+The map is capped at 4 KB; all other index data is retrieved by a focused tool
+query. File writes from standard tools update the cached declarations
+immediately, while a short metadata refresh window catches external edits.
+Supported tools are `search_files`, `search_text`, `find_symbol`,
+`find_references`, `goto_definition`, `get_diagnostics`, `get_file_outline`, and
+`get_repo_tree`. Diagnostics start a bounded one-shot LSP request for Rust,
+TypeScript/JavaScript, or Python when the corresponding language-server program
+is on `PATH`; otherwise the tool reports that diagnostics are unavailable.
+
+The v0 symbol extractor uses deterministic declaration patterns for Rust,
+Python, TypeScript/JavaScript, and Go, plus conservative generic patterns for
+other known source languages. This is a navigation aid, not a syntax tree or
+semantic reference engine. The workspace currently has no Tree-sitter grammar
+dependencies, so adding those should be justified by measured extraction gaps
+and accompanied by language fixtures. Index sizes are capped at 50,000 files,
+1 MiB per parsed source file, and 128 MiB of parsed content.
+
 ## Dependency direction
 
 The workspace separates contracts, capabilities, and composition. Dependencies
@@ -201,7 +229,7 @@ under the system temporary directory.
 | --- | --- | --- |
 | `harness-core` | Provider-neutral orchestration traits, shared errors, IDs, configuration, logging setup, workspace discovery | Provider APIs, filesystem or shell execution |
 | `harness-models` | Model-provider adapters and provider capabilities | Agent lifecycle, tool execution policy |
-| `harness-tools` | Tool contracts, tool requests/results, registry, workspace tools, process execution | Authorization decisions, provider logic |
+| `harness-tools` | Tool contracts, tool requests/results, registry, filesystem/process tools, bounded repository index and queries | Authorization decisions, provider logic |
 | `harness-policy` | Permissions, decisions, and policy enforcement | Tool implementations, UI concerns |
 | `harness-session` | Sessions, events, and persistence | Git operations, provider adapters |
 | `harness-git` | Git/checkpoint contracts and shadow checkpoint storage | General session state |

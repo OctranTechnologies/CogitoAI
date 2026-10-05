@@ -852,6 +852,19 @@ impl AgentRunner {
         } else {
             None
         };
+        let mut workspace_metadata = task.workspace.clone();
+        if workspace_metadata.root.is_none() {
+            workspace_metadata.root = Some(task.workspace_root.clone());
+        }
+        if let Some(root) = &workspace_metadata.root {
+            if !workspace_metadata.details.contains_key("repository_map") {
+                if let Ok(repository_map) = self.tools.repository_map(root) {
+                    workspace_metadata
+                        .details
+                        .insert("repository_map".to_owned(), repository_map);
+                }
+            }
+        }
         let collector = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&collector);
         let collected_ids = Arc::new(Mutex::new(HashSet::new()));
@@ -879,7 +892,7 @@ impl AgentRunner {
         };
         let mut context_input = ContextInput {
             system_instructions,
-            workspace: task.workspace.clone(),
+            workspace: workspace_metadata,
             instructions: task.instructions.clone(),
             user_request: task.user_task.clone(),
             conversation: if task.recent_conversation.is_empty() {

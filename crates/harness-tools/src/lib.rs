@@ -1,5 +1,6 @@
 mod filesystem;
 mod process;
+mod repository_index;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,6 +19,10 @@ pub use filesystem::{
 pub use process::{
     CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
     ProcessResult, ProcessRunner,
+};
+pub use repository_index::{
+    IndexedFile, RepositoryAction, RepositoryIndex, RepositoryIndexService, RepositoryTool,
+    SymbolDefinition, SymbolKind,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -131,6 +136,7 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    repository_index: Option<Arc<RepositoryIndexService>>,
 }
 
 impl ToolRegistry {
@@ -154,6 +160,20 @@ impl ToolRegistry {
             Arc::new(LocalProcessRunner),
             cancellation,
         )));
+        let index = Arc::new(RepositoryIndexService::default());
+        for action in [
+            RepositoryAction::SearchFiles,
+            RepositoryAction::SearchText,
+            RepositoryAction::FindSymbol,
+            RepositoryAction::FindReferences,
+            RepositoryAction::GotoDefinition,
+            RepositoryAction::GetDiagnostics,
+            RepositoryAction::GetFileOutline,
+            RepositoryAction::GetRepoTree,
+        ] {
+            registry.register(Box::new(RepositoryTool::new(action, Arc::clone(&index))));
+        }
+        registry.repository_index = Some(index);
         registry
     }
 
@@ -222,6 +242,15 @@ impl ToolRegistry {
         let result = tool.execute(context, request);
         match result {
             Ok(result) => {
+                if !result.changed_files.is_empty() {
+                    if let Some(index) = &self.repository_index {
+                        // A successful write updates the in-memory index before
+                        // the next model turn can query it. A later query may
+                        // still lazily rebuild the index if this update fails.
+                        let _ =
+                            index.update_changed(context.working_directory, &result.changed_files);
+                    }
+                }
                 context.emit(EventPayload::ToolOutput {
                     tool: tool_name.clone(),
                     output: concise_event_value(&result.output),
@@ -248,6 +277,17 @@ impl ToolRegistry {
 
     pub fn names(&self) -> Vec<String> {
         self.tools.iter().map(|tool| tool.spec().name).collect()
+    }
+
+    /// Return a short workspace map from the same cached index used by query
+    /// tools. The complete index is never returned to the model.
+    pub fn repository_map(&self, root: &std::path::Path) -> Result<String, ToolError> {
+        if let Some(index) = &self.repository_index {
+            index.repo_map(root)
+        } else {
+            let index = RepositoryIndex::build(root)?;
+            Ok(index.repo_map())
+        }
     }
 
     /// Returns the registered operation for a tool so higher-level runtime

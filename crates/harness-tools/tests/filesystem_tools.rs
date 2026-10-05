@@ -349,7 +349,15 @@ fn emits_file_change_lifecycle_events() {
             "list_directory",
             "glob",
             "grep",
-            "shell"
+            "shell",
+            "search_files",
+            "search_text",
+            "find_symbol",
+            "find_references",
+            "goto_definition",
+            "get_diagnostics",
+            "get_file_outline",
+            "get_repo_tree"
         ]
     );
 }
