@@ -151,6 +151,39 @@ export interface AgentTask {
 
 export type TaskMode = "explore" | "plan" | "code";
 
+export type PlanItemStatus = "pending" | "in_progress" | "completed" | "blocked";
+
+export interface GoalSnapshot {
+  objective: string;
+  constraints: string[];
+  acceptance_criteria: string[];
+  non_goals: string[];
+  current_milestone: string | null;
+  completion_condition: string;
+}
+
+export interface ExecutionPlanSnapshot {
+  revision: number;
+  status: PlanItemStatus;
+  decision_notes: string[];
+  milestones: {
+    title: string;
+    status: PlanItemStatus;
+    tasks: { description: string; status: PlanItemStatus }[];
+    affected_architecture: string[];
+    validation_commands: string[];
+    completion_criteria: string[];
+  }[];
+}
+
+export interface TaskRunSnapshot {
+  original_goal: string;
+  goal: GoalSnapshot;
+  execution_plan: ExecutionPlanSnapshot | null;
+  current_phase: string;
+  completion_status: string;
+}
+
 export interface GitStatusSummary {
   repository_root: string;
   branch: string | null;

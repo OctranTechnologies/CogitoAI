@@ -1044,6 +1044,234 @@ fn multi_file_feature_persists_plan_and_acceptance_criteria() {
 }
 
 #[test]
+fn long_runs_keep_the_goal_and_plan_across_compaction_at_ten_and_one_hundred_turns() {
+    assert!(AgentLimits::default().max_turns >= 100);
+    for expected_turns in [10_u32, 100_u32] {
+        let temporary = tempdir().unwrap();
+        let workspace = temporary.path();
+        let tool_turns = expected_turns - 1;
+        let mut responses = Vec::with_capacity(expected_turns as usize);
+        for index in 0..tool_turns {
+            let path = format!("fixture-{index:03}.txt");
+            std::fs::write(workspace.join(&path), format!("fixture {index}\n")).unwrap();
+            let text = if index == 0 {
+                "Plan:\n- Read the requested fixture files\n- Summarize the findings"
+            } else {
+                ""
+            };
+            responses.push(response_many(
+                text,
+                vec![("read_file", serde_json::json!({ "path": path }))],
+            ));
+        }
+        responses.push(response(
+            "All fixture files were read and summarized.",
+            None,
+        ));
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider::new(requests.clone(), responses));
+        let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+        let runner = AgentRunner::new(
+            provider,
+            "recording",
+            ToolRegistry::with_workspace_tools(),
+            Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace)),
+            sessions.clone(),
+            ContextBuilder::default(),
+            AgentLimits::default(),
+            Arc::new(ApproveAll),
+        )
+        .with_compaction_config(CompactionConfig {
+            threshold_tokens: 1,
+            keep_recent_messages: 2,
+        });
+        let goal = format!(
+            "Inspect {tool_turns} fixture files and summarize them.\nConstraints:\n- Read only.\nAcceptance criteria:\n- Read every fixture file\n- Preserve the findings across compaction"
+        );
+        let objective = format!("Inspect {tool_turns} fixture files and summarize them.");
+        let task = AgentTask {
+            user_task: goal.clone(),
+            acceptance_criteria: vec![
+                "Read every fixture file".to_owned(),
+                "Preserve the findings across compaction".to_owned(),
+            ],
+            ..task(workspace)
+        };
+
+        let outcome = runner.run(&task, &CancellationToken::new()).unwrap();
+        assert_eq!(outcome.turns, expected_turns);
+        assert_eq!(
+            outcome.completion_status,
+            harness_session::TaskCompletionStatus::Done
+        );
+        let state = sessions.load(&outcome.session_id).unwrap().state().unwrap();
+        assert!(state.context_compactions > 0);
+        let task_run = state.task_run.unwrap();
+        assert_eq!(task_run.goal.objective, objective);
+        assert_eq!(task_run.goal.constraints, ["Read only."]);
+        assert_eq!(task_run.goal.acceptance_criteria, task.acceptance_criteria);
+        let plan = task_run.execution_plan.unwrap();
+        assert_eq!(
+            plan.revision, 1,
+            "ordinary repeated plans must not rewrite state"
+        );
+        assert_eq!(plan.status, harness_session::PlanItemStatus::Completed);
+        assert!(state.continuation.as_ref().is_some_and(|state| {
+            state
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.objective == objective)
+                && state.execution_plan.is_some()
+        }));
+        let requests = requests.lock().unwrap();
+        let compacted_prompt = requests
+            .iter()
+            .skip(1)
+            .flat_map(|request| &request.messages)
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                harness_models::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .find(|text| text.contains("Persistent task state"))
+            .expect("later turns should receive the persisted task state");
+        assert!(compacted_prompt.contains(&goal));
+        assert!(compacted_prompt.contains("Execution plan revision 1"));
+    }
+}
+
+#[test]
+fn cancelled_task_resumes_from_its_persisted_goal_after_a_process_restart() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let first = Arc::new(ScriptedMockProvider::new("interrupted", Vec::new()));
+    let first_runner = AgentRunner::new(
+        first,
+        "interrupted",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(AllowAllPolicy),
+        sessions.clone(),
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    );
+    let original_goal = "Implement a multi-step change.\nConstraints:\n- Keep the public API stable\nAcceptance criteria:\n- Verify behavior";
+    let interrupted_task = AgentTask {
+        user_task: original_goal.to_owned(),
+        acceptance_criteria: vec!["Verify behavior".to_owned()],
+        ..task(workspace)
+    };
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert!(first_runner.run(&interrupted_task, &cancellation).is_err());
+    let session_id = sessions.recent(1).unwrap().into_iter().next().unwrap().id;
+    let persisted = sessions.load(&session_id).unwrap().state().unwrap();
+    assert_eq!(
+        persisted.task_run.as_ref().unwrap().goal.objective,
+        "Implement a multi-step change."
+    );
+    assert_eq!(
+        persisted.task_run.as_ref().unwrap().completion_status,
+        harness_session::TaskCompletionStatus::Cancelled
+    );
+
+    // A new provider/runner models a new CLI or desktop process. The session
+    // history, not the original in-memory run, restores the objective.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let resumed_provider = Arc::new(RecordingProvider::new(
+        requests.clone(),
+        vec![response(
+            "The saved goal is complete after validation.",
+            None,
+        )],
+    ));
+    let resumed_runner = AgentRunner::new(
+        resumed_provider,
+        "recording",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(AllowAllPolicy),
+        sessions.clone(),
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    );
+    let resumed = AgentTask {
+        workspace_root: workspace.to_path_buf(),
+        user_task: "Continue from the saved task.".to_owned(),
+        resume_session: Some(session_id.clone()),
+        ..AgentTask::default()
+    };
+    let outcome = resumed_runner
+        .run(&resumed, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(outcome.session_id, session_id);
+    let prompt = requests.lock().unwrap()[0]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            harness_models::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains(original_goal));
+    let resumed_state = sessions.load(&outcome.session_id).unwrap().state().unwrap();
+    assert_eq!(
+        resumed_state.task_run.unwrap().goal.objective,
+        "Implement a multi-step change."
+    );
+}
+
+#[test]
+fn blocked_task_marks_its_active_milestone_as_blocked() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            response(
+                "Plan:\n- Inspect the workspace\n- Apply the repair",
+                Some((
+                    "shell",
+                    serde_json::json!({ "command": "harness_missing_goal_fixture_command" }),
+                )),
+            ),
+            response("[BLOCKED] The required command is unavailable.", None),
+        ],
+    ));
+    let (runner, sessions) = runner(
+        provider,
+        workspace,
+        Arc::new(PolicyEngine::new(ExecutionMode::Normal, workspace)),
+        Arc::new(ApproveAll),
+    );
+
+    let outcome = runner
+        .run(&task(workspace), &CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        outcome.completion_status,
+        harness_session::TaskCompletionStatus::Blocked
+    );
+    let task_run = sessions
+        .load(&outcome.session_id)
+        .unwrap()
+        .state()
+        .unwrap()
+        .task_run
+        .unwrap();
+    let plan = task_run.execution_plan.unwrap();
+    assert_eq!(plan.status, harness_session::PlanItemStatus::Blocked);
+    assert_eq!(
+        plan.milestones[0].status,
+        harness_session::PlanItemStatus::Blocked
+    );
+}
+
+#[test]
 fn failed_command_is_reported_to_model_and_can_be_repaired() {
     let temporary = tempdir().unwrap();
     let workspace = temporary.path();

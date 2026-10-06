@@ -15,8 +15,9 @@ use harness_policy::{
 };
 use harness_session::{
     CompactState, ConversationMessage as SessionConversationMessage, EventBus, EventPayload,
-    HarnessEvent, ImplementationPlan, MessageRole, SessionStore, TaskCompletionStatus, TaskMode,
-    TaskPhase, TaskRun, TaskVerificationResult,
+    ExecutionMilestone, ExecutionPlan, ExecutionTask, Goal, HarnessEvent, ImplementationPlan,
+    MessageRole, PlanItemStatus, SessionStore, TaskCompletionStatus, TaskMode, TaskPhase, TaskRun,
+    TaskVerificationResult,
 };
 use harness_tools::{CancellationToken, ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{
@@ -54,10 +55,10 @@ fn default_repeated_failure_limit() -> u32 {
 impl Default for AgentLimits {
     fn default() -> Self {
         Self {
-            max_turns: 8,
-            max_tool_calls: 32,
-            max_runtime: Duration::from_secs(600),
-            max_model_tokens: 100_000,
+            max_turns: 256,
+            max_tool_calls: 512,
+            max_runtime: Duration::from_secs(3600),
+            max_model_tokens: 1_000_000,
             max_estimated_cost_microusd: None,
             max_repeated_tool_calls: default_repeated_call_limit(),
             max_repeated_failures: default_repeated_failure_limit(),
@@ -128,6 +129,8 @@ impl Default for CompactionConfig {
 
 pub struct CompactionRequest<'a> {
     pub task: &'a str,
+    pub goal: Option<&'a Goal>,
+    pub execution_plan: Option<&'a ExecutionPlan>,
     pub conversation: &'a [SessionConversationMessage],
     pub tool_results: &'a [ToolContextResult],
 }
@@ -143,6 +146,8 @@ impl CompactionStrategy for DeriveCompactionStrategy {
     fn compact(&self, request: &CompactionRequest<'_>) -> Result<CompactState, String> {
         let mut state = CompactState {
             task: request.task.to_owned(),
+            goal: request.goal.cloned(),
+            execution_plan: request.execution_plan.cloned(),
             current_approach: request
                 .conversation
                 .iter()
@@ -272,7 +277,7 @@ fn push_unique_bounded<T: Eq>(values: &mut Vec<T>, value: T, limit: usize) {
 
 fn coding_agent_instructions(existing: &str) -> String {
     let guidance = "\
-You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Make focused changes, run the cheapest useful checks selected from workspace configuration and repository verification instructions, read structured diagnostics, inspect the final diff, and repair failures before finishing. Verification runs stop at the first failure so you can diagnose and repair before broader checks. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. For a broad or high-risk request, you may recommend that the user switch to PLAN mode first, but do not force simple tasks through a verbose plan. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a failure is clearly pre-existing or unrelated to your patch, inspect the evidence and report its exact command and reason on a line beginning `[UNRELATED_VERIFICATION] ` followed by the exact command and ` :: ` plus the evidence. Use this only when the failure is not caused by your changes. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
+You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Make focused changes, run the cheapest useful checks selected from workspace configuration and repository verification instructions, read structured diagnostics, inspect the final diff, and repair failures before finishing. Verification runs stop at the first failure so you can diagnose and repair before broader checks. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. For a broad or high-risk request, you may recommend that the user switch to PLAN mode first, but do not force simple tasks through a verbose plan. The runtime persists the goal and plan across turns, compaction, and restart: continue the current milestone and next incomplete task instead of recreating the plan. Only revise a saved plan when new evidence materially changes the approach; use `Plan revision: <specific reason>` followed by a `Plan:` list. Repeated `Plan:` text alone does not replace a saved plan. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a failure is clearly pre-existing or unrelated to your patch, inspect the evidence and report its exact command and reason on a line beginning `[UNRELATED_VERIFICATION] ` followed by the exact command and ` :: ` plus the evidence. Use this only when the failure is not caused by your changes. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
     if existing.trim().is_empty() {
         guidance.to_owned()
     } else {
@@ -313,6 +318,26 @@ fn append_prior_task_state(instructions: &mut String, previous: &TaskRun) {
     instructions
         .push_str("\n\nThis is a resumed task. Continue from the runtime's persisted state:");
     instructions.push_str(&format!("\nOriginal goal: {}", previous.original_goal));
+    if !previous.goal.constraints.is_empty() {
+        instructions.push_str("\nConstraints:");
+        for item in &previous.goal.constraints {
+            instructions.push_str("\n- ");
+            instructions.push_str(item);
+        }
+    }
+    if !previous.goal.non_goals.is_empty() {
+        instructions.push_str("\nNon-goals:");
+        for item in &previous.goal.non_goals {
+            instructions.push_str("\n- ");
+            instructions.push_str(item);
+        }
+    }
+    if !previous.goal.completion_condition.is_empty() {
+        instructions.push_str(&format!(
+            "\nCompletion condition: {}",
+            previous.goal.completion_condition
+        ));
+    }
     if !previous.current_plan.is_empty() {
         instructions.push_str("\nCurrent plan:");
         for step in &previous.current_plan {
@@ -358,6 +383,81 @@ fn append_prior_task_state(instructions: &mut String, previous: &TaskRun) {
                 instructions.push_str("\n- ");
                 instructions.push_str(item);
             }
+        }
+    }
+}
+
+fn append_live_task_state(instructions: &mut String, task_run: &TaskRun) {
+    instructions.push_str("\n\nPersistent task state (runtime-owned; continue this goal after compaction or restart):");
+    instructions.push_str(&format!("\nObjective: {}", task_run.goal.objective));
+    instructions.push_str(&format!(
+        "\nCompletion condition: {}",
+        task_run.goal.completion_condition
+    ));
+    if !task_run.goal.acceptance_criteria.is_empty() {
+        instructions.push_str("\nAcceptance criteria:");
+        for criterion in &task_run.goal.acceptance_criteria {
+            instructions.push_str("\n- ");
+            instructions.push_str(criterion);
+        }
+    }
+    if !task_run.goal.constraints.is_empty() {
+        instructions.push_str("\nConstraints:");
+        for constraint in &task_run.goal.constraints {
+            instructions.push_str("\n- ");
+            instructions.push_str(constraint);
+        }
+    }
+    if !task_run.goal.non_goals.is_empty() {
+        instructions.push_str("\nNon-goals:");
+        for item in &task_run.goal.non_goals {
+            instructions.push_str("\n- ");
+            instructions.push_str(item);
+        }
+    }
+    if let Some(plan) = &task_run.execution_plan {
+        instructions.push_str(&format!(
+            "\nExecution plan revision {} ({:?}):",
+            plan.revision, plan.status
+        ));
+        for milestone in &plan.milestones {
+            instructions.push_str(&format!(
+                "\nMilestone {:?}: {}",
+                milestone.status, milestone.title
+            ));
+            for task in &milestone.tasks {
+                instructions.push_str(&format!("\n- [{:?}] {}", task.status, task.description));
+            }
+            for command in &milestone.validation_commands {
+                instructions.push_str(&format!("\n  Validate with: {command}"));
+            }
+            for criterion in &milestone.completion_criteria {
+                instructions.push_str(&format!("\n  Completion criterion: {criterion}"));
+            }
+        }
+        if !plan.decision_notes.is_empty() {
+            instructions.push_str("\nPlan decision notes:");
+            for note in &plan.decision_notes {
+                instructions.push_str("\n- ");
+                instructions.push_str(note);
+            }
+        }
+    }
+    if let Some(next) = task_run.execution_plan.as_ref().and_then(|plan| {
+        plan.milestones
+            .iter()
+            .flat_map(|milestone| &milestone.tasks)
+            .find(|task| task.status != PlanItemStatus::Completed)
+    }) {
+        instructions.push_str(&format!("\nNext useful planned step: {}", next.description));
+    } else if task_run.execution_plan.is_none() {
+        instructions.push_str("\nNo explicit plan is needed yet; inspect the request and choose the next useful repository step.");
+    }
+    if !task_run.remaining_work.is_empty() {
+        instructions.push_str("\nRemaining work:");
+        for item in &task_run.remaining_work {
+            instructions.push_str("\n- ");
+            instructions.push_str(item);
         }
     }
 }
@@ -454,6 +554,366 @@ fn parse_implementation_plan(
         }
     }
     plan
+}
+
+const MAX_PLAN_REVISIONS: u32 = 3;
+
+fn parse_goal_details(goal: &str, acceptance_criteria: &[String]) -> Goal {
+    let mut parsed = Goal::new(extract_goal_objective(goal));
+    parsed.acceptance_criteria = acceptance_criteria.to_vec();
+    let mut section = "";
+    for line in goal.lines().map(str::trim) {
+        let normalized = line
+            .trim_start_matches('#')
+            .trim()
+            .trim_end_matches(':')
+            .to_ascii_lowercase();
+        if normalized == "acceptance criteria" || normalized == "criteria" {
+            section = "acceptance";
+            continue;
+        }
+        if normalized == "constraints" {
+            section = "constraints";
+            continue;
+        }
+        if normalized == "non-goals" || normalized == "non goals" {
+            section = "non-goals";
+            continue;
+        }
+        if let Some((heading, value)) = line.split_once(':') {
+            let heading = heading.trim().trim_start_matches('#').trim();
+            if heading.eq_ignore_ascii_case("constraints") {
+                section = "constraints";
+                if !value.trim().is_empty() {
+                    push_unique_bounded(&mut parsed.constraints, plan_item(value), 32);
+                }
+                continue;
+            }
+            if heading.eq_ignore_ascii_case("non-goals")
+                || heading.eq_ignore_ascii_case("non goals")
+            {
+                section = "non-goals";
+                if !value.trim().is_empty() {
+                    push_unique_bounded(&mut parsed.non_goals, plan_item(value), 32);
+                }
+                continue;
+            }
+            if heading.eq_ignore_ascii_case("completion condition") {
+                parsed.completion_condition = value.trim().to_owned();
+                section = "completion";
+                continue;
+            }
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if is_list_item(line) {
+            let item = plan_item(line);
+            match section {
+                "constraints" => push_unique_bounded(&mut parsed.constraints, item, 32),
+                "non-goals" => push_unique_bounded(&mut parsed.non_goals, item, 32),
+                _ => {}
+            }
+        } else if !line.starts_with("- ") {
+            section = "";
+        }
+    }
+    parsed
+}
+
+fn extract_goal_objective(goal: &str) -> String {
+    let objective = goal
+        .lines()
+        .take_while(|line| {
+            let heading = line
+                .trim()
+                .trim_start_matches('#')
+                .trim()
+                .trim_end_matches(':')
+                .to_ascii_lowercase();
+            !matches!(
+                heading.as_str(),
+                "acceptance criteria"
+                    | "criteria"
+                    | "constraints"
+                    | "non-goals"
+                    | "non goals"
+                    | "completion condition"
+            ) && !line.split_once(':').is_some_and(|(heading, _)| {
+                heading.trim().eq_ignore_ascii_case("completion condition")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned();
+    if objective.is_empty() {
+        goal.trim().to_owned()
+    } else {
+        objective
+    }
+}
+
+fn execution_plan_from_implementation(
+    plan: &ImplementationPlan,
+    acceptance_criteria: &[String],
+) -> ExecutionPlan {
+    let tasks = plan
+        .implementation_steps
+        .iter()
+        .filter(|step| !step.trim().is_empty())
+        .take(32)
+        .map(|description| ExecutionTask {
+            description: description.clone(),
+            status: PlanItemStatus::Pending,
+        })
+        .collect::<Vec<_>>();
+    let mut completion_criteria = acceptance_criteria.to_vec();
+    if completion_criteria.is_empty() {
+        completion_criteria
+            .push("Complete the planned changes and inspect the final diff.".to_owned());
+    }
+    let milestones = tasks
+        .chunks(4)
+        .enumerate()
+        .map(|(index, chunk)| ExecutionMilestone {
+            title: if tasks.len() <= 4 {
+                "Implementation".to_owned()
+            } else {
+                format!(
+                    "Milestone {} · {}",
+                    index + 1,
+                    bounded_summary(&chunk[0].description)
+                )
+            },
+            tasks: chunk.to_vec(),
+            affected_architecture: plan.relevant_architecture.clone(),
+            validation_commands: plan.validation.clone(),
+            completion_criteria: completion_criteria.clone(),
+            status: PlanItemStatus::Pending,
+        })
+        .collect();
+    ExecutionPlan {
+        revision: 1,
+        milestones,
+        decision_notes: plan.risks_or_unknowns.clone(),
+        status: PlanItemStatus::Pending,
+    }
+}
+
+fn sync_current_milestone(task_run: &mut TaskRun) {
+    let current = task_run.execution_plan.as_ref().and_then(|plan| {
+        plan.milestones
+            .iter()
+            .find(|milestone| milestone.status != PlanItemStatus::Completed)
+            .map(|milestone| milestone.title.clone())
+    });
+    task_run.goal.current_milestone = current;
+}
+
+fn advance_execution_plan(task_run: &mut TaskRun) {
+    let Some(plan) = &mut task_run.execution_plan else {
+        return;
+    };
+    plan.status = PlanItemStatus::InProgress;
+    if let Some(milestone) = plan
+        .milestones
+        .iter_mut()
+        .find(|milestone| milestone.status != PlanItemStatus::Completed)
+    {
+        milestone.status = PlanItemStatus::InProgress;
+        if let Some(task) = milestone
+            .tasks
+            .iter_mut()
+            .find(|task| task.status == PlanItemStatus::Pending)
+        {
+            task.status = PlanItemStatus::InProgress;
+        }
+    }
+    sync_current_milestone(task_run);
+}
+
+fn record_plan_progress(task_run: &mut TaskRun) {
+    let Some(plan) = &mut task_run.execution_plan else {
+        return;
+    };
+    let Some(milestone) = plan
+        .milestones
+        .iter_mut()
+        .find(|milestone| milestone.status != PlanItemStatus::Completed)
+    else {
+        return;
+    };
+    if let Some(task) = milestone
+        .tasks
+        .iter_mut()
+        .find(|task| task.status == PlanItemStatus::InProgress)
+    {
+        task.status = PlanItemStatus::Completed;
+    }
+    if let Some(task) = milestone
+        .tasks
+        .iter_mut()
+        .find(|task| task.status == PlanItemStatus::Pending)
+    {
+        task.status = PlanItemStatus::InProgress;
+    } else {
+        milestone.status = PlanItemStatus::Completed;
+    }
+    if plan
+        .milestones
+        .iter()
+        .all(|item| item.status == PlanItemStatus::Completed)
+    {
+        plan.status = PlanItemStatus::Completed;
+    }
+    sync_current_milestone(task_run);
+}
+
+fn finish_plan_state(task_run: &mut TaskRun) {
+    let Some(plan) = &mut task_run.execution_plan else {
+        return;
+    };
+    match task_run.completion_status {
+        TaskCompletionStatus::Done => {
+            for milestone in &mut plan.milestones {
+                milestone.status = PlanItemStatus::Completed;
+                for task in &mut milestone.tasks {
+                    task.status = PlanItemStatus::Completed;
+                }
+            }
+            plan.status = PlanItemStatus::Completed;
+        }
+        TaskCompletionStatus::Blocked
+        | TaskCompletionStatus::UserInputRequired
+        | TaskCompletionStatus::ResourceLimitReached => {
+            if let Some(milestone) = plan
+                .milestones
+                .iter_mut()
+                .find(|milestone| milestone.status != PlanItemStatus::Completed)
+            {
+                milestone.status = PlanItemStatus::Blocked;
+                if let Some(task) = milestone
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.status == PlanItemStatus::InProgress)
+                {
+                    task.status = PlanItemStatus::Blocked;
+                }
+            }
+            plan.status = PlanItemStatus::Blocked;
+        }
+        TaskCompletionStatus::Cancelled | TaskCompletionStatus::InProgress => {}
+    }
+    sync_current_milestone(task_run);
+}
+
+fn extract_plan_revision(text: &str) -> Option<(String, Vec<String>)> {
+    let mut lines = text.lines();
+    let revision = lines.find_map(|line| {
+        let (heading, reason) = line.trim().split_once(':')?;
+        heading
+            .trim()
+            .eq_ignore_ascii_case("plan revision")
+            .then(|| reason.trim().to_owned())
+    })?;
+    if revision.is_empty() {
+        return None;
+    }
+    let remaining = text
+        .lines()
+        .skip_while(|line| {
+            !line
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("plan revision:")
+        })
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let plan_start = remaining
+        .lines()
+        .position(|line| line.trim().eq_ignore_ascii_case("plan:"))?;
+    let steps = extract_plan(
+        &remaining
+            .lines()
+            .skip(plan_start)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )?
+    .into_iter()
+    .take(32)
+    .collect::<Vec<_>>();
+    (!steps.is_empty()).then_some((bounded_summary(&revision), steps))
+}
+
+fn revise_execution_plan(task_run: &mut TaskRun, reason: &str, steps: &[String]) -> bool {
+    if reason.trim().is_empty() || steps.is_empty() {
+        return false;
+    }
+    let Some(existing) = task_run.execution_plan.as_mut() else {
+        return false;
+    };
+    if existing.revision >= MAX_PLAN_REVISIONS.saturating_add(1) {
+        return false;
+    }
+    let old_steps = existing
+        .milestones
+        .iter()
+        .flat_map(|milestone| milestone.tasks.iter().map(|task| task.description.as_str()))
+        .collect::<Vec<_>>();
+    if old_steps
+        .iter()
+        .copied()
+        .eq(steps.iter().map(String::as_str))
+    {
+        return false;
+    }
+    let completed = existing
+        .milestones
+        .iter()
+        .flat_map(|milestone| milestone.tasks.iter())
+        .filter(|task| task.status == PlanItemStatus::Completed)
+        .map(|task| task.description.clone())
+        .collect::<HashSet<_>>();
+    let mut affected_architecture = Vec::new();
+    let mut validation_commands = Vec::new();
+    let mut completion_criteria = task_run.goal.acceptance_criteria.clone();
+    for milestone in &existing.milestones {
+        for item in &milestone.affected_architecture {
+            push_unique_bounded(&mut affected_architecture, item.clone(), 32);
+        }
+        for command in &milestone.validation_commands {
+            push_unique_bounded(&mut validation_commands, command.clone(), 32);
+        }
+        for criterion in &milestone.completion_criteria {
+            push_unique_bounded(&mut completion_criteria, criterion.clone(), 32);
+        }
+    }
+    let milestone = ExecutionMilestone {
+        title: "Implementation".to_owned(),
+        tasks: steps
+            .iter()
+            .map(|description| ExecutionTask {
+                description: description.clone(),
+                status: if completed.contains(description) {
+                    PlanItemStatus::Completed
+                } else {
+                    PlanItemStatus::Pending
+                },
+            })
+            .collect(),
+        affected_architecture,
+        validation_commands,
+        completion_criteria,
+        ..ExecutionMilestone::default()
+    };
+    existing.revision += 1;
+    existing.milestones = vec![milestone];
+    push_unique_bounded(&mut existing.decision_notes, bounded_summary(reason), 16);
+    existing.status = PlanItemStatus::InProgress;
+    advance_execution_plan(task_run);
+    true
 }
 
 fn push_plan_item(plan: &mut ImplementationPlan, section: PlanSection, item: String) {
@@ -953,12 +1413,51 @@ impl AgentRunner {
         if task_run.original_goal.is_empty() {
             task_run.original_goal.clone_from(&task.user_task);
         }
-        task_run.task_mode = task.task_mode;
+        if task_run.goal.objective.trim().is_empty() {
+            task_run.goal =
+                parse_goal_details(&task_run.original_goal, &task_run.acceptance_criteria);
+        }
         if !task.acceptance_criteria.is_empty() {
             task_run.acceptance_criteria = task.acceptance_criteria.clone();
         } else if task_run.acceptance_criteria.is_empty() {
             task_run.acceptance_criteria = extract_acceptance_criteria(&task.user_task);
         }
+        task_run.goal.objective = extract_goal_objective(&task_run.original_goal);
+        task_run.goal.acceptance_criteria = task_run.acceptance_criteria.clone();
+        let parsed_goal =
+            parse_goal_details(&task_run.original_goal, &task_run.acceptance_criteria);
+        if task_run.goal.constraints.is_empty() {
+            task_run.goal.constraints = parsed_goal.constraints;
+        }
+        if task_run.goal.non_goals.is_empty() {
+            task_run.goal.non_goals = parsed_goal.non_goals;
+        }
+        if task_run.goal.completion_condition.trim().is_empty()
+            || parsed_goal.completion_condition != Goal::new("").completion_condition
+        {
+            task_run.goal.completion_condition = parsed_goal.completion_condition;
+        }
+        if task_run.execution_plan.is_none() {
+            if let Some(plan) = &task_run.structured_plan {
+                task_run.execution_plan = Some(execution_plan_from_implementation(
+                    plan,
+                    &task_run.acceptance_criteria,
+                ));
+            } else if !task_run.current_plan.is_empty() {
+                let legacy_plan = ImplementationPlan {
+                    goal: task_run.original_goal.clone(),
+                    implementation_steps: task_run.current_plan.clone(),
+                    ..ImplementationPlan::default()
+                };
+                task_run.execution_plan = Some(execution_plan_from_implementation(
+                    &legacy_plan,
+                    &task_run.acceptance_criteria,
+                ));
+            }
+        }
+        task_run.task_mode = task.task_mode;
+        advance_execution_plan(&mut task_run);
+        sync_current_milestone(&mut task_run);
         task_run.completion_status = TaskCompletionStatus::InProgress;
         task_run.current_phase = TaskPhase::Understand;
         task_run.remaining_work.clear();
@@ -975,6 +1474,7 @@ impl AgentRunner {
         if let Some(previous) = &resumed_task_state {
             append_prior_task_state(&mut system_instructions, previous);
         }
+        let base_system_instructions = system_instructions.clone();
         let checkpoint_id = if let Some(checkpoints) = &self.checkpoints {
             Some(
                 checkpoints
@@ -1035,7 +1535,7 @@ impl AgentRunner {
             }
         }
         let mut context_input = ContextInput {
-            system_instructions,
+            system_instructions: base_system_instructions.clone(),
             workspace: workspace_metadata,
             instructions,
             user_request: task.user_task.clone(),
@@ -1100,6 +1600,8 @@ impl AgentRunner {
                 TaskPhase::Plan
             };
             self.update_task_run(&session_id, &collector, &task_run)?;
+            context_input.system_instructions = base_system_instructions.clone();
+            append_live_task_state(&mut context_input.system_instructions, &task_run);
             let mut assembly = match self.context_builder.build(&context_input) {
                 Ok(assembly) => assembly,
                 Err(error) => {
@@ -1109,7 +1611,7 @@ impl AgentRunner {
             if self.compaction_config.threshold_tokens > 0
                 && assembly.estimated_tokens >= self.compaction_config.threshold_tokens
             {
-                self.compact_context(&session_id, &mut context_input, &collector)?;
+                self.compact_context(&session_id, &mut context_input, &collector, &task_run)?;
                 assembly = match self.context_builder.build(&context_input) {
                     Ok(assembly) => assembly,
                     Err(error) => {
@@ -1200,10 +1702,32 @@ impl AgentRunner {
             if unresolved_error_keys.remove("runtime:provider").is_some() {
                 task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
             }
-            if let Some(plan) = extract_plan(&response.text()).filter(|plan| !plan.is_empty()) {
-                task_run.current_plan = plan;
-                task_run.current_phase = TaskPhase::Plan;
-                self.update_task_run(&session_id, &collector, &task_run)?;
+            let plan_revision = extract_plan_revision(&response.text());
+            if let Some((reason, steps)) = &plan_revision {
+                if revise_execution_plan(&mut task_run, reason, steps) {
+                    task_run.current_plan = steps.clone();
+                    task_run.current_phase = TaskPhase::Plan;
+                    self.update_task_run(&session_id, &collector, &task_run)?;
+                }
+            } else if task_run.execution_plan.is_none() {
+                if let Some(plan_steps) =
+                    extract_plan(&response.text()).filter(|plan| !plan.is_empty())
+                {
+                    task_run.current_plan = plan_steps.clone();
+                    let mut parsed = parse_implementation_plan(
+                        &task_run.original_goal,
+                        &response.text(),
+                        &task_run.relevant_files,
+                    );
+                    parsed.implementation_steps = plan_steps;
+                    task_run.execution_plan = Some(execution_plan_from_implementation(
+                        &parsed,
+                        &task_run.acceptance_criteria,
+                    ));
+                    advance_execution_plan(&mut task_run);
+                    task_run.current_phase = TaskPhase::Plan;
+                    self.update_task_run(&session_id, &collector, &task_run)?;
+                }
             }
             model_tokens += usage_tokens(response.usage.as_ref());
             let response_cost = estimate_cost_microusd(
@@ -1270,9 +1794,24 @@ impl AgentRunner {
                 let (directive, completion_text) = parse_completion_directive(&response.text());
                 let (final_message, unrelated_verification) =
                     parse_unrelated_verification_directives(&completion_text);
-                task_run.current_plan = extract_plan(&response.text())
-                    .filter(|plan| !plan.is_empty())
-                    .unwrap_or_else(|| task_run.current_plan.clone());
+                if task_run.execution_plan.is_none() {
+                    if let Some(plan_steps) =
+                        extract_plan(&response.text()).filter(|plan| !plan.is_empty())
+                    {
+                        task_run.current_plan = plan_steps.clone();
+                        let mut parsed = parse_implementation_plan(
+                            &task_run.original_goal,
+                            &response.text(),
+                            &task_run.relevant_files,
+                        );
+                        parsed.implementation_steps = plan_steps;
+                        task_run.execution_plan = Some(execution_plan_from_implementation(
+                            &parsed,
+                            &task_run.acceptance_criteria,
+                        ));
+                        advance_execution_plan(&mut task_run);
+                    }
+                }
                 if directive == Some(TaskCompletionStatus::UserInputRequired) {
                     task_run.current_phase = TaskPhase::Finish;
                     task_run.completion_status = TaskCompletionStatus::UserInputRequired;
@@ -1319,8 +1858,15 @@ impl AgentRunner {
                         &response.text(),
                         &task_run.relevant_files,
                     );
-                    task_run.current_plan = plan.implementation_steps.clone();
-                    task_run.structured_plan = Some(plan);
+                    if task_run.structured_plan.is_none() {
+                        task_run.current_plan = plan.implementation_steps.clone();
+                        task_run.execution_plan = Some(execution_plan_from_implementation(
+                            &plan,
+                            &task_run.acceptance_criteria,
+                        ));
+                        advance_execution_plan(&mut task_run);
+                        task_run.structured_plan = Some(plan);
+                    }
                     task_run.current_phase = TaskPhase::Finish;
                     self.update_task_run(&session_id, &collector, &task_run)?;
                 }
@@ -1582,6 +2128,7 @@ impl AgentRunner {
                 result.output = bounded_output;
                 result.truncated = output_truncated;
                 let changed_files = result.changed_files.clone();
+                let mut meaningful_plan_progress = !result.is_error && task_mode_denial.is_none();
                 let quick_diagnostic = quick_diagnostic_result(&result, &changed_files);
                 let final_edit_diff = (!git_available || self.verifier.is_none())
                     .then(|| complete_edit_diff(&result, &changed_files))
@@ -1648,6 +2195,7 @@ impl AgentRunner {
                             );
                             let key = format!("verification:{command}");
                             if passed {
+                                meaningful_plan_progress = true;
                                 unresolved_error_keys.remove(&key);
                                 unresolved_error_keys.remove("verification:after_last_edit");
                                 validation_since_last_edit = true;
@@ -1713,6 +2261,7 @@ impl AgentRunner {
                         is_shell: false,
                     });
                     if passed {
+                        meaningful_plan_progress = true;
                         unresolved_error_keys.remove(&key);
                         unresolved_error_keys.remove("verification:after_last_edit");
                         validation_since_last_edit = true;
@@ -1808,6 +2357,10 @@ impl AgentRunner {
                     self.limits.max_repeated_failures,
                 )?;
                 if task_run.verification_results.len() > verification_results_before {
+                    meaningful_plan_progress |= task_run.verification_results
+                        [verification_results_before..]
+                        .iter()
+                        .any(|result| result.passed);
                     validation_since_last_edit = task_run.verification_results
                         [verification_results_before..]
                         .iter()
@@ -1821,6 +2374,9 @@ impl AgentRunner {
                     // complete edit diff was reviewed and no check failed.
                     validation_since_last_edit = true;
                     unresolved_error_keys.remove("verification:after_last_edit");
+                }
+                if meaningful_plan_progress {
+                    record_plan_progress(&mut task_run);
                 }
                 task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
                 task_run.remaining_work = task_run.unresolved_errors.clone();
@@ -1868,13 +2424,14 @@ impl AgentRunner {
         &self,
         session_id: SessionId,
         collector: Arc<Mutex<Vec<HarnessEvent>>>,
-        task_run: TaskRun,
+        mut task_run: TaskRun,
         final_message: String,
         turns: u32,
         tool_calls: u32,
         model_tokens: u64,
         estimated_cost_microusd: Option<u64>,
     ) -> Result<AgentOutcome, AgentError> {
+        finish_plan_state(&mut task_run);
         self.update_task_run(&session_id, &collector, &task_run)?;
         let reason = match task_run.completion_status {
             TaskCompletionStatus::Done => None,
@@ -1947,7 +2504,9 @@ impl AgentRunner {
         task_run: &TaskRun,
         error: AgentError,
     ) -> Result<T, AgentError> {
-        let _ = self.update_task_run(&session_id, &collector, task_run);
+        let mut task_run = task_run.clone();
+        finish_plan_state(&mut task_run);
+        let _ = self.update_task_run(&session_id, &collector, &task_run);
         self.fail(session_id, collector, error)
     }
 
@@ -1956,9 +2515,12 @@ impl AgentRunner {
         session_id: &SessionId,
         context_input: &mut ContextInput,
         collector: &Arc<Mutex<Vec<HarnessEvent>>>,
+        task_run: &TaskRun,
     ) -> Result<(), AgentError> {
         let request = CompactionRequest {
             task: &context_input.user_request,
+            goal: Some(&task_run.goal),
+            execution_plan: task_run.execution_plan.as_ref(),
             conversation: &context_input.conversation,
             tool_results: &context_input.tool_results,
         };
@@ -2477,15 +3039,118 @@ fn usage_tokens(usage: Option<&Usage>) -> u64 {
 #[cfg(test)]
 mod conformance_hardening_tests {
     use super::{
-        apply_unrelated_verification_dispositions, bound_tool_result_output, complete_edit_diff,
-        decimal_microusd, estimate_cost_microusd, parse_unrelated_verification_directives,
-        quick_diagnostic_result, task_final_diff, tool_error_result,
+        advance_execution_plan, apply_unrelated_verification_dispositions,
+        bound_tool_result_output, complete_edit_diff, decimal_microusd, estimate_cost_microusd,
+        execution_plan_from_implementation, extract_plan_revision, finish_plan_state,
+        parse_unrelated_verification_directives, quick_diagnostic_result, record_plan_progress,
+        revise_execution_plan, task_final_diff, tool_error_result,
     };
     use harness_models::{ModelPricing, Usage};
-    use harness_session::{TaskRun, TaskVerificationResult};
+    use harness_session::{
+        ExecutionPlan, ImplementationPlan, PlanItemStatus, TaskCompletionStatus, TaskRun,
+        TaskVerificationResult,
+    };
     use std::collections::HashMap;
     use std::process::Command;
     use tempfile::tempdir;
+
+    #[test]
+    fn plans_advance_on_progress_and_only_revise_for_a_reason() {
+        let mut task_run = TaskRun::new("implement a durable goal");
+        let initial = ImplementationPlan {
+            goal: task_run.original_goal.clone(),
+            implementation_steps: vec![
+                "Inspect existing session state".to_owned(),
+                "Persist execution plan".to_owned(),
+            ],
+            relevant_architecture: vec!["harness-session owns durable events".to_owned()],
+            validation: vec!["cargo test -p harness-session".to_owned()],
+            ..ImplementationPlan::default()
+        };
+        task_run.execution_plan = Some(execution_plan_from_implementation(&initial, &[]));
+        advance_execution_plan(&mut task_run);
+        record_plan_progress(&mut task_run);
+        assert_eq!(
+            task_run.execution_plan.as_ref().unwrap().milestones[0].tasks[0].status,
+            PlanItemStatus::Completed
+        );
+
+        let revised_steps = vec![
+            "Inspect existing session state".to_owned(),
+            "Persist execution plan".to_owned(),
+            "Verify after compaction".to_owned(),
+        ];
+        assert!(!revise_execution_plan(&mut task_run, "", &revised_steps));
+        assert!(!revise_execution_plan(
+            &mut task_run,
+            "the saved plan still applies",
+            &revised_steps[..2]
+        ));
+        assert!(revise_execution_plan(
+            &mut task_run,
+            "compaction testing revealed a missing resume step",
+            &revised_steps
+        ));
+        let plan = task_run.execution_plan.as_ref().unwrap();
+        assert_eq!(plan.revision, 2);
+        assert_eq!(
+            plan.decision_notes,
+            ["compaction testing revealed a missing resume step"]
+        );
+        assert_eq!(
+            plan.milestones[0].tasks[0].status,
+            PlanItemStatus::Completed
+        );
+        assert_eq!(
+            plan.milestones[0].tasks[1].status,
+            PlanItemStatus::InProgress
+        );
+        assert_eq!(
+            plan.milestones[0].affected_architecture,
+            ["harness-session owns durable events"]
+        );
+        assert_eq!(
+            plan.milestones[0].validation_commands,
+            ["cargo test -p harness-session"]
+        );
+
+        let ordinary_plan_text = "Plan:\n- replace the existing approach";
+        assert!(extract_plan_revision(ordinary_plan_text).is_none());
+        let revision_text = "Plan revision: a fixture exposed a missing validation step\nPlan:\n- inspect\n- validate";
+        assert_eq!(
+            extract_plan_revision(revision_text).unwrap().0,
+            "a fixture exposed a missing validation step"
+        );
+        assert_eq!(task_run.execution_plan.as_ref().unwrap().revision, 2);
+    }
+
+    #[test]
+    fn failed_milestone_is_persisted_as_blocked() {
+        let mut task_run = TaskRun::new("finish a task");
+        task_run.execution_plan = Some(ExecutionPlan {
+            revision: 1,
+            status: PlanItemStatus::InProgress,
+            milestones: vec![harness_session::ExecutionMilestone {
+                title: "Validate".to_owned(),
+                tasks: vec![harness_session::ExecutionTask {
+                    description: "Run the required check".to_owned(),
+                    status: PlanItemStatus::InProgress,
+                }],
+                status: PlanItemStatus::InProgress,
+                ..harness_session::ExecutionMilestone::default()
+            }],
+            ..ExecutionPlan::default()
+        });
+        task_run.completion_status = TaskCompletionStatus::Blocked;
+
+        finish_plan_state(&mut task_run);
+
+        let plan = task_run.execution_plan.unwrap();
+        assert_eq!(plan.status, PlanItemStatus::Blocked);
+        assert_eq!(plan.milestones[0].status, PlanItemStatus::Blocked);
+        assert_eq!(plan.milestones[0].tasks[0].status, PlanItemStatus::Blocked);
+        assert_eq!(task_run.goal.current_milestone.as_deref(), Some("Validate"));
+    }
 
     #[test]
     fn tool_errors_are_marked_and_large_utf8_results_are_bounded() {

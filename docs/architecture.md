@@ -37,10 +37,17 @@ they do not implement agent behavior.
 The runtime owns a provider-neutral `TaskRun` snapshot for each active task.
 `harness-agent` updates it as the run moves through understand, plan, search/read,
 edit, verify, diff inspection, repair, and finish. The session reducer restores
-the latest snapshot from `task.run.updated` events, including the original goal,
-known acceptance criteria, files, commands, verification results, unresolved
-errors, remaining work, and terminal status. The desktop and CLI render events;
-they do not decide whether work is complete.
+the latest snapshot from `task.run.updated` events. It contains a structured
+`Goal` (objective, constraints, acceptance criteria, non-goals, current
+milestone, and completion condition) and an optional revisioned `ExecutionPlan`
+(milestones, tasks, architecture, validation commands, completion criteria,
+decision notes, and status). It also retains files, commands, verification
+results, unresolved errors, remaining work, and terminal status. Context
+compaction records the goal and active plan alongside conversation summaries,
+and each model turn receives the latest incomplete work from runtime state.
+Ordinary repeated `Plan:` text does not replace a saved plan. A revision needs a
+specific reason and is capped at three per task. The desktop and CLI render this
+state; they do not decide whether work is complete.
 
 Completion is gated on unresolved tool and verification errors. A failed command
 or test is returned as an error observation to the model, which may revise its
@@ -79,16 +86,20 @@ can implement an approved plan without repeating repository discovery. Simple
 tasks may go directly to CODE; general agent instructions let a model recommend
 PLAN when scope or risk warrants it.
 
-The CLI exposes `/explore`, `/plan`, and `/code`; the desktop composer has a
-separate Task behavior selector next to the execution permission selector. The
+The CLI exposes `/explore`, `/plan`, `/code`, `/goal`, and `/plan-status`; the
+desktop composer has a separate Task behavior selector next to the execution
+permission selector and shows compact persisted goal/milestone progress. The
 clients send the mode on a task request and display persisted session state; the
-runtime owns enforcement, plan state, and continuation.
+runtime owns enforcement, plan state, and continuation. `/goal` and
+`/plan-status` read the active session or an explicitly supplied session ID.
 
 Agent safeguards can be tuned in the runtime environment with
 `COGITO_AGENT_MAX_TURNS`, `COGITO_AGENT_MAX_TOOL_CALLS`,
 `COGITO_AGENT_MAX_RUNTIME_SECONDS`, `COGITO_AGENT_MAX_MODEL_TOKENS`,
 `COGITO_AGENT_MAX_COST_USD`, `COGITO_AGENT_MAX_REPEATED_TOOL_CALLS`, and
 `COGITO_AGENT_MAX_REPEATED_FAILURES`. Invalid values fall back to defaults.
+The defaults are 256 model turns, 512 tool calls, one hour of runtime, and one
+million reported model tokens. Known-cost enforcement remains opt-in.
 
 ## Repository intelligence
 

@@ -45,6 +45,8 @@ enum InteractiveCommand {
     Inspect,
     Sessions,
     Status,
+    Goal,
+    PlanStatus,
     Diff,
     Undo,
     Config,
@@ -117,6 +119,20 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandDefinition] = &[
         usage: "/status [session-id]",
         description: "Show session status",
         command: InteractiveCommand::Status,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/goal",
+        usage: "/goal [session-id]",
+        description: "Show the durable objective and completion condition",
+        command: InteractiveCommand::Goal,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/plan-status",
+        usage: "/plan-status [session-id]",
+        description: "Show persisted milestone and task progress",
+        command: InteractiveCommand::PlanStatus,
         plain_supported: true,
     },
     InteractiveCommandDefinition {
@@ -729,6 +745,20 @@ fn plain_interactive(
                     (!arguments.is_empty()).then_some(arguments),
                     None,
                 )?,
+                InteractiveCommand::Goal => {
+                    if arguments.is_empty() {
+                        eprintln!("usage: /goal <session-id>");
+                    } else {
+                        task_state_command(&session_cli, Some(arguments), false)?;
+                    }
+                }
+                InteractiveCommand::PlanStatus => {
+                    if arguments.is_empty() {
+                        eprintln!("usage: /plan-status <session-id>");
+                    } else {
+                        task_state_command(&session_cli, Some(arguments), true)?;
+                    }
+                }
                 InteractiveCommand::Diff => {
                     let file =
                         (!arguments.is_empty()).then(|| PathBuf::from(arguments.trim_matches('"')));
@@ -919,6 +949,16 @@ fn dispatch_interactive(
         InteractiveCommand::Status => run_visible_command(tui, || {
             status(cli, (!arguments.is_empty()).then_some(arguments), None)
         }),
+        InteractiveCommand::Goal | InteractiveCommand::PlanStatus => {
+            let session_id = session_argument_or_active(arguments, tui.active_session_id())?;
+            run_visible_command(tui, || {
+                task_state_command(
+                    cli,
+                    Some(&session_id),
+                    command == InteractiveCommand::PlanStatus,
+                )
+            })
+        }
         InteractiveCommand::Diff => {
             let file = (!arguments.is_empty()).then(|| PathBuf::from(arguments.trim_matches('"')));
             run_visible_command(tui, || diff(cli, file.as_deref(), None))
@@ -1475,6 +1515,126 @@ fn configured_mode(cli: &Cli) -> Result<&'static str, Box<dyn std::error::Error>
 fn sessions(cli: &Cli, limit: usize) -> Result<(), Box<dyn std::error::Error>> {
     let store = JsonlSessionStore::new(&cli.session_root)?;
     print_sessions(&store.recent(limit)?, cli.json)
+}
+
+fn session_argument_or_active(
+    argument: &str,
+    active_session: Option<String>,
+) -> Result<String, String> {
+    let argument = argument.trim();
+    if !argument.is_empty() {
+        if argument.split_whitespace().count() != 1 {
+            return Err("usage: /goal [session-id]".to_owned());
+        }
+        return Ok(argument.to_owned());
+    }
+    active_session.ok_or_else(|| {
+        "there is no active session yet; run a task or provide a session ID".to_owned()
+    })
+}
+
+fn task_state_command(
+    cli: &Cli,
+    session_id: Option<&str>,
+    show_plan: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session_id = session_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("usage: /goal [session-id] or /plan-status [session-id]")?;
+    let session_id = SessionId::new(session_id.to_owned())?;
+    let session = JsonlSessionStore::new(&cli.session_root)?.load(&session_id)?;
+    let task_run = session
+        .state()?
+        .task_run
+        .ok_or("the selected session has no persisted task goal yet")?;
+    if cli.json {
+        let value = if show_plan {
+            json!({
+                "session_id": session_id,
+                "execution_plan": task_run.execution_plan,
+                "current_milestone": task_run.goal.current_milestone,
+                "completion_status": task_run.completion_status,
+            })
+        } else {
+            json!({
+                "session_id": session_id,
+                "goal": task_run.goal,
+                "completion_status": task_run.completion_status,
+                "remaining_work": task_run.remaining_work,
+            })
+        };
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    if show_plan {
+        let Some(plan) = task_run.execution_plan else {
+            println!("No execution plan has been saved for this session.");
+            return Ok(());
+        };
+        println!(
+            "Plan · revision {} · {:?} · session {}",
+            plan.revision, plan.status, session_id
+        );
+        for (index, milestone) in plan.milestones.iter().enumerate() {
+            println!(
+                "\n{}. {} · {:?}",
+                index + 1,
+                milestone.title,
+                milestone.status
+            );
+            for task in &milestone.tasks {
+                println!(
+                    "  [{}] {}",
+                    plan_status_label(task.status),
+                    task.description
+                );
+            }
+            for command in &milestone.validation_commands {
+                println!("  validate: {command}");
+            }
+        }
+        for note in &plan.decision_notes {
+            println!("decision: {note}");
+        }
+    } else {
+        println!(
+            "Goal · {:?} · session {}",
+            task_run.completion_status, session_id
+        );
+        println!("{}", task_run.goal.objective);
+        if let Some(milestone) = &task_run.goal.current_milestone {
+            println!("Current milestone: {milestone}");
+        }
+        println!("Done when: {}", task_run.goal.completion_condition);
+        for (label, values) in [
+            ("Acceptance", &task_run.goal.acceptance_criteria),
+            ("Constraints", &task_run.goal.constraints),
+            ("Non-goals", &task_run.goal.non_goals),
+        ] {
+            if !values.is_empty() {
+                println!("{label}:");
+                for value in values {
+                    println!("  · {value}");
+                }
+            }
+        }
+        if !task_run.remaining_work.is_empty() {
+            println!("Remaining work:");
+            for item in &task_run.remaining_work {
+                println!("  · {item}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_status_label(status: harness_session::PlanItemStatus) -> &'static str {
+    match status {
+        harness_session::PlanItemStatus::Pending => "pending",
+        harness_session::PlanItemStatus::InProgress => "active",
+        harness_session::PlanItemStatus::Completed => "done",
+        harness_session::PlanItemStatus::Blocked => "blocked",
+    }
 }
 
 fn resume_session(
@@ -3027,8 +3187,20 @@ mod interactive_command_tests {
     fn help_uses_the_command_catalog_and_limits_plain_mode_to_supported_commands() {
         let full_help = interactive_help(false);
         for command in [
-            "/help", "/model", "/models", "/mode", "/explore", "/plan", "/code", "/diff", "/undo",
-            "/resume", "/clear", "/exit",
+            "/help",
+            "/model",
+            "/models",
+            "/mode",
+            "/explore",
+            "/plan",
+            "/goal",
+            "/plan-status",
+            "/code",
+            "/diff",
+            "/undo",
+            "/resume",
+            "/clear",
+            "/exit",
         ] {
             assert!(
                 full_help.contains(command),
@@ -3039,6 +3211,8 @@ mod interactive_command_tests {
         assert!(plain_help.contains("/mode"));
         assert!(plain_help.contains("/explore"));
         assert!(plain_help.contains("/plan"));
+        assert!(plain_help.contains("/plan-status"));
+        assert!(plain_help.contains("/goal"));
         assert!(plain_help.contains("/code"));
         assert!(!plain_help.contains("/cancel"));
         assert!(!plain_help.contains("/clear"));
@@ -3068,5 +3242,46 @@ mod interactive_command_tests {
             command: None,
         };
         assert_eq!(configured_mode(&cli).unwrap(), "safe");
+    }
+
+    #[test]
+    fn goal_and_plan_status_commands_read_the_persisted_session_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cli = Cli::try_parse_from(["harness", "--json"]).unwrap();
+        cli.session_root = directory.path().join("sessions");
+        let store = JsonlSessionStore::new(&cli.session_root).unwrap();
+        let session = store.create(directory.path()).unwrap();
+        let mut task_run = harness_session::TaskRun::new("Keep the objective after compaction");
+        task_run.execution_plan = Some(harness_session::ExecutionPlan {
+            revision: 1,
+            status: harness_session::PlanItemStatus::InProgress,
+            milestones: vec![harness_session::ExecutionMilestone {
+                title: "Persist state".to_owned(),
+                tasks: vec![harness_session::ExecutionTask {
+                    description: "Save milestone state".to_owned(),
+                    status: harness_session::PlanItemStatus::InProgress,
+                }],
+                ..harness_session::ExecutionMilestone::default()
+            }],
+            ..harness_session::ExecutionPlan::default()
+        });
+        store
+            .append_event(
+                &session.id,
+                HarnessEvent::new(
+                    session.id.clone(),
+                    EventPayload::TaskRunUpdated { task_run },
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+
+        assert!(task_state_command(&cli, Some(&session.id.to_string()), false).is_ok());
+        assert!(task_state_command(&cli, Some(&session.id.to_string()), true).is_ok());
+        assert_eq!(
+            session_argument_or_active("", Some(session.id.to_string())).unwrap(),
+            session.id.to_string()
+        );
     }
 }

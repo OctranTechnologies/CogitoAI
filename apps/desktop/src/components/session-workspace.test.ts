@@ -130,6 +130,54 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+it("shows compact progress from the latest persisted task goal", () => {
+  const objective = "Add durable goals that survive compaction and process restart";
+  setup({
+    events: [
+      event("task.run.updated", {
+        task_run: {
+          original_goal: objective,
+          goal: {
+            objective,
+            constraints: [],
+            acceptance_criteria: ["Keep task state durable"],
+            non_goals: [],
+            current_milestone: "Persist session state",
+            completion_condition: "Validation passes",
+          },
+          execution_plan: {
+            revision: 1,
+            status: "in_progress",
+            decision_notes: [],
+            milestones: [
+              {
+                title: "Persist session state",
+                status: "in_progress",
+                tasks: [
+                  { description: "Add the goal object", status: "completed" },
+                  { description: "Restore after restart", status: "in_progress" },
+                ],
+                affected_architecture: [],
+                validation_commands: [],
+                completion_criteria: [],
+              },
+            ],
+          },
+          current_phase: "edit",
+          completion_status: "in_progress",
+        },
+      }),
+    ],
+  });
+
+  const progress = screen.getByTestId("goal-progress");
+  expect(progress.textContent).toContain(objective);
+  expect(progress.textContent).toContain("Persist session state");
+  expect(progress.textContent).toContain("1/2");
+  expect(within(progress).getByRole("progressbar").getAttribute("aria-valuenow")).toBe("1");
+  expect(progress.getAttribute("title")).toBe(objective);
+});
+
 describe("session header", () => {
   it("shows only what the runtime reported", () => {
     setup();

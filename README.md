@@ -51,12 +51,17 @@ cleanly. The same task produces the same event stream whether a person or a scri
 is watching.
 
 **Task-aware completion.** The runtime persists a `TaskRun` snapshot in the
-session event log: the original goal, known acceptance criteria, plan, files,
-commands, verification results, unresolved errors, remaining work, and completion
-status. Failed commands and tests return to the model as errors so it can revise
-and retry. The runtime does not mark a task done while those recorded failures
-remain unresolved; repeated identical calls and repeated failures become
-`blocked`. A model can request a decision with `[USER_INPUT_REQUIRED]`.
+session event log, including a structured `Goal` and revisioned `ExecutionPlan`:
+objective, constraints, acceptance criteria, non-goals, milestones, tasks,
+validation, decision notes, and completion condition. Progress snapshots survive
+process and desktop restarts. Context compaction carries the objective and current
+plan forward, so the model can resume from the next incomplete step without
+depending on chat history. Ordinary `Plan:` text cannot replace a saved plan;
+revisions require a concrete reason and are bounded. Failed commands and tests
+return to the model as errors so it can revise and retry. The runtime does not
+mark a task done while recorded failures remain unresolved; repeated identical
+calls and repeated failures become `blocked`. A model can request a decision with
+`[USER_INPUT_REQUIRED]`.
 
 **CLI and desktop over one runtime.** Both clients use the shared loopback RPC
 bootstrap for agent runs and drive the same agent core, policy engine, and session
@@ -487,8 +492,11 @@ Everything in this list is implemented and covered by tests.
 **Agent and tools**
 
 - Single-agent loop with tool calling, streaming deltas, and usage accounting.
-- Runtime-owned task state with persisted plans, verification feedback, completion
-  gating, and repeated-call/failure safeguards.
+- Runtime-owned goals and revisioned milestone plans persisted in session events;
+  compaction, interruption, and session resume preserve objective and progress.
+- Default safeguards support up to 256 model turns, 512 tool calls, one hour of
+  runtime, and one million reported model tokens; environment limits can lower or
+  raise these bounds. Plan revisions remain limited to three per task.
 - Fifteen bounded tools: file and process operations plus repository intelligence
   (`search_files`, `search_text`, `find_symbol`, `find_references`,
   `goto_definition`, `get_diagnostics`, `get_file_outline`, and `get_repo_tree`).
@@ -538,10 +546,14 @@ Everything in this list is implemented and covered by tests.
 - A Git workspace's final diff is passed to the model after the last edit before
   completion. A task is not marked done while a patch-related verification error
   remains unresolved.
+- Goal and plan progress is visible as a compact line in the desktop session and
+  inspectable with CLI `/goal` and `/plan-status` (optionally followed by a session
+  ID in the line-oriented fallback).
 - Git-aware checkpoints and precise, conflict-refusing undo.
 - Compaction of long sessions with the full history preserved.
 
-Persistent runtime limits can be tuned with `COGITO_AGENT_MAX_TURNS`,
+Persistent runtime limits default to 256 turns, 512 tool calls, 3600 seconds, and
+1,000,000 model tokens; tune them with `COGITO_AGENT_MAX_TURNS`,
 `COGITO_AGENT_MAX_TOOL_CALLS`, `COGITO_AGENT_MAX_RUNTIME_SECONDS`,
 `COGITO_AGENT_MAX_MODEL_TOKENS`, `COGITO_AGENT_MAX_COST_USD`,
 `COGITO_AGENT_MAX_REPEATED_TOOL_CALLS`, and `COGITO_AGENT_MAX_REPEATED_FAILURES`.
@@ -697,7 +709,7 @@ repository discoveries forward.
 
 The interactive slash commands are `/help`, `/run`, `/resume`, `/inspect`,
 `/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/models`, `/connect`, `/mode`,
-`/explore`, `/plan`, `/code`,
+`/explore`, `/plan`, `/code`, `/goal`, and `/plan-status`,
 `/clear`, `/cancel`, and `/exit`. `/models` shows the cached model registry;
 `/models refresh [provider-id]` refreshes all catalogs or one provider. `/model`
 shows the current provider/model; `/model provider/model-id` changes it. `/mode`
@@ -707,6 +719,9 @@ workspace policy; change that setting in `.agent/config.toml` and restart the CL
 not change `/mode`, which remains the workspace's execution permission level.
 After reviewing a PLAN result, use `/code` and submit an implementation request
 in the same session to continue from the persisted plan.
+`/goal` shows the saved objective and completion condition; `/plan-status` shows
+milestone/task progress and plan revisions for the active session. Supply a
+session ID to either command when using the line-oriented fallback.
 Tab completes commands. The `TERM=dumb` line-oriented fallback lists only the
 commands it supports while preserving ordinary terminal output.
 

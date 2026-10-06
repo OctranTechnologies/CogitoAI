@@ -1,4 +1,4 @@
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, ListTodo } from "lucide-react";
 import { ActivityStream } from "./activity-stream";
 import { Inspector, InspectorToggle, type InspectorTab } from "./inspector";
 import { PromptComposer } from "./prompt-composer";
@@ -7,7 +7,7 @@ import { TerminalPanel } from "./terminal-panel";
 import { buildActivityStream, summariseStream, type ActivityBlock } from "../lib/activity";
 import { useAutoScroll } from "../lib/auto-scroll";
 import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
-import type { HarnessEvent, TaskMode } from "../lib/rpc";
+import type { HarnessEvent, TaskMode, TaskRunSnapshot } from "../lib/rpc";
 import type { CheckpointEntry, ChangeEntry, FileChange, FileView } from "../lib/changes";
 import type { RunPhase } from "../lib/events";
 
@@ -90,6 +90,7 @@ export interface SessionWorkspaceProps {
 export function SessionWorkspace(props: SessionWorkspaceProps) {
   const blocks: ActivityBlock[] = buildActivityStream(props.events, { approvals: props.approvals });
   const summary = summariseStream(blocks);
+  const taskRun = latestTaskRun(props.events);
 
   // Re-derive and follow whenever the log grows.
   const { ref, following, resume } = useAutoScroll(blocks.length);
@@ -115,6 +116,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
           <InspectorToggle open={props.inspector.open} onClick={props.inspector.onToggle} />
         </div>
       </div>
+
+      {taskRun ? <TaskProgress taskRun={taskRun} /> : null}
 
       <div className="relative flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
@@ -218,5 +221,63 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
         ) : null}
       </div>
     </section>
+  );
+}
+
+function latestTaskRun(events: HarnessEvent[]): TaskRunSnapshot | null {
+  const event = events
+    .slice()
+    .reverse()
+    .find((item) => item.event_type === "task.run.updated");
+  const taskRun = event?.payload.data.task_run;
+  if (typeof taskRun !== "object" || taskRun === null) return null;
+  const snapshot = taskRun as Partial<TaskRunSnapshot>;
+  if (typeof snapshot.goal?.objective !== "string" || !snapshot.goal.objective.trim()) return null;
+  return snapshot as TaskRunSnapshot;
+}
+
+function TaskProgress({ taskRun }: { taskRun: TaskRunSnapshot }) {
+  const milestones = taskRun.execution_plan?.milestones ?? [];
+  const tasks = milestones.flatMap((milestone) => milestone.tasks);
+  const completed = tasks.filter((task) => task.status === "completed").length;
+  const activeMilestone = milestones.find((milestone) => milestone.status !== "completed");
+  const total = tasks.length;
+  const percentage = total ? Math.round((completed / total) * 100) : 0;
+  const phase = taskRun.current_phase.replaceAll("_", " ");
+
+  return (
+    <div
+      className="flex shrink-0 items-center gap-2 border-b border-line px-4 py-1 text-2xs"
+      data-testid="goal-progress"
+      title={taskRun.goal.objective}
+    >
+      <ListTodo className="size-icon-xs shrink-0 text-faint" aria-hidden="true" />
+      <span className="min-w-0 flex-1 truncate text-secondary" title={taskRun.goal.objective}>
+        {taskRun.goal.objective}
+      </span>
+      {activeMilestone ? (
+        <span className="hidden max-w-[35%] truncate text-muted md:inline-flex" title={activeMilestone.title}>
+          {activeMilestone.title}
+        </span>
+      ) : (
+        <span className="hidden capitalize text-muted md:inline-flex">{phase}</span>
+      )}
+      {total > 0 ? (
+        <>
+          <span className="shrink-0 tabular-nums text-faint">{completed}/{total}</span>
+          <span
+            className="h-1 shrink-0 overflow-hidden rounded-full bg-line"
+            style={{ width: "3rem" }}
+            role="progressbar"
+            aria-label="Planned task progress"
+            aria-valuemin={0}
+            aria-valuemax={total}
+            aria-valuenow={completed}
+          >
+            <span className="block h-full rounded-full bg-accent" style={{ width: `${percentage}%` }} />
+          </span>
+        </>
+      ) : null}
+    </div>
   );
 }

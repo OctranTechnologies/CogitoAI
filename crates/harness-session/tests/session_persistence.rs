@@ -26,6 +26,7 @@ fn compacted_state(task: &str) -> CompactState {
         failed_attempts: vec![],
         test_status: vec!["cargo test passed".to_owned()],
         remaining_work: vec!["resume verification".to_owned()],
+        ..CompactState::default()
     }
 }
 
@@ -38,6 +39,63 @@ fn legacy_task_run_payloads_default_to_code_mode_without_a_plan() {
 
     assert_eq!(task_run.task_mode, TaskMode::Code);
     assert!(task_run.structured_plan.is_none());
+    assert!(task_run.execution_plan.is_none());
+    assert!(task_run.goal.objective.is_empty());
+}
+
+#[test]
+fn goal_and_execution_plan_survive_event_log_reload_and_compaction_rendering() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = JsonlSessionStore::new(temporary.path().join("sessions")).unwrap();
+    let session = store.create(&workspace).unwrap();
+    let mut task_run = TaskRun::new("Add resumable goals");
+    task_run.goal.constraints = vec!["Keep the runtime as the source of truth".to_owned()];
+    task_run.goal.acceptance_criteria = vec!["Survive compaction".to_owned()];
+    task_run.goal.non_goals = vec!["No workflow engine".to_owned()];
+    task_run.goal.current_milestone = Some("Persist state".to_owned());
+    task_run.goal.completion_condition = "Tests pass and diff is inspected".to_owned();
+    task_run.execution_plan = Some(harness_session::ExecutionPlan {
+        revision: 2,
+        status: harness_session::PlanItemStatus::InProgress,
+        milestones: vec![harness_session::ExecutionMilestone {
+            title: "Persist state".to_owned(),
+            tasks: vec![harness_session::ExecutionTask {
+                description: "Store the goal in the session event".to_owned(),
+                status: harness_session::PlanItemStatus::InProgress,
+            }],
+            validation_commands: vec!["cargo test -p harness-session".to_owned()],
+            ..harness_session::ExecutionMilestone::default()
+        }],
+        decision_notes: vec!["Keep plans runtime-owned".to_owned()],
+    });
+
+    append(&store, &session, EventPayload::TaskRunUpdated { task_run });
+
+    let loaded = store.load(&session.id).unwrap().state().unwrap();
+    let task_run = loaded.task_run.unwrap();
+    assert_eq!(task_run.goal.objective, "Add resumable goals");
+    assert_eq!(
+        task_run.goal.current_milestone.as_deref(),
+        Some("Persist state")
+    );
+    assert_eq!(task_run.execution_plan.as_ref().unwrap().revision, 2);
+    assert_eq!(
+        task_run.execution_plan.as_ref().unwrap().milestones[0].tasks[0].status,
+        harness_session::PlanItemStatus::InProgress
+    );
+
+    let compacted = CompactState {
+        task: "current turn summary".to_owned(),
+        goal: Some(task_run.goal),
+        execution_plan: task_run.execution_plan,
+        ..CompactState::default()
+    };
+    let rendered = compacted.render();
+    assert!(rendered.contains("Add resumable goals"));
+    assert!(rendered.contains("Persist state"));
+    assert!(rendered.contains("Store the goal in the session event"));
 }
 
 #[test]

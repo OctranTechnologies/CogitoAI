@@ -121,6 +121,12 @@ pub enum EventType {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompactState {
     pub task: String,
+    /// Durable objective carried across context compaction.
+    #[serde(default)]
+    pub goal: Option<Goal>,
+    /// A compact copy of the current execution plan, including progress.
+    #[serde(default)]
+    pub execution_plan: Option<ExecutionPlan>,
     pub current_approach: String,
     pub discoveries: Vec<String>,
     pub important_files: Vec<String>,
@@ -172,6 +178,78 @@ pub struct ImplementationPlan {
     pub risks_or_unknowns: Vec<String>,
 }
 
+/// Durable statement of what a long-running task is intended to accomplish.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Goal {
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    #[serde(default)]
+    pub current_milestone: Option<String>,
+    #[serde(default)]
+    pub completion_condition: String,
+}
+
+impl Goal {
+    pub fn new(objective: impl Into<String>) -> Self {
+        Self {
+            objective: objective.into(),
+            completion_condition: "Acceptance criteria pass, relevant validation succeeds, and the final diff is inspected; otherwise report the blocker or remaining work.".to_owned(),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanItemStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionTask {
+    pub description: String,
+    #[serde(default)]
+    pub status: PlanItemStatus,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionMilestone {
+    pub title: String,
+    #[serde(default)]
+    pub tasks: Vec<ExecutionTask>,
+    #[serde(default)]
+    pub affected_architecture: Vec<String>,
+    #[serde(default)]
+    pub validation_commands: Vec<String>,
+    #[serde(default)]
+    pub completion_criteria: Vec<String>,
+    #[serde(default)]
+    pub status: PlanItemStatus,
+}
+
+/// Runtime-owned, revisioned plan stored with the session's task snapshots.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionPlan {
+    #[serde(default)]
+    pub revision: u32,
+    #[serde(default)]
+    pub milestones: Vec<ExecutionMilestone>,
+    #[serde(default)]
+    pub decision_notes: Vec<String>,
+    #[serde(default)]
+    pub status: PlanItemStatus,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCompletionStatus {
@@ -203,6 +281,8 @@ pub struct TaskVerificationResult {
 pub struct TaskRun {
     pub original_goal: String,
     #[serde(default)]
+    pub goal: Goal,
+    #[serde(default)]
     pub task_mode: TaskMode,
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
@@ -212,6 +292,8 @@ pub struct TaskRun {
     pub current_plan: Vec<String>,
     #[serde(default)]
     pub structured_plan: Option<ImplementationPlan>,
+    #[serde(default)]
+    pub execution_plan: Option<ExecutionPlan>,
     #[serde(default)]
     pub relevant_files: Vec<PathBuf>,
     #[serde(default)]
@@ -232,8 +314,10 @@ pub struct TaskRun {
 
 impl TaskRun {
     pub fn new(goal: impl Into<String>) -> Self {
+        let original_goal = goal.into();
         Self {
-            original_goal: goal.into(),
+            goal: Goal::new(original_goal.clone()),
+            original_goal,
             ..Self::default()
         }
     }
@@ -243,6 +327,41 @@ impl CompactState {
     pub fn render(&self) -> String {
         let mut sections = Vec::new();
         push_section(&mut sections, "task", std::slice::from_ref(&self.task));
+        if let Some(goal) = &self.goal {
+            push_section(
+                &mut sections,
+                "persistent objective",
+                std::slice::from_ref(&goal.objective),
+            );
+            push_section(
+                &mut sections,
+                "acceptance criteria",
+                &goal.acceptance_criteria,
+            );
+            push_section(&mut sections, "constraints", &goal.constraints);
+            push_section(&mut sections, "non-goals", &goal.non_goals);
+            push_section(
+                &mut sections,
+                "completion condition",
+                std::slice::from_ref(&goal.completion_condition),
+            );
+        }
+        if let Some(plan) = &self.execution_plan {
+            let progress = plan
+                .milestones
+                .iter()
+                .flat_map(|milestone| {
+                    std::iter::once(format!("{} [{:?}]", milestone.title, milestone.status)).chain(
+                        milestone
+                            .tasks
+                            .iter()
+                            .map(|task| format!("- {:?}: {}", task.status, task.description)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            push_section(&mut sections, "execution plan progress", &progress);
+            push_section(&mut sections, "plan decisions", &plan.decision_notes);
+        }
         push_section(
             &mut sections,
             "current approach",

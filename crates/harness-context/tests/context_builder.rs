@@ -178,6 +178,7 @@ fn includes_compacted_working_state_in_prompt() {
         failed_attempts: vec![],
         test_status: vec!["workspace tests pass".to_owned()],
         remaining_work: vec!["Resume verification".to_owned()],
+        ..CompactState::default()
     });
 
     let assembly = ContextBuilder::default().build(&input).unwrap();
