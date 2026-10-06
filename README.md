@@ -74,6 +74,54 @@ tests, failures, tried approaches, and next steps for resume. Task snapshots
 record estimated and provider-reported input tokens, reusable context, compaction
 count, and repository-retrieval effectiveness where known.
 
+**Coding-agent customization.** User `AGENTS.md` instructions are loaded first,
+then repository instructions, then more specific subdirectory instructions.
+`AGENTS.md` is primary; `CLAUDE.md` and `.agent/instructions.md` are also read
+for compatibility. The user-level file is `$COGITO_CONFIG_DIR/AGENTS.md` when
+that variable is configured; otherwise it is under the platform's CogitoAI
+application configuration directory. The agent initially receives only
+instructions applicable to its starting directory and can query inherited
+instructions for another path with `get_instructions`.
+
+Project skills live at `.agent/skills/<skill-name>/SKILL.md`. Optional scripts
+and reference files can sit beside the skill file or in subdirectories. The
+initial context includes only each skill's name, description, and `when_to_use`
+metadata. The agent loads a selected skill through `load_skill`; supporting
+files are retrieved separately only when needed. A skill can start with simple
+YAML-style metadata:
+
+```markdown
+---
+name: rust-tests
+description: Run focused Rust validation
+when_to_use: when editing Rust crates
+---
+Run the narrowest relevant test first, then broaden checks as needed.
+```
+
+Optional project lifecycle hooks are configured in `.agent/hooks.toml`. Each
+`[[hooks]]` entry has an `event`, `command`, optional `timeout_ms` (default 10
+seconds, maximum 60 seconds), and `on_error` (`continue` by default or `block`).
+For example, run formatting after an edit and prevent edits to generated files:
+
+```toml
+protected_paths = ["src/generated/**"]
+
+[[hooks]]
+event = "after_edit"
+command = "cargo fmt --all"
+timeout_ms = 15000
+on_error = "block"
+```
+
+Hooks may use `session_start`, `before_model`, `before_tool`, `after_tool`,
+`before_edit`, `after_edit`, `before_command`, `after_command`, `before_compact`,
+`after_compact`, and `session_end`. Hook commands run through the normal shell
+tool, permission checks, approval flow, cancellation, timeout, and output limits;
+they cannot grant themselves permission. EXPLORE and PLAN modes do not run hook
+commands. Invalid configuration stops the run with a diagnostic instead of
+silently disabling protection rules.
+
 **CLI and desktop over one runtime.** Both clients use the shared loopback RPC
 bootstrap for agent runs and drive the same agent core, policy engine, and session
 store. They reuse a healthy runtime or start a detached runtime process when none

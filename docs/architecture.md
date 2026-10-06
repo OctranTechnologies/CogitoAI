@@ -62,6 +62,34 @@ reusable context, compaction frequency, repository retrieval queries, and
 retrieved files later changed, so long-session behavior can be measured without
 putting old output back into the prompt.
 
+## Coding-agent customization
+
+Workspace discovery orders applicable user `AGENTS.md`, repository
+`AGENTS.md`/`CLAUDE.md`, and nested directory instructions from parent to child.
+`AGENTS.md` is the primary format; `CLAUDE.md` and the existing
+`.agent/instructions.md` remain compatible. The agent can query additional
+inherited instruction files for a relevant path through the policy-governed
+`get_instructions` read tool instead of loading every subdirectory file at task
+start.
+
+Project skills use `.agent/skills/<name>/SKILL.md`. Their short metadata is
+listed in the initial workspace context and by `list_skills`; the full file is
+returned only after the model selects `load_skill`. Resource names are listed
+without reading their contents, so the agent can retrieve a reference or script
+only when needed. Skill tools are ordinary workspace reads subject to the same
+tool policy and workspace boundary as source files.
+
+`.agent/hooks.toml` defines bounded lifecycle command hooks and additional
+protected path patterns. Commands are executed by the normal `shell` tool, so
+they pass through policy evaluation, approval, cancellation, timeout, and output
+limits. A hook can block an operation or report a failure; it cannot turn a
+policy DENY into ALLOW. Before-operation hooks run only after the requested
+operation is itself allowed or approved. EXPLORE and PLAN suppress hook command
+execution, while protected path rules remain veto-only. Broken hook config
+fails with a diagnostic, hook timeouts are capped at one minute, and
+`on_error = "continue"` versus `"block"` controls deterministic failure
+handling. There is no plugin marketplace or package installation layer.
+
 Planning is a model judgment, not a separate workflow engine. Search, read,
 edit, verification, and repair are ordinary normalized model/tool turns under
 the same policy and event contracts. The desktop and CLI present the workflow;

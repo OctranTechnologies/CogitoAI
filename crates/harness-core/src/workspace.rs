@@ -145,6 +145,7 @@ pub struct WorkspaceConfiguration {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum InstructionKind {
+    GlobalAgents,
     Agents,
     Claude,
     Readme,
@@ -246,7 +247,7 @@ pub fn discover_workspace(start: &Path) -> Result<WorkspaceDescription, Error> {
         source: configuration_path.is_file().then_some(configuration_path),
     };
     let git = describe_git(git_available, repository_root.as_deref());
-    let instructions = read_instructions(&project_root)?;
+    let instructions = discover_instructions(&project_root, &current_directory)?;
 
     Ok(WorkspaceDescription {
         current_directory,
@@ -729,27 +730,139 @@ fn package_manager_command(package_manager: PackageManager) -> &'static str {
     }
 }
 
-fn read_instructions(root: &Path) -> Result<Vec<InstructionFile>, Error> {
-    let files = [
-        ("AGENTS.md", InstructionKind::Agents),
-        ("CLAUDE.md", InstructionKind::Claude),
-        ("README.md", InstructionKind::Readme),
-        ("CONTRIBUTING.md", InstructionKind::Contributing),
-        (".agent/instructions.md", InstructionKind::AgentInstructions),
-    ];
+/// Loads instructions that apply to `target` in parent-to-child order.
+///
+/// User instructions are lowest precedence, followed by repository and then
+/// subdirectory instructions. `AGENTS.md` is primary; `CLAUDE.md` and the
+/// existing `.agent/instructions.md` format remain compatible.
+pub fn discover_instructions(
+    workspace_root: &Path,
+    target: &Path,
+) -> Result<Vec<InstructionFile>, Error> {
+    discover_instructions_with_global(workspace_root, target, user_instructions_path().as_deref())
+}
+
+fn discover_instructions_with_global(
+    workspace_root: &Path,
+    target: &Path,
+    global_path: Option<&Path>,
+) -> Result<Vec<InstructionFile>, Error> {
+    let root = fs::canonicalize(workspace_root)?;
+    let target = if target.is_absolute() {
+        fs::canonicalize(target)?
+    } else {
+        fs::canonicalize(root.join(target))?
+    };
+    let target_directory = if target.is_dir() {
+        target
+    } else {
+        target.parent().unwrap_or(&root).to_path_buf()
+    };
+    if !target_directory.starts_with(&root) {
+        return Err(Error::InvalidConfig {
+            reason: "instruction target is outside the workspace".to_owned(),
+        });
+    }
+
     let mut instructions = Vec::new();
-    for (index, (relative_path, kind)) in files.into_iter().enumerate() {
-        let path = root.join(relative_path);
-        if path.is_file() {
-            instructions.push(InstructionFile {
-                path,
+
+    if let Some(path) = global_path.filter(|path| path.is_file()) {
+        append_instruction(
+            &mut instructions,
+            path.to_path_buf(),
+            InstructionKind::GlobalAgents,
+            0,
+        )?;
+    }
+
+    let mut directories = Vec::new();
+    let mut current = target_directory;
+    loop {
+        directories.push(current.clone());
+        if current == root || !current.pop() {
+            break;
+        }
+    }
+    directories.reverse();
+
+    for (depth, directory) in directories.iter().enumerate() {
+        let base = u8::try_from(depth.saturating_mul(8).saturating_add(16)).unwrap_or(u8::MAX);
+        let local = if directory == &root {
+            vec![
+                ("README.md", InstructionKind::Readme),
+                ("CONTRIBUTING.md", InstructionKind::Contributing),
+                (".agent/instructions.md", InstructionKind::AgentInstructions),
+                ("CLAUDE.md", InstructionKind::Claude),
+                ("AGENTS.md", InstructionKind::Agents),
+            ]
+        } else {
+            vec![
+                (".agent/instructions.md", InstructionKind::AgentInstructions),
+                ("CLAUDE.md", InstructionKind::Claude),
+                ("AGENTS.md", InstructionKind::Agents),
+            ]
+        };
+        for (index, (relative_path, kind)) in local.into_iter().enumerate() {
+            append_instruction(
+                &mut instructions,
+                directory.join(relative_path),
                 kind,
-                precedence: index as u8,
-                content: fs::read_to_string(root.join(relative_path))?,
-            });
+                base.saturating_add(u8::try_from(index).unwrap_or_default()),
+            )?;
         }
     }
     Ok(instructions)
+}
+
+fn append_instruction(
+    instructions: &mut Vec<InstructionFile>,
+    path: PathBuf,
+    kind: InstructionKind,
+    precedence: u8,
+) -> Result<(), Error> {
+    if path.is_file() {
+        instructions.push(InstructionFile {
+            content: fs::read_to_string(&path)?,
+            path,
+            kind,
+            precedence,
+        });
+    }
+    Ok(())
+}
+
+/// Per-user repository instructions. `COGITO_CONFIG_DIR` is honored for
+/// portable installs, matching the location used by other user preferences.
+pub fn user_instructions_path() -> Option<PathBuf> {
+    if let Some(directory) = std::env::var_os("COGITO_CONFIG_DIR") {
+        return Some(PathBuf::from(directory).join("AGENTS.md"));
+    }
+    #[cfg(windows)]
+    {
+        return std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|directory| directory.join("CogitoAI").join("AGENTS.md"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("CogitoAI")
+                .join("AGENTS.md")
+        });
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(directory) = std::env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(directory).join("cogitoai").join("AGENTS.md"));
+        }
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".config").join("cogitoai").join("AGENTS.md"));
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 #[cfg(test)]
@@ -830,14 +943,70 @@ mod tests {
                 .map(|instruction| instruction.kind)
                 .collect::<Vec<_>>(),
             vec![
-                InstructionKind::Agents,
-                InstructionKind::Claude,
                 InstructionKind::Readme,
                 InstructionKind::Contributing,
                 InstructionKind::AgentInstructions,
+                InstructionKind::Claude,
+                InstructionKind::Agents,
             ]
         );
         assert!(description.git.available);
+    }
+
+    #[test]
+    fn instructions_follow_global_repository_and_nested_precedence() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("repo");
+        let global = temporary.path().join("user/AGENTS.md");
+        let nested = root.join("packages/app/src");
+        write(&root.join("AGENTS.md"), "repository rules");
+        write(&root.join("CLAUDE.md"), "repository compatibility rules");
+        write(
+            &root.join(".agent/instructions.md"),
+            "repository legacy rules",
+        );
+        write(
+            &root.join("packages/CLAUDE.md"),
+            "package compatibility rules",
+        );
+        write(&root.join("packages/AGENTS.md"), "package rules");
+        write(&root.join("packages/app/src/AGENTS.md"), "source rules");
+        write(&global, "global rules");
+
+        let instructions =
+            discover_instructions_with_global(&root, &nested, Some(&global)).unwrap();
+
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|instruction| instruction.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "global rules",
+                "repository legacy rules",
+                "repository compatibility rules",
+                "repository rules",
+                "package compatibility rules",
+                "package rules",
+                "source rules"
+            ]
+        );
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| instruction.path == root.join("AGENTS.md"))
+                .map(|instruction| instruction.precedence)
+                .next(),
+            instructions
+                .iter()
+                .filter(|instruction| instruction.path == root.join("CLAUDE.md"))
+                .map(|instruction| instruction.precedence)
+                .next()
+                .map(|precedence| precedence + 1)
+        );
+        assert!(instructions
+            .windows(2)
+            .all(|pair| pair[0].precedence < pair[1].precedence));
     }
 
     #[test]

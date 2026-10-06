@@ -11,8 +11,8 @@ pub use ids::{CheckpointId, Id, RunId, SessionId};
 pub use redaction::{redact_sensitive, register_sensitive_value, RedactingFields};
 pub use runtime::{AgentRuntime, RunEvent, RunOutcome, RunRequest};
 pub use workspace::{
-    discover_current_workspace, discover_workspace, CommandSpec, GitDescription, InstructionFile,
-    InstructionKind, Language, Manifest, ManifestKind, MonorepoDescription, MonorepoIndicator,
-    PackageManager, ProjectCommands, WorkingTreeState, WorkspaceConfiguration,
-    WorkspaceDescription,
+    discover_current_workspace, discover_instructions, discover_workspace, user_instructions_path,
+    CommandSpec, GitDescription, InstructionFile, InstructionKind, Language, Manifest,
+    ManifestKind, MonorepoDescription, MonorepoIndicator, PackageManager, ProjectCommands,
+    WorkingTreeState, WorkspaceConfiguration, WorkspaceDescription,
 };

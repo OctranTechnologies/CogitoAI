@@ -1,3 +1,5 @@
+mod hooks;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -27,6 +29,7 @@ use harness_verification::{
     FailureOrigin, VerificationCategory, VerificationPlan, VerificationPlanner,
     VerificationRequest, VerificationStep, Verifier,
 };
+use hooks::{hook_shell_request, is_edit_tool, HookConfig, HookEvent, HookFailureMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -327,6 +330,17 @@ fn bounded_summary(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
+fn append_hook_observations(context: &mut ContextInput, observations: Vec<String>) {
+    for observation in observations {
+        context.tool_results.push(ToolContextResult {
+            name: "lifecycle_hook".to_owned(),
+            result: ToolResult::new(observation),
+            is_shell: false,
+            already_in_model_history: false,
+        });
+    }
+}
+
 fn bounded_context(value: &str, limit: usize) -> String {
     if value.len() <= limit {
         return value.to_owned();
@@ -616,7 +630,7 @@ fn is_repository_retrieval_tool(name: &str) -> bool {
 
 fn coding_agent_instructions(existing: &str) -> String {
     let guidance = "\
-You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Make focused changes, run the cheapest useful checks selected from workspace configuration and repository verification instructions, read structured diagnostics, inspect the final diff, and repair failures before finishing. Verification runs stop at the first failure so you can diagnose and repair before broader checks. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. For a broad or high-risk request, you may recommend that the user switch to PLAN mode first, but do not force simple tasks through a verbose plan. The runtime persists the goal and plan across turns, compaction, and restart: continue the current milestone and next incomplete task instead of recreating the plan. Only revise a saved plan when new evidence materially changes the approach; use `Plan revision: <specific reason>` followed by a `Plan:` list. Repeated `Plan:` text alone does not replace a saved plan. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a failure is clearly pre-existing or unrelated to your patch, inspect the evidence and report its exact command and reason on a line beginning `[UNRELATED_VERIFICATION] ` followed by the exact command and ` :: ` plus the evidence. Use this only when the failure is not caused by your changes. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
+You are a software-engineering coding agent. Understand the request and inspect the repository before editing. Before changing files in another directory, query `get_instructions` if its inherited instructions are not already in context. Review the short skill catalog and call `load_skill` only for a skill relevant to the current task; do not load every skill. Make focused changes, run the cheapest useful checks selected from workspace configuration and repository verification instructions, read structured diagnostics, inspect the final diff, and repair failures before finishing. Verification runs stop at the first failure so you can diagnose and repair before broader checks. For multi-step work, state a concise plan with a line beginning `Plan:`; skip planning for a straightforward one-file fix. For a broad or high-risk request, you may recommend that the user switch to PLAN mode first, but do not force simple tasks through a verbose plan. The runtime persists the goal and plan across turns, compaction, and restart: continue the current milestone and next incomplete task instead of recreating the plan. Only revise a saved plan when new evidence materially changes the approach; use `Plan revision: <specific reason>` followed by a `Plan:` list. Repeated `Plan:` text alone does not replace a saved plan. Revise your approach when a command or test fails. Never claim a task is complete while a known verification or tool error remains unresolved. If a failure is clearly pre-existing or unrelated to your patch, inspect the evidence and report its exact command and reason on a line beginning `[UNRELATED_VERIFICATION] ` followed by the exact command and ` :: ` plus the evidence. Use this only when the failure is not caused by your changes. If a necessary user decision blocks safe progress, finish with `[USER_INPUT_REQUIRED]` and one concise question. If the requested task is impossible with the available repository or tools, finish with `[BLOCKED]` and the concrete reason. Otherwise finish with a concise result and mention verification performed.";
     if existing.trim().is_empty() {
         guidance.to_owned()
     } else {
@@ -1625,6 +1639,8 @@ struct ToolExecutionContext<'a> {
     approved: &'a Arc<Mutex<HashSet<String>>>,
     collector: &'a Arc<Mutex<Vec<HarnessEvent>>>,
     cancellation: &'a CancellationToken,
+    task_mode: TaskMode,
+    hooks: &'a HookConfig,
 }
 
 impl AgentRunner {
@@ -1697,6 +1713,7 @@ impl AgentRunner {
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome, AgentError> {
         let started_at = Instant::now();
+        let hooks = HookConfig::load(&task.workspace_root).map_err(AgentError::Core)?;
         // Desktop and other RPC clients may omit a plan. Discover the project
         // here so verification remains runtime-owned and works consistently
         // for every client.
@@ -1829,6 +1846,13 @@ impl AgentRunner {
             workspace_metadata.root = Some(task.workspace_root.clone());
         }
         if let Some(root) = &workspace_metadata.root {
+            let skills = self.tools.skill_catalog_summary(root);
+            if !skills.is_empty() {
+                workspace_metadata.details.insert(
+                    "available_skills (metadata only; load on demand)".to_owned(),
+                    skills,
+                );
+            }
             if !workspace_metadata.details.contains_key("repository_map") {
                 if let Ok(repository_map) = self.tools.repository_map(root) {
                     workspace_metadata
@@ -1911,6 +1935,23 @@ impl AgentRunner {
             &collector,
         )?;
         self.update_task_run(&session_id, &collector, &task_run)?;
+        let session_start_hooks = {
+            let execution = ToolExecutionContext {
+                session_id: &session_id,
+                workspace_root: &task.workspace_root,
+                policy: &approval_policy,
+                approved: &approved,
+                collector: &collector,
+                cancellation,
+                task_mode: task.task_mode,
+                hooks: &hooks,
+            };
+            self.run_hooks(&execution, HookEvent::SessionStart)
+        };
+        match session_start_hooks {
+            Ok(observations) => append_hook_observations(&mut context_input, observations),
+            Err(error) => return self.fail(session_id, collector, error),
+        }
         let mut turns = 0;
         let mut tool_calls = 0;
         let mut model_tokens = 0;
@@ -1949,6 +1990,25 @@ impl AgentRunner {
                 estimated_cost_microusd,
             )?;
             turns += 1;
+            let before_model_hooks = {
+                let execution = ToolExecutionContext {
+                    session_id: &session_id,
+                    workspace_root: &task.workspace_root,
+                    policy: &approval_policy,
+                    approved: &approved,
+                    collector: &collector,
+                    cancellation,
+                    task_mode: task.task_mode,
+                    hooks: &hooks,
+                };
+                self.run_hooks(&execution, HookEvent::BeforeModel)
+            };
+            match before_model_hooks {
+                Ok(observations) => append_hook_observations(&mut context_input, observations),
+                Err(error) => {
+                    return self.fail(session_id, collector, error);
+                }
+            }
             task_run.current_phase = if task_run.current_plan.is_empty() {
                 TaskPhase::Understand
             } else {
@@ -2000,13 +2060,26 @@ impl AgentRunner {
             if self.compaction_config.threshold_tokens > 0
                 && estimated_total_tokens >= compaction_threshold
             {
-                self.compact_context(
-                    &session_id,
-                    &task.workspace_root,
-                    &mut context_input,
-                    &collector,
-                    &mut task_run,
-                )?;
+                {
+                    let execution = ToolExecutionContext {
+                        session_id: &session_id,
+                        workspace_root: &task.workspace_root,
+                        policy: &approval_policy,
+                        approved: &approved,
+                        collector: &collector,
+                        cancellation,
+                        task_mode: task.task_mode,
+                        hooks: &hooks,
+                    };
+                    self.compact_context(
+                        &session_id,
+                        &task.workspace_root,
+                        &mut context_input,
+                        &collector,
+                        &mut task_run,
+                        &execution,
+                    )?;
+                }
                 assembly = match self.context_builder.build_for_context_window_reserving(
                     &context_input,
                     model_context_window,
@@ -2502,14 +2575,6 @@ impl AgentRunner {
                 }
                 self.update_task_run(&session_id, &collector, &task_run)?;
                 let request = ToolRequest::new(tool_call.name.clone(), tool_call.arguments.clone());
-                let execution = ToolExecutionContext {
-                    session_id: &session_id,
-                    workspace_root: &task.workspace_root,
-                    policy: &approval_policy,
-                    approved: &approved,
-                    collector: &collector,
-                    cancellation,
-                };
                 let operation = self.tools.operation_for(&tool_call.name);
                 let task_mode_denial = (!task_mode_allows_tool(task.task_mode, operation)).then(|| {
                     format!(
@@ -2530,7 +2595,20 @@ impl AgentRunner {
                     result.is_error = true;
                     result
                 } else {
-                    match self.execute_tool(&execution, request) {
+                    let executed = {
+                        let execution = ToolExecutionContext {
+                            session_id: &session_id,
+                            workspace_root: &task.workspace_root,
+                            policy: &approval_policy,
+                            approved: &approved,
+                            collector: &collector,
+                            cancellation,
+                            task_mode: task.task_mode,
+                            hooks: &hooks,
+                        };
+                        self.execute_tool_with_hooks(&execution, request)
+                    };
+                    match executed {
                         Ok(result) => result,
                         Err(error) => {
                             unresolved_error_keys.insert(
@@ -2882,12 +2960,20 @@ impl AgentRunner {
         session_id: SessionId,
         collector: Arc<Mutex<Vec<HarnessEvent>>>,
         mut task_run: TaskRun,
-        final_message: String,
+        mut final_message: String,
         turns: u32,
         tool_calls: u32,
         model_tokens: u64,
         estimated_cost_microusd: Option<u64>,
     ) -> Result<AgentOutcome, AgentError> {
+        if let Err(error) = self.run_session_end_hooks(&session_id, &collector, task_run.task_mode)
+        {
+            task_run.completion_status = TaskCompletionStatus::Blocked;
+            let message = format!("SessionEnd hook failed: {error}");
+            task_run.unresolved_errors.push(message.clone());
+            task_run.remaining_work.push(message.clone());
+            final_message.push_str(&format!("\n\n{message}"));
+        }
         finish_plan_state(&mut task_run);
         self.update_task_run(&session_id, &collector, &task_run)?;
         let reason = match task_run.completion_status {
@@ -2974,7 +3060,10 @@ impl AgentRunner {
         context_input: &mut ContextInput,
         collector: &Arc<Mutex<Vec<HarnessEvent>>>,
         task_run: &mut TaskRun,
+        execution: &ToolExecutionContext<'_>,
     ) -> Result<(), AgentError> {
+        let before_compact = self.run_hooks(execution, HookEvent::BeforeCompact)?;
+        append_hook_observations(context_input, before_compact);
         let current_git_diff = (!task_run.changed_files.is_empty())
             .then(|| task_final_diff(workspace_root, &task_run.changed_files))
             .flatten()
@@ -3017,6 +3106,8 @@ impl AgentRunner {
         context_input.tool_results.clear();
         context_input.compacted_state = Some(compacted);
         self.update_task_run(session_id, collector, task_run)?;
+        let after_compact = self.run_hooks(execution, HookEvent::AfterCompact)?;
+        append_hook_observations(context_input, after_compact);
         Ok(())
     }
 
@@ -3268,7 +3359,13 @@ impl AgentRunner {
                     .approved
                     .lock()
                     .expect("agent approval lock poisoned")
-                    .insert(approval_key(&request));
+                    .extend(
+                        self.tools
+                            .policy_requests(&context, &request)
+                            .map_err(|error| AgentError::Core(error.to_string()))?
+                            .iter()
+                            .map(approval_key_from_request),
+                    );
                 let result = self.tools.execute(&context, request);
                 self.flush(execution.session_id, execution.collector)?;
                 match result {
@@ -3280,6 +3377,188 @@ impl AgentRunner {
             Err(Error::Tool { tool, message }) => Ok(tool_error_result(tool, message)),
             Err(error) => Err(AgentError::Tool(error.to_string())),
         }
+    }
+
+    fn execute_tool_with_hooks(
+        &self,
+        execution: &ToolExecutionContext<'_>,
+        request: ToolRequest,
+    ) -> Result<ToolResult, AgentError> {
+        let name = request.name.clone();
+        let is_edit = is_edit_tool(&name);
+        let is_command = name == "shell";
+        let context = ToolContext {
+            policy: execution.policy,
+            working_directory: execution.workspace_root,
+            cancellation: Some(execution.cancellation),
+            event_bus: Some(&self.event_bus),
+            session_id: Some(execution.session_id),
+            correlation_id: None,
+        };
+
+        // Do not run any hook until the requested operation is known to be
+        // permitted. An explicit DENY remains authoritative even if a hook
+        // command would otherwise be allowed.
+        let policy = self.tools.preflight(&context, &request);
+        let evaluation = match policy {
+            Ok(evaluation) => evaluation,
+            Err(_) => return self.execute_tool(execution, request),
+        };
+        if evaluation.decision == PolicyDecision::Deny {
+            return self.execute_tool(execution, request);
+        }
+        if is_edit {
+            if let Some(path) = execution
+                .hooks
+                .protected_path(execution.workspace_root, &request)
+            {
+                let message = format!(
+                    "edit blocked by .agent/hooks.toml protected_paths: {}",
+                    path.display()
+                );
+                self.emit(
+                    execution.session_id,
+                    EventPayload::ToolFailed {
+                        tool: name,
+                        error: message.clone(),
+                    },
+                    execution.collector,
+                )?;
+                let mut result = tool_error_result("protected_path".to_owned(), message);
+                result
+                    .metadata
+                    .insert("hook_veto".to_owned(), serde_json::Value::Bool(true));
+                return Ok(result);
+            }
+        }
+        if evaluation.decision == PolicyDecision::Ask {
+            if !self.approval_handler.request(&request)? {
+                return Err(AgentError::ApprovalDenied { tool: name });
+            }
+            execution
+                .approved
+                .lock()
+                .expect("agent approval lock poisoned")
+                .extend(
+                    self.tools
+                        .policy_requests(&context, &request)
+                        .map_err(|error| AgentError::Core(error.to_string()))?
+                        .iter()
+                        .map(approval_key_from_request),
+                );
+        }
+
+        let mut hook_notes = Vec::new();
+        hook_notes.extend(self.run_hooks(execution, HookEvent::BeforeTool)?);
+        if is_edit {
+            hook_notes.extend(self.run_hooks(execution, HookEvent::BeforeEdit)?);
+        }
+        if is_command {
+            hook_notes.extend(self.run_hooks(execution, HookEvent::BeforeCommand)?);
+        }
+
+        let mut result = self.execute_tool(execution, request)?;
+        let changed_files = !result.changed_files.is_empty();
+        let after_tool = self.run_hooks(execution, HookEvent::AfterTool);
+        let after_edit = if is_edit && changed_files {
+            self.run_hooks(execution, HookEvent::AfterEdit)
+        } else {
+            Ok(Vec::new())
+        };
+        let after_command = if is_command {
+            self.run_hooks(execution, HookEvent::AfterCommand)
+        } else {
+            Ok(Vec::new())
+        };
+        for hook_result in [after_tool, after_edit, after_command] {
+            match hook_result {
+                Ok(notes) => hook_notes.extend(notes),
+                Err(error) => {
+                    hook_notes.push(format!("after hook failed: {error}"));
+                    result.is_error = true;
+                    result
+                        .metadata
+                        .insert("hook_failure".to_owned(), serde_json::Value::Bool(true));
+                }
+            }
+        }
+        if !hook_notes.is_empty() {
+            result.output.push_str("\n\nLifecycle hooks:\n");
+            result.output.push_str(&hook_notes.join("\n"));
+        }
+        Ok(result)
+    }
+
+    fn run_hooks(
+        &self,
+        execution: &ToolExecutionContext<'_>,
+        event: HookEvent,
+    ) -> Result<Vec<String>, AgentError> {
+        let mut notes = Vec::new();
+        for hook in execution.hooks.hooks_for(event) {
+            if execution.task_mode != TaskMode::Code {
+                notes.push(format!(
+                    "{event:?} hook skipped in {:?} task mode (hook commands require CODE mode)",
+                    execution.task_mode,
+                ));
+                continue;
+            }
+            match self.execute_tool(execution, hook_shell_request(hook)) {
+                Ok(result) if !result.is_error => notes.push(format!(
+                    "{event:?}: {}",
+                    bounded_context(&result.output, 4 * 1024)
+                )),
+                Ok(result) => {
+                    let message = format!(
+                        "{event:?} hook command failed: {}",
+                        bounded_context(&result.output, 4 * 1024)
+                    );
+                    if hook.on_error == HookFailureMode::Block {
+                        return Err(AgentError::Tool(message));
+                    }
+                    notes.push(message);
+                }
+                Err(error) => {
+                    let message = format!("{event:?} hook could not run: {error}");
+                    if hook.on_error == HookFailureMode::Block {
+                        return Err(AgentError::Tool(message));
+                    }
+                    notes.push(message);
+                }
+            }
+        }
+        Ok(notes)
+    }
+
+    fn run_session_end_hooks(
+        &self,
+        session_id: &SessionId,
+        collector: &Arc<Mutex<Vec<HarnessEvent>>>,
+        task_mode: TaskMode,
+    ) -> Result<(), AgentError> {
+        let session = self
+            .sessions
+            .load(session_id)
+            .map_err(|error| AgentError::Core(error.to_string()))?;
+        let hooks = HookConfig::load(&session.workspace_root).map_err(AgentError::Core)?;
+        let approved = Arc::new(Mutex::new(HashSet::new()));
+        let approval_policy = ApprovedPolicy {
+            base: Arc::clone(&self.policy),
+            approved: Arc::clone(&approved),
+        };
+        let cancellation = CancellationToken::new();
+        let execution = ToolExecutionContext {
+            session_id,
+            workspace_root: &session.workspace_root,
+            policy: &approval_policy,
+            approved: &approved,
+            collector,
+            cancellation: &cancellation,
+            task_mode,
+            hooks: &hooks,
+        };
+        self.run_hooks(&execution, HookEvent::SessionEnd)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3347,6 +3626,14 @@ impl AgentRunner {
         error: AgentError,
     ) -> Result<T, AgentError> {
         let _ = self.flush(&session_id, &collector);
+        let task_mode = self
+            .sessions
+            .load(&session_id)
+            .ok()
+            .and_then(|session| session.state().ok())
+            .and_then(|state| state.task_run.map(|run| run.task_mode))
+            .unwrap_or_default();
+        let _ = self.run_session_end_hooks(&session_id, &collector, task_mode);
         let _ = self.emit(
             &session_id,
             EventPayload::SessionFailed {
@@ -3487,12 +3774,17 @@ impl Policy for ApprovedPolicy {
     }
 }
 
-fn approval_key(request: &ToolRequest) -> String {
-    request.name.clone()
-}
-
 fn approval_key_from_request(request: &PolicyRequest) -> String {
-    request.tool_name.clone()
+    serde_json::to_string(request).unwrap_or_else(|_| {
+        format!(
+            "{}:{:?}:{}:{:?}:{:?}",
+            request.tool_name,
+            request.operation,
+            request.workspace_root.display(),
+            request.path,
+            request.command
+        )
+    })
 }
 
 fn format_command(command: &harness_core::CommandSpec) -> String {

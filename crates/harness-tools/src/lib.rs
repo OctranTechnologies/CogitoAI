@@ -1,3 +1,4 @@
+mod customization;
 mod filesystem;
 mod process;
 mod repository_index;
@@ -8,11 +9,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use harness_core::{Error, Id, SessionId};
-use harness_policy::{OperationKind, Permission, Policy, PolicyDecision, PolicyRequest};
+use harness_policy::{
+    OperationKind, Permission, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest,
+};
 use harness_session::{EventBus, EventPayload, HarnessEvent};
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
+pub use customization::{available_skills, SkillMetadata};
 pub use filesystem::{
     ApplyPatchTool, CreateFileTool, DeleteFileTool, GlobTool, GrepTool, ListDirectoryTool,
     ReadFileTool, RenameFileTool, ReplaceRangeTool, ReplaceTextTool, ShellTool, WriteFileTool,
@@ -181,11 +185,35 @@ impl ToolRegistry {
             registry.register(Box::new(RepositoryTool::new(action, Arc::clone(&index))));
         }
         registry.repository_index = Some(index);
+        registry.register(Box::new(customization::InstructionsTool));
+        registry.register(Box::new(customization::ListSkillsTool));
+        registry.register(Box::new(customization::LoadSkillTool));
         registry
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
+    }
+
+    /// Returns concise skill metadata for the initial working context. Full
+    /// skill instructions remain available only through the `load_skill` tool.
+    pub fn skill_catalog_summary(&self, workspace_root: &std::path::Path) -> String {
+        available_skills(workspace_root)
+            .into_iter()
+            .take(48)
+            .map(|skill| {
+                format!(
+                    "{}: {}{}",
+                    skill.name,
+                    skill.description,
+                    skill
+                        .when_to_use
+                        .map(|when| format!(" (use when: {when})"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn execute(
@@ -401,6 +429,80 @@ impl ToolRegistry {
             .iter()
             .find(|tool| tool.spec().name == name)
             .map(|tool| tool.operation())
+    }
+
+    /// Evaluates a tool request without executing it or emitting events. This
+    /// lets the agent run veto-only BeforeTool hooks only after the requested
+    /// operation itself is allowed or approved.
+    pub fn preflight(
+        &self,
+        context: &ToolContext<'_>,
+        request: &ToolRequest,
+    ) -> Result<PolicyEvaluation, Error> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.spec().name == request.name)
+            .ok_or_else(|| Error::Tool {
+                tool: request.name.clone(),
+                message: "tool is not registered".to_owned(),
+            })?;
+        let policy_request = build_policy_request(context, &request.name, tool.as_ref(), request);
+        let evaluation = context.policy.evaluate(&policy_request);
+        if evaluation.decision != PolicyDecision::Allow || request.name != "rename_file" {
+            return Ok(evaluation);
+        }
+        let destination = build_policy_request_for_path(
+            context,
+            &request.name,
+            tool.as_ref(),
+            request
+                .arguments
+                .get("destination_path")
+                .and_then(serde_json::Value::as_str),
+        );
+        let destination_evaluation = context.policy.evaluate(&destination);
+        if destination_evaluation.decision == PolicyDecision::Allow {
+            Ok(evaluation)
+        } else {
+            Ok(destination_evaluation)
+        }
+    }
+
+    /// Returns the concrete policy requests for a tool. Rename tools include
+    /// both source and destination so an approval can be scoped to the exact
+    /// paths involved rather than to the tool name globally.
+    pub fn policy_requests(
+        &self,
+        context: &ToolContext<'_>,
+        request: &ToolRequest,
+    ) -> Result<Vec<PolicyRequest>, Error> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.spec().name == request.name)
+            .ok_or_else(|| Error::Tool {
+                tool: request.name.clone(),
+                message: "tool is not registered".to_owned(),
+            })?;
+        let mut requests = vec![build_policy_request(
+            context,
+            &request.name,
+            tool.as_ref(),
+            request,
+        )];
+        if request.name == "rename_file" {
+            requests.push(build_policy_request_for_path(
+                context,
+                &request.name,
+                tool.as_ref(),
+                request
+                    .arguments
+                    .get("destination_path")
+                    .and_then(serde_json::Value::as_str),
+            ));
+        }
+        Ok(requests)
     }
 
     fn revision_key(&self, context: &ToolContext<'_>, path: &str) -> String {

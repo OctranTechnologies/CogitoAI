@@ -15,8 +15,10 @@ harness-policy.workspace = true
 harness-session.workspace = true
 harness-tools.workspace = true
 harness-verification.workspace = true
+globset.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

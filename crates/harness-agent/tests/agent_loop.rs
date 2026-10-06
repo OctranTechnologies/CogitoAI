@@ -235,6 +235,21 @@ impl ApprovalHandler for ApproveAll {
     }
 }
 
+#[derive(Default)]
+struct RecordingApproval {
+    requests: Mutex<Vec<harness_tools::ToolRequest>>,
+}
+
+impl ApprovalHandler for RecordingApproval {
+    fn request(
+        &self,
+        request: &harness_tools::ToolRequest,
+    ) -> Result<bool, harness_agent::AgentError> {
+        self.requests.lock().unwrap().push(request.clone());
+        Ok(true)
+    }
+}
+
 fn task(workspace: &Path) -> AgentTask {
     AgentTask {
         workspace_root: workspace.to_path_buf(),
@@ -360,6 +375,180 @@ fn mock_agent_reads_edits_runs_observes_and_finishes() {
         event_types.last(),
         Some(&harness_session::EventType::SessionCompleted)
     );
+}
+
+#[test]
+fn skills_are_advertised_as_metadata_and_loaded_only_after_selection() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let skill_directory = workspace.join(".agent/skills/rust-tests");
+    std::fs::create_dir_all(skill_directory.join("references")).unwrap();
+    std::fs::write(
+        skill_directory.join("SKILL.md"),
+        "---\nname: rust-tests\ndescription: Focused Rust validation\nwhen_to_use: when working in Rust crates\n---\nRun the smallest relevant cargo test, then broaden validation.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        skill_directory.join("references/checks.md"),
+        "Use cargo fmt and clippy after changes.",
+    )
+    .unwrap();
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider::new(
+        requests.clone(),
+        vec![
+            response(
+                "",
+                Some(("load_skill", serde_json::json!({"name": "rust-tests"}))),
+            ),
+            response("I will use focused Rust validation.", None),
+        ],
+    ));
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let runner = AgentRunner::new(
+        provider,
+        "recording",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(AllowAllPolicy),
+        sessions,
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        Arc::new(ApproveAll),
+    );
+    runner
+        .run(&task(workspace), &CancellationToken::new())
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    let first_prompt = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(first_prompt.contains("rust-tests: Focused Rust validation"));
+    assert!(!first_prompt.contains("Run the smallest relevant cargo test"));
+    assert!(!first_prompt.contains("Use cargo fmt and clippy"));
+    assert!(requests[0]
+        .tools
+        .iter()
+        .any(|tool| tool.name == "load_skill"));
+    let second_prompt = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(second_prompt.contains("Run the smallest relevant cargo test"));
+}
+
+#[test]
+fn denied_tool_does_not_run_its_configured_before_hook() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    let agent_directory = workspace.join(".agent");
+    std::fs::create_dir_all(&agent_directory).unwrap();
+    let marker = "hook-was-run.txt";
+    let command = format!("echo hook-ran > {marker}");
+    std::fs::write(
+        agent_directory.join("hooks.toml"),
+        format!(
+            "[[hooks]]\nevent = \"before_tool\"\ncommand = {:?}\n",
+            command
+        ),
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            response(
+                "",
+                Some((
+                    "write_file",
+                    serde_json::json!({"path": "protected.txt", "content": "must not write"}),
+                )),
+            ),
+            response("The policy denied the write.", None),
+        ],
+    ));
+    let (runner, _sessions) = runner(
+        provider,
+        workspace,
+        Arc::new(DenyAllPolicy),
+        Arc::new(DenyApprovalHandler),
+    );
+    let error = runner
+        .run(&task(workspace), &CancellationToken::new())
+        .unwrap_err();
+    assert!(error.to_string().contains("permission denied"));
+    assert!(!workspace.join(marker).exists());
+    assert!(!workspace.join("protected.txt").exists());
+}
+
+#[test]
+fn approval_for_a_tool_does_not_implicitly_approve_its_hook_command() {
+    let temporary = tempdir().unwrap();
+    let workspace = temporary.path();
+    std::fs::create_dir_all(workspace.join(".agent")).unwrap();
+    std::fs::write(
+        workspace.join(".agent/hooks.toml"),
+        "[[hooks]]\nevent = \"before_tool\"\ncommand = \"echo hook-ran > hook-output.txt\"\n",
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedMockProvider::new(
+        "scripted",
+        vec![
+            response(
+                "",
+                Some((
+                    "shell",
+                    serde_json::json!({"command": "echo main > target.txt"}),
+                )),
+            ),
+            response("Done", None),
+        ],
+    ));
+    let approvals = Arc::new(RecordingApproval::default());
+    let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
+    let runner = AgentRunner::new(
+        provider,
+        "scripted",
+        ToolRegistry::with_workspace_tools(),
+        Arc::new(PolicyEngine::new(ExecutionMode::Safe, workspace)),
+        sessions,
+        ContextBuilder::default(),
+        AgentLimits::default(),
+        approvals.clone(),
+    );
+
+    runner
+        .run(&task(workspace), &CancellationToken::new())
+        .unwrap();
+
+    let approved = approvals.requests.lock().unwrap();
+    assert_eq!(approved.len(), 2);
+    assert!(approved.iter().any(|request| request.name == "shell"));
+    assert!(workspace.join("hook-output.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("target.txt"))
+            .unwrap()
+            .trim(),
+        "main"
+    );
+    let commands = approved
+        .iter()
+        .filter_map(|request| request.arguments["command"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(commands.len(), 2);
 }
 
 #[test]

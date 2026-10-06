@@ -1741,6 +1741,7 @@ dependencies = [
 name = "harness-agent"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "harness-context",
  "harness-core",
  "harness-git",
@@ -1753,6 +1754,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "toml 0.8.2",
 ]
 
 [[package]]
