@@ -121,6 +121,9 @@ pub enum EventType {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompactState {
     pub task: String,
+    /// Current task state written as a compact artifact rather than a chat transcript.
+    #[serde(default)]
+    pub current_state: String,
     /// Durable objective carried across context compaction.
     #[serde(default)]
     pub goal: Option<Goal>,
@@ -129,11 +132,23 @@ pub struct CompactState {
     pub execution_plan: Option<ExecutionPlan>,
     pub current_approach: String,
     pub discoveries: Vec<String>,
+    #[serde(default)]
+    pub important_symbols: Vec<String>,
     pub important_files: Vec<String>,
     pub files_modified: Vec<String>,
     pub decisions: Vec<String>,
     pub failed_attempts: Vec<String>,
     pub test_status: Vec<String>,
+    #[serde(default)]
+    pub commands_and_tests: Vec<String>,
+    #[serde(default)]
+    pub known_failures: Vec<String>,
+    #[serde(default)]
+    pub what_has_been_tried: Vec<String>,
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+    #[serde(default)]
+    pub current_git_diff: Option<String>,
     pub remaining_work: Vec<String>,
 }
 
@@ -277,6 +292,25 @@ pub struct TaskVerificationResult {
     pub relevant_output: String,
 }
 
+/// Bounded counters and per-turn estimates for context-budget tuning.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextMetrics {
+    #[serde(default)]
+    pub estimated_tokens_per_turn: Vec<u32>,
+    #[serde(default)]
+    pub reported_input_tokens_per_turn: Vec<Option<u32>>,
+    #[serde(default)]
+    pub estimated_tokens_sent: u64,
+    #[serde(default)]
+    pub reused_context_tokens: u64,
+    #[serde(default)]
+    pub compactions: u32,
+    #[serde(default)]
+    pub retrieval_queries: u32,
+    #[serde(default)]
+    pub retrieved_files_used: u32,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskRun {
     pub original_goal: String,
@@ -290,6 +324,8 @@ pub struct TaskRun {
     pub current_phase: TaskPhase,
     #[serde(default)]
     pub current_plan: Vec<String>,
+    #[serde(default)]
+    pub context_metrics: ContextMetrics,
     #[serde(default)]
     pub structured_plan: Option<ImplementationPlan>,
     #[serde(default)]
@@ -326,7 +362,17 @@ impl TaskRun {
 impl CompactState {
     pub fn render(&self) -> String {
         let mut sections = Vec::new();
-        push_section(&mut sections, "task", std::slice::from_ref(&self.task));
+        let goal = self
+            .goal
+            .as_ref()
+            .map(|goal| goal.objective.as_str())
+            .filter(|objective| !objective.is_empty())
+            .unwrap_or(&self.task);
+        push_section(
+            &mut sections,
+            "GOAL",
+            std::slice::from_ref(&goal.to_owned()),
+        );
         if let Some(goal) = &self.goal {
             push_section(
                 &mut sections,
@@ -362,18 +408,39 @@ impl CompactState {
             push_section(&mut sections, "execution plan progress", &progress);
             push_section(&mut sections, "plan decisions", &plan.decision_notes);
         }
+        let current_state = if self.current_state.is_empty() {
+            &self.current_approach
+        } else {
+            &self.current_state
+        };
         push_section(
             &mut sections,
-            "current approach",
-            std::slice::from_ref(&self.current_approach),
+            "CURRENT STATE",
+            std::slice::from_ref(current_state),
         );
-        push_section(&mut sections, "discoveries", &self.discoveries);
-        push_section(&mut sections, "important files", &self.important_files);
-        push_section(&mut sections, "files modified", &self.files_modified);
-        push_section(&mut sections, "decisions", &self.decisions);
-        push_section(&mut sections, "failed attempts", &self.failed_attempts);
-        push_section(&mut sections, "test status", &self.test_status);
-        push_section(&mut sections, "remaining work", &self.remaining_work);
+        push_section(&mut sections, "DECISIONS", &self.decisions);
+        push_section(&mut sections, "FILES CHANGED", &self.files_modified);
+        push_section(&mut sections, "IMPORTANT SYMBOLS", &self.important_symbols);
+        push_section(&mut sections, "IMPORTANT FILES", &self.important_files);
+        push_section(&mut sections, "DISCOVERIES", &self.discoveries);
+        push_section(&mut sections, "COMMANDS/TESTS", &self.commands_and_tests);
+        push_section(&mut sections, "TEST STATUS", &self.test_status);
+        push_section(&mut sections, "KNOWN FAILURES", &self.known_failures);
+        push_section(&mut sections, "FAILED ATTEMPTS", &self.failed_attempts);
+        push_section(
+            &mut sections,
+            "WHAT HAS BEEN TRIED",
+            &self.what_has_been_tried,
+        );
+        push_section(&mut sections, "NEXT STEPS", &self.next_steps);
+        push_section(&mut sections, "REMAINING WORK", &self.remaining_work);
+        if let Some(diff) = &self.current_git_diff {
+            push_section(
+                &mut sections,
+                "CURRENT GIT DIFF",
+                std::slice::from_ref(diff),
+            );
+        }
         sections.join("\n\n")
     }
 }

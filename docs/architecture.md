@@ -29,6 +29,39 @@ repair turn when needed. Finishing leaves the user with the final response,
 session history, verification results, and inspectable changes. `harness-rpc`
 composes these capabilities into the shared local runtime used by both clients.
 
+## Coding-session context and compaction
+
+The runtime keeps five distinct views of a coding session:
+
+- **Permanent history:** session events and tool/model observations remain on
+  disk for audit and resume; compaction does not rewrite or discard them.
+- **Working context:** `harness-context` assembles a bounded prompt for each
+  turn. It ranks the current request, task goal and acceptance criteria,
+  instructions, plan, relevant files, recent failures, and current diff above
+  older discoveries, successful calls, and shell output. Results already
+  represented in the model's native tool protocol are excluded from the extra
+  context prompt.
+- **Durable task state:** `TaskRun` carries the goal, plan, phase, affected
+  files, command and verification outcomes, failures, and remaining work.
+- **Repository state:** workspace discovery, instructions, Git status/diff, and
+  incremental retrieval results are queried as needed rather than injecting a
+  complete repository index into every turn.
+- **Compacted history:** a structured `CompactState` records goal, current
+  state, decisions, files, symbols, commands/tests, known failures, tried
+  approaches, next steps, and current diff. New artifacts merge fresh progress
+  into prior state instead of summarizing an old summary repeatedly. Original
+  event history remains available.
+
+`ContextBudgetManager` caps working context against a known provider context
+window and uses the configured local budget when the window is unknown. It
+trims oversized files/results, summarizes shell output while preserving
+diagnostic lines and the tail, and gives the compaction artifact its own size
+limit. Token estimates use bounded text-size estimates; provider-reported input
+usage is retained when available. `TaskRun.context_metrics` also records
+reusable context, compaction frequency, repository retrieval queries, and
+retrieved files later changed, so long-session behavior can be measured without
+putting old output back into the prompt.
+
 Planning is a model judgment, not a separate workflow engine. Search, read,
 edit, verification, and repair are ordinary normalized model/tool turns under
 the same policy and event contracts. The desktop and CLI present the workflow;

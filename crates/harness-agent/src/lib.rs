@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use harness_context::{ContextBuilder, ContextInput, ToolContextResult, WorkspaceMetadata};
+use harness_context::{
+    summarize_shell_output, ContextBuilder, ContextInput, ContextItem, ToolContextResult,
+    WorkspaceMetadata,
+};
 use harness_core::{discover_workspace, CommandSpec, Error, SessionId};
 use harness_git::{CheckpointStore, GitClient};
 use harness_models::{
@@ -14,10 +17,10 @@ use harness_policy::{
     ExecutionMode, OperationKind, Policy, PolicyDecision, PolicyEvaluation, PolicyRequest,
 };
 use harness_session::{
-    CompactState, ConversationMessage as SessionConversationMessage, EventBus, EventPayload,
-    ExecutionMilestone, ExecutionPlan, ExecutionTask, Goal, HarnessEvent, ImplementationPlan,
-    MessageRole, PlanItemStatus, SessionStore, TaskCompletionStatus, TaskMode, TaskPhase, TaskRun,
-    TaskVerificationResult,
+    CompactState, ContextMetrics, ConversationMessage as SessionConversationMessage, EventBus,
+    EventPayload, ExecutionMilestone, ExecutionPlan, ExecutionTask, Goal, HarnessEvent,
+    ImplementationPlan, MessageRole, PlanItemStatus, SessionStore, TaskCompletionStatus, TaskMode,
+    TaskPhase, TaskRun, TaskVerificationResult,
 };
 use harness_tools::{CancellationToken, ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{
@@ -131,8 +134,11 @@ pub struct CompactionRequest<'a> {
     pub task: &'a str,
     pub goal: Option<&'a Goal>,
     pub execution_plan: Option<&'a ExecutionPlan>,
+    pub task_run: &'a TaskRun,
     pub conversation: &'a [SessionConversationMessage],
     pub tool_results: &'a [ToolContextResult],
+    pub previous: Option<&'a CompactState>,
+    pub current_git_diff: Option<&'a str>,
 }
 
 pub trait CompactionStrategy: Send + Sync {
@@ -144,45 +150,165 @@ pub struct DeriveCompactionStrategy;
 
 impl CompactionStrategy for DeriveCompactionStrategy {
     fn compact(&self, request: &CompactionRequest<'_>) -> Result<CompactState, String> {
-        let mut state = CompactState {
-            task: request.task.to_owned(),
-            goal: request.goal.cloned(),
-            execution_plan: request.execution_plan.cloned(),
-            current_approach: request
-                .conversation
+        let mut state = request.previous.cloned().unwrap_or_default();
+        state.task = request.task.to_owned();
+        state.goal = request.goal.cloned();
+        state.execution_plan = request.execution_plan.cloned();
+        state.known_failures.clear();
+        state.failed_attempts.clear();
+        state.test_status.clear();
+        state.next_steps.clear();
+        state.current_state = format!("phase={:?}", request.task_run.current_phase);
+        if let Some(latest) = request.conversation.iter().rev().find(|message| {
+            message.role == MessageRole::Assistant && !message.text.trim().is_empty()
+        }) {
+            state.current_approach = bounded_summary(&latest.text);
+            state.current_state = format!(
+                "phase={:?}; completion={:?}; {}",
+                request.task_run.current_phase,
+                request.task_run.completion_status,
+                bounded_summary(&latest.text)
+            );
+        }
+        if let Some(current_git_diff) = request.current_git_diff {
+            state.current_git_diff = Some(current_git_diff.to_owned());
+        }
+        for path in &request.task_run.changed_files {
+            let path = path.display().to_string();
+            push_unique_bounded(&mut state.files_modified, path.clone(), 32);
+            push_unique_bounded(&mut state.important_files, path, 32);
+        }
+        for path in &request.task_run.relevant_files {
+            push_unique_bounded(&mut state.important_files, path.display().to_string(), 32);
+        }
+        for command in request
+            .task_run
+            .commands_executed
+            .iter()
+            .rev()
+            .take(20)
+            .rev()
+        {
+            push_unique_bounded(&mut state.commands_and_tests, bounded_summary(command), 24);
+            push_unique_bounded(
+                &mut state.what_has_been_tried,
+                format!("Ran: {}", bounded_summary(command)),
+                24,
+            );
+        }
+        for result in request
+            .task_run
+            .verification_results
+            .iter()
+            .rev()
+            .take(12)
+            .rev()
+        {
+            let status = if result.passed { "passed" } else { "failed" };
+            let origin = result.failure_origin.as_deref().unwrap_or("unknown");
+            let affected_files = result
+                .affected_files
                 .iter()
-                .rev()
-                .find(|message| message.role == MessageRole::Assistant)
-                .map_or_else(|| request.task.to_owned(), |message| message.text.clone()),
-            ..CompactState::default()
-        };
-        for result in request.tool_results {
-            let summary = bounded_summary(&format!("{}: {}", result.name, result.result.output));
-            if result.name.contains("test") || summary.to_ascii_lowercase().contains("test") {
-                state.test_status.push(summary);
-            } else if summary.to_ascii_lowercase().contains("fail")
-                || summary.to_ascii_lowercase().contains("error")
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            let entry = bounded_context(
+                &format!(
+                    "category={} command={} status={} exit_code={:?} failure_origin={} affected_files={:?} summary={}\n{}",
+                    result.category,
+                    result.command,
+                    status,
+                    result.exit_code,
+                    origin,
+                    affected_files,
+                    result.summary,
+                    result.relevant_output
+                ),
+                1400,
+            );
+            push_unique_bounded(&mut state.commands_and_tests, entry.clone(), 24);
+            push_unique_bounded(&mut state.test_status, entry.clone(), 16);
+            let unresolved_failure =
+                request.task_run.unresolved_errors.iter().any(|failure| {
+                    failure.starts_with(&format!("verification:{} ::", result.command))
+                });
+            if !result.passed
+                && unresolved_failure
+                && result.failure_origin.as_deref() != Some("unrelated")
             {
-                state.failed_attempts.push(summary);
-            } else {
-                state.discoveries.push(summary);
+                push_unique_bounded(&mut state.known_failures, entry, 16);
             }
-            for path in &result.result.changed_files {
-                let path = path.display().to_string();
-                if !state.files_modified.contains(&path) {
-                    state.files_modified.push(path.clone());
-                }
-                if !state.important_files.contains(&path) {
-                    state.important_files.push(path);
+        }
+        for failure in &request.task_run.unresolved_errors {
+            push_unique_bounded(&mut state.known_failures, bounded_summary(failure), 16);
+        }
+        state.remaining_work = request
+            .task_run
+            .remaining_work
+            .iter()
+            .map(|work| bounded_summary(work))
+            .collect();
+        if !state.remaining_work.is_empty() {
+            state.next_steps = state.remaining_work.iter().take(8).cloned().collect();
+        } else if let Some(plan) = request.execution_plan {
+            state.next_steps = plan
+                .milestones
+                .iter()
+                .flat_map(|milestone| &milestone.tasks)
+                .filter(|task| task.status != PlanItemStatus::Completed)
+                .take(8)
+                .map(|task| bounded_summary(&task.description))
+                .collect();
+        }
+        for result in request.tool_results {
+            if result.result.is_error {
+                let summary =
+                    bounded_summary(&format!("{}: {}", result.name, result.result.output));
+                push_unique_bounded(&mut state.what_has_been_tried, summary, 24);
+            } else if result.is_shell {
+                // Successful shell output is retained in the event log. The
+                // durable task snapshot already records the command and its
+                // verification status, so copying output here adds little.
+                continue;
+            } else {
+                let summary =
+                    bounded_summary(&format!("{}: {}", result.name, result.result.output));
+                push_unique_bounded(&mut state.discoveries, summary, 24);
+                if matches!(
+                    result.name.as_str(),
+                    "find_symbol" | "find_references" | "goto_definition" | "get_file_outline"
+                ) {
+                    for line in result.result.output.lines().filter(|line| {
+                        [
+                            "fn ",
+                            "struct ",
+                            "enum ",
+                            "trait ",
+                            "class ",
+                            "interface ",
+                            "type ",
+                            "def ",
+                        ]
+                        .iter()
+                        .any(|marker| line.contains(marker))
+                    }) {
+                        push_unique_bounded(
+                            &mut state.important_symbols,
+                            bounded_summary(line.trim()),
+                            24,
+                        );
+                    }
                 }
             }
         }
-        for message in request.conversation.iter().rev().take(5) {
-            if message.role == MessageRole::Assistant
-                && !message.text.trim().is_empty()
-                && !state.decisions.contains(&message.text)
-            {
-                state.decisions.push(message.text.clone());
+        for message in request.conversation.iter().rev().take(8) {
+            if message.role == MessageRole::Assistant {
+                for line in message.text.lines().filter(|line| {
+                    line.trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("decision:")
+                }) {
+                    push_unique_bounded(&mut state.decisions, bounded_summary(line.trim()), 16);
+                }
             }
         }
         Ok(state)
@@ -273,6 +399,219 @@ fn push_unique_bounded<T: Eq>(values: &mut Vec<T>, value: T, limit: usize) {
     if !values.contains(&value) {
         push_bounded(values, value, limit);
     }
+}
+
+fn keep_recent_conversation(messages: &mut Vec<SessionConversationMessage>, limit: usize) {
+    let remove = messages.len().saturating_sub(limit);
+    if remove > 0 {
+        messages.drain(..remove);
+    }
+}
+
+fn compact_state_from_task_run(task_run: &TaskRun) -> CompactState {
+    DeriveCompactionStrategy
+        .compact(&CompactionRequest {
+            task: &task_run.original_goal,
+            goal: Some(&task_run.goal),
+            execution_plan: task_run.execution_plan.as_ref(),
+            task_run,
+            conversation: &[],
+            tool_results: &[],
+            previous: None,
+            current_git_diff: None,
+        })
+        .unwrap_or_default()
+}
+
+fn record_context_request(metrics: &mut ContextMetrics, estimated_tokens: u32, reused_tokens: u32) {
+    const MAX_RETAINED_TURNS: usize = 512;
+    if metrics.estimated_tokens_per_turn.len() >= MAX_RETAINED_TURNS {
+        metrics.estimated_tokens_per_turn.remove(0);
+        metrics.reported_input_tokens_per_turn.remove(0);
+    }
+    metrics.estimated_tokens_per_turn.push(estimated_tokens);
+    metrics.reported_input_tokens_per_turn.push(None);
+    metrics.estimated_tokens_sent = metrics
+        .estimated_tokens_sent
+        .saturating_add(u64::from(estimated_tokens));
+    metrics.reused_context_tokens = metrics
+        .reused_context_tokens
+        .saturating_add(u64::from(reused_tokens));
+}
+
+fn record_context_response(metrics: &mut ContextMetrics, reported_input_tokens: Option<u32>) {
+    if let Some(last) = metrics.reported_input_tokens_per_turn.last_mut() {
+        *last = reported_input_tokens;
+    }
+}
+
+fn estimate_model_history_tokens(messages: &[Message]) -> u32 {
+    messages
+        .iter()
+        .map(|message| {
+            let content_bytes = message
+                .content
+                .iter()
+                .map(|block| match block {
+                    harness_models::ContentBlock::Text { text }
+                    | harness_models::ContentBlock::Reasoning { text } => text.len(),
+                    harness_models::ContentBlock::Image { data, media_type } => {
+                        data.len().saturating_add(media_type.len())
+                    }
+                })
+                .sum::<usize>();
+            let call_bytes = message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    call.id
+                        .len()
+                        .saturating_add(call.name.len())
+                        .saturating_add(
+                            serde_json::to_vec(&call.arguments)
+                                .map_or(0, |arguments| arguments.len()),
+                        )
+                })
+                .sum::<usize>();
+            content_bytes
+                .saturating_add(call_bytes)
+                .saturating_add(3)
+                .checked_div(4)
+                .unwrap_or(0)
+                .min(u32::MAX as usize) as u32
+        })
+        .fold(0_u32, u32::saturating_add)
+}
+
+fn trim_model_history_to_budget(messages: &mut [Message], max_tokens: u32) {
+    if estimate_model_history_tokens(messages) <= max_tokens {
+        return;
+    }
+    // These tool calls have already run and their paired results remain in the
+    // protocol history. Keep IDs and names for provider pairing while avoiding
+    // sending huge edit/search arguments a second time.
+    for message in messages
+        .iter_mut()
+        .filter(|message| !message.tool_calls.is_empty())
+    {
+        for call in &mut message.tool_calls {
+            call.arguments = serde_json::json!({ "previously_executed": true });
+        }
+    }
+    if estimate_model_history_tokens(messages) <= max_tokens {
+        return;
+    }
+
+    let tool_messages = messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .count()
+        .max(1);
+    let fixed_tokens = messages
+        .iter()
+        .filter(|message| message.role != Role::Tool)
+        .map(|message| estimate_model_history_tokens(std::slice::from_ref(message)))
+        .fold(0_u32, u32::saturating_add)
+        .saturating_add(tool_messages.min(u32::MAX as usize) as u32);
+    let available_tool_tokens = max_tokens.saturating_sub(fixed_tokens);
+    let per_result_bytes = (available_tool_tokens as usize)
+        .saturating_mul(4)
+        .checked_div(tool_messages)
+        .unwrap_or_default();
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.role == Role::Tool)
+    {
+        for block in &mut message.content {
+            if let harness_models::ContentBlock::Text { text } = block {
+                *text = truncate_history_text(text, per_result_bytes);
+            }
+        }
+    }
+}
+
+fn truncate_history_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    const MARKER: &str = "\n[tool history trimmed]";
+    let payload_bytes = max_bytes.saturating_sub(MARKER.len());
+    let head_bytes = payload_bytes / 2;
+    let tail_bytes = payload_bytes.saturating_sub(head_bytes);
+    let mut head_end = head_bytes.min(value.len());
+    while !value.is_char_boundary(head_end) {
+        head_end = head_end.saturating_sub(1);
+    }
+    let mut tail_start = value.len().saturating_sub(tail_bytes);
+    while !value.is_char_boundary(tail_start) {
+        tail_start = tail_start.saturating_add(1);
+    }
+    let result = format!("{}{MARKER}{}", &value[..head_end], &value[tail_start..]);
+    if result.len() > max_bytes {
+        let mut end = max_bytes.min(result.len());
+        while !result.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        result[..end].to_owned()
+    } else {
+        result
+    }
+}
+
+fn context_reuse_tokens(previous: &[ContextItem], current: &[ContextItem]) -> u32 {
+    current
+        .iter()
+        .filter(|item| item.included)
+        .filter_map(|item| {
+            previous
+                .iter()
+                .find(|old| old.included && old.id == item.id && old.content == item.content)
+                .map(|old| old.estimated_tokens.min(item.estimated_tokens))
+        })
+        .fold(0_u32, u32::saturating_add)
+}
+
+fn normalize_context_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase()
+}
+
+fn normalize_workspace_path(path: &std::path::Path, workspace_root: &std::path::Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let absolute = absolute.canonicalize().unwrap_or(absolute);
+    normalize_context_path(
+        &absolute
+            .strip_prefix(root)
+            .unwrap_or(&absolute)
+            .display()
+            .to_string(),
+    )
+}
+
+fn is_repository_retrieval_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "search_files"
+            | "search_text"
+            | "find_symbol"
+            | "find_references"
+            | "goto_definition"
+            | "get_diagnostics"
+            | "get_file_outline"
+            | "get_repo_tree"
+    )
 }
 
 fn coding_agent_instructions(existing: &str) -> String {
@@ -1534,24 +1873,35 @@ impl AgentRunner {
                 }
             }
         }
+        let mut conversation = if task.recent_conversation.is_empty() {
+            if previous_state.continuation.is_some() {
+                previous_state.working_messages.clone()
+            } else {
+                previous_state.messages.clone()
+            }
+        } else {
+            task.recent_conversation.clone()
+        };
+        keep_recent_conversation(
+            &mut conversation,
+            self.compaction_config.keep_recent_messages.min(8),
+        );
+        let compacted_state = previous_state.continuation.clone().or_else(|| {
+            task.resume_session
+                .as_ref()
+                .map(|_| compact_state_from_task_run(&task_run))
+        });
         let mut context_input = ContextInput {
             system_instructions: base_system_instructions.clone(),
             workspace: workspace_metadata,
             instructions,
             user_request: task.user_task.clone(),
-            conversation: if task.recent_conversation.is_empty() {
-                if previous_state.continuation.is_some() {
-                    previous_state.working_messages
-                } else {
-                    previous_state.messages
-                }
-            } else {
-                task.recent_conversation.clone()
-            },
+            conversation,
             files: task.selected_files.clone(),
             tool_results: task.initial_tool_results.clone(),
-            compacted_state: previous_state.continuation,
+            compacted_state,
             git_status: task.git_status.clone(),
+            git_diff: None,
         };
         self.emit(
             &session_id,
@@ -1576,11 +1926,16 @@ impl AgentRunner {
         let mut no_progress_final_responses = 0_u32;
         let mut validation_since_last_edit =
             task.task_mode != TaskMode::Code || task_run.changed_files.is_empty();
+        let mut retrieved_file_paths = HashSet::<String>::new();
+        let mut used_retrieved_file_paths = HashSet::<String>::new();
         // Keep the latest canonical call/result batch for native model
         // protocols that require explicit tool-result messages. The rebuilt
         // context carries older observations without retaining an unbounded
         // raw tool transcript. Provider-private signatures stay in adapters.
         let mut model_history = Vec::<Message>::new();
+        let model_descriptor = self.provider.descriptor();
+        let model_context_window = model_descriptor.capabilities.context_window;
+        let mut previous_context_items = None::<Vec<ContextItem>>;
         loop {
             self.check_limits(
                 started_at,
@@ -1602,17 +1957,61 @@ impl AgentRunner {
             self.update_task_run(&session_id, &collector, &task_run)?;
             context_input.system_instructions = base_system_instructions.clone();
             append_live_task_state(&mut context_input.system_instructions, &task_run);
-            let mut assembly = match self.context_builder.build(&context_input) {
+            let total_context_budget = self
+                .context_builder
+                .budget_for_context_window(model_context_window)
+                .max_working_context_tokens;
+            let history_budget = total_context_budget
+                .saturating_div(3)
+                .max(1)
+                .min(total_context_budget);
+            trim_model_history_to_budget(&mut model_history, history_budget);
+            let model_history_tokens = estimate_model_history_tokens(&model_history);
+            context_input.git_diff = if git_available && !task_run.changed_files.is_empty() {
+                task_final_diff(&task.workspace_root, &task_run.changed_files)
+                    .map(|diff| bounded_context(&diff, 8 * 1024))
+            } else {
+                None
+            };
+            let mut assembly = match self.context_builder.build_for_context_window_reserving(
+                &context_input,
+                model_context_window,
+                model_history_tokens,
+            ) {
                 Ok(assembly) => assembly,
                 Err(error) => {
                     return self.fail(session_id, collector, AgentError::Core(error.to_string()))
                 }
             };
+            let adaptive_threshold = assembly
+                .budget
+                .max_working_context_tokens
+                .saturating_mul(3)
+                .checked_div(4)
+                .unwrap_or(1)
+                .max(1);
+            let compaction_threshold = self
+                .compaction_config
+                .threshold_tokens
+                .min(adaptive_threshold);
+            let estimated_total_tokens = assembly
+                .estimated_tokens
+                .saturating_add(model_history_tokens);
             if self.compaction_config.threshold_tokens > 0
-                && assembly.estimated_tokens >= self.compaction_config.threshold_tokens
+                && estimated_total_tokens >= compaction_threshold
             {
-                self.compact_context(&session_id, &mut context_input, &collector, &task_run)?;
-                assembly = match self.context_builder.build(&context_input) {
+                self.compact_context(
+                    &session_id,
+                    &task.workspace_root,
+                    &mut context_input,
+                    &collector,
+                    &mut task_run,
+                )?;
+                assembly = match self.context_builder.build_for_context_window_reserving(
+                    &context_input,
+                    model_context_window,
+                    model_history_tokens,
+                ) {
                     Ok(assembly) => assembly,
                     Err(error) => {
                         return self.fail(
@@ -1623,6 +2022,24 @@ impl AgentRunner {
                     }
                 };
             }
+            let reused_context_tokens = previous_context_items
+                .as_deref()
+                .map(|previous| context_reuse_tokens(previous, &assembly.items))
+                .unwrap_or_default();
+            record_context_request(
+                &mut task_run.context_metrics,
+                assembly
+                    .estimated_tokens
+                    .saturating_add(model_history_tokens),
+                reused_context_tokens,
+            );
+            previous_context_items = Some(
+                assembly
+                    .included_items()
+                    .cloned()
+                    .collect::<Vec<ContextItem>>(),
+            );
+            self.update_task_run(&session_id, &collector, &task_run)?;
             let context_message = Message::user_text(assembly.prompt);
             let mut model_messages = Vec::with_capacity(model_history.len() + 1);
             model_messages.push(context_message);
@@ -1648,13 +2065,16 @@ impl AgentRunner {
                 metadata: Default::default(),
                 reasoning: self.reasoning.clone(),
             };
-            let descriptor = self.provider.descriptor();
             self.emit(
                 &session_id,
                 EventPayload::ModelRequested {
-                    provider: descriptor.provider.clone(),
+                    provider: model_descriptor.provider.clone(),
                     model: self.model.clone(),
-                    prompt_tokens: None,
+                    prompt_tokens: Some(
+                        assembly
+                            .estimated_tokens
+                            .saturating_add(model_history_tokens),
+                    ),
                 },
                 &collector,
             )?;
@@ -1699,6 +2119,11 @@ impl AgentRunner {
                 }
             };
             self.flush(&session_id, &collector)?;
+            record_context_response(
+                &mut task_run.context_metrics,
+                response.usage.as_ref().and_then(|usage| usage.input_tokens),
+            );
+            self.update_task_run(&session_id, &collector, &task_run)?;
             if unresolved_error_keys.remove("runtime:provider").is_some() {
                 task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
             }
@@ -1732,7 +2157,7 @@ impl AgentRunner {
             model_tokens += usage_tokens(response.usage.as_ref());
             let response_cost = estimate_cost_microusd(
                 response.usage.as_ref(),
-                descriptor.metadata.pricing.as_ref(),
+                model_descriptor.metadata.pricing.as_ref(),
             );
             estimated_cost_microusd = match (estimated_cost_microusd, response_cost) {
                 (Some(total), Some(cost)) => Some(total.saturating_add(cost)),
@@ -1741,7 +2166,7 @@ impl AgentRunner {
             self.emit(
                 &session_id,
                 EventPayload::ModelResponse {
-                    provider: descriptor.provider,
+                    provider: model_descriptor.provider.clone(),
                     model: response.model.clone(),
                     text: response.text(),
                     input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),
@@ -1973,6 +2398,7 @@ impl AgentRunner {
                             ),
                         ),
                         is_shell: false,
+                        already_in_model_history: false,
                     });
                     self.update_task_run(&session_id, &collector, &task_run)?;
                     continue;
@@ -2124,10 +2550,39 @@ impl AgentRunner {
                     }
                 };
                 let (bounded_output, output_truncated) =
-                    bound_tool_result_output(&result.output, result.truncated);
+                    bound_tool_result_output(&result.output, result.truncated, is_shell);
                 result.output = bounded_output;
                 result.truncated = output_truncated;
                 let changed_files = result.changed_files.clone();
+                if !result.is_error && task_mode_denial.is_none() {
+                    if is_repository_retrieval_tool(&tool_call.name) {
+                        task_run.context_metrics.retrieval_queries =
+                            task_run.context_metrics.retrieval_queries.saturating_add(1);
+                    }
+                    if tool_call.name == "read_file" {
+                        if let Some(path) = tool_call
+                            .arguments
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            retrieved_file_paths.insert(normalize_workspace_path(
+                                std::path::Path::new(path),
+                                &task.workspace_root,
+                            ));
+                        }
+                    }
+                    for path in &changed_files {
+                        let normalized = normalize_workspace_path(path, &task.workspace_root);
+                        if retrieved_file_paths.contains(&normalized)
+                            && used_retrieved_file_paths.insert(normalized)
+                        {
+                            task_run.context_metrics.retrieved_files_used = task_run
+                                .context_metrics
+                                .retrieved_files_used
+                                .saturating_add(1);
+                        }
+                    }
+                }
                 let mut meaningful_plan_progress = !result.is_error && task_mode_denial.is_none();
                 let quick_diagnostic = quick_diagnostic_result(&result, &changed_files);
                 let final_edit_diff = (!git_available || self.verifier.is_none())
@@ -2259,6 +2714,7 @@ impl AgentRunner {
                             changed_files
                         )),
                         is_shell: false,
+                        already_in_model_history: false,
                     });
                     if passed {
                         meaningful_plan_progress = true;
@@ -2291,6 +2747,7 @@ impl AgentRunner {
                     name: tool_call.name,
                     result,
                     is_shell,
+                    already_in_model_history: true,
                 });
                 if let Some(diff) = final_edit_diff {
                     let command = "inspect final edit diff".to_owned();
@@ -2513,21 +2970,31 @@ impl AgentRunner {
     fn compact_context(
         &self,
         session_id: &SessionId,
+        workspace_root: &std::path::Path,
         context_input: &mut ContextInput,
         collector: &Arc<Mutex<Vec<HarnessEvent>>>,
-        task_run: &TaskRun,
+        task_run: &mut TaskRun,
     ) -> Result<(), AgentError> {
+        let current_git_diff = (!task_run.changed_files.is_empty())
+            .then(|| task_final_diff(workspace_root, &task_run.changed_files))
+            .flatten()
+            .map(|diff| bounded_context(&diff, 8 * 1024));
         let request = CompactionRequest {
-            task: &context_input.user_request,
+            task: &task_run.original_goal,
             goal: Some(&task_run.goal),
             execution_plan: task_run.execution_plan.as_ref(),
+            task_run,
             conversation: &context_input.conversation,
             tool_results: &context_input.tool_results,
+            previous: context_input.compacted_state.as_ref(),
+            current_git_diff: current_git_diff.as_deref(),
         };
         let compacted = self
             .compaction_strategy
             .compact(&request)
             .map_err(|error| AgentError::Core(format!("context compaction failed: {error}")))?;
+        task_run.context_metrics.compactions =
+            task_run.context_metrics.compactions.saturating_add(1);
         let removed_items = context_input
             .conversation
             .len()
@@ -2542,13 +3009,14 @@ impl AgentRunner {
             },
             collector,
         )?;
-        let keep = self.compaction_config.keep_recent_messages;
+        let keep = self.compaction_config.keep_recent_messages.min(8);
         let split = context_input.conversation.len().saturating_sub(keep);
         if split > 0 {
             context_input.conversation.drain(..split);
         }
         context_input.tool_results.clear();
         context_input.compacted_state = Some(compacted);
+        self.update_task_run(session_id, collector, task_run)?;
         Ok(())
     }
 
@@ -2685,6 +3153,7 @@ impl AgentRunner {
                         name: "verification".to_owned(),
                         result: ToolResult::new(summary),
                         is_shell: false,
+                        already_in_model_history: false,
                     });
                     if report.passed {
                         unresolved_error_keys.remove(&failure_key);
@@ -2761,6 +3230,7 @@ impl AgentRunner {
                     name: "verification".to_owned(),
                     result: ToolResult::new(message),
                     is_shell: false,
+                    already_in_model_history: false,
                 });
                 if *failures >= repeated_failure_limit.max(1) {
                     task_run.unresolved_errors = unresolved_error_keys.values().cloned().collect();
@@ -2925,7 +3395,15 @@ fn tool_error_result(tool: String, message: String) -> ToolResult {
     result
 }
 
-fn bound_tool_result_output(output: &str, already_truncated: bool) -> (String, bool) {
+fn bound_tool_result_output(
+    output: &str,
+    already_truncated: bool,
+    is_shell: bool,
+) -> (String, bool) {
+    if is_shell {
+        let bounded = summarize_shell_output(output, MAX_MODEL_TOOL_RESULT_BYTES);
+        return (bounded.clone(), already_truncated || bounded != output);
+    }
     let truncated = already_truncated || output.len() > MAX_MODEL_TOOL_RESULT_BYTES;
     if !truncated {
         return (output.to_owned(), false);
@@ -3038,18 +3516,23 @@ fn usage_tokens(usage: Option<&Usage>) -> u64 {
 
 #[cfg(test)]
 mod conformance_hardening_tests {
+    use super::CompactionStrategy;
     use super::{
         advance_execution_plan, apply_unrelated_verification_dispositions,
-        bound_tool_result_output, complete_edit_diff, decimal_microusd, estimate_cost_microusd,
-        execution_plan_from_implementation, extract_plan_revision, finish_plan_state,
-        parse_unrelated_verification_directives, quick_diagnostic_result, record_plan_progress,
-        revise_execution_plan, task_final_diff, tool_error_result,
+        bound_tool_result_output, compact_state_from_task_run, complete_edit_diff,
+        context_reuse_tokens, decimal_microusd, estimate_cost_microusd,
+        estimate_model_history_tokens, execution_plan_from_implementation, extract_plan_revision,
+        finish_plan_state, parse_unrelated_verification_directives, quick_diagnostic_result,
+        record_context_request, record_context_response, record_plan_progress,
+        revise_execution_plan, task_final_diff, tool_error_result, trim_model_history_to_budget,
     };
-    use harness_models::{ModelPricing, Usage};
+    use harness_context::{ContextCategory, ContextItem, ContextReason, ToolContextResult};
+    use harness_models::{ContentBlock, Message, ModelPricing, Role, ToolCall, Usage};
     use harness_session::{
-        ExecutionPlan, ImplementationPlan, PlanItemStatus, TaskCompletionStatus, TaskRun,
-        TaskVerificationResult,
+        CompactState, ContextMetrics, ExecutionPlan, ImplementationPlan, PlanItemStatus,
+        TaskCompletionStatus, TaskRun, TaskVerificationResult,
     };
+    use harness_tools::ToolResult;
     use std::collections::HashMap;
     use std::process::Command;
     use tempfile::tempdir;
@@ -3153,13 +3636,196 @@ mod conformance_hardening_tests {
     }
 
     #[test]
+    fn compaction_artifact_is_structured_bounded_and_merged_without_rewriting_old_summaries() {
+        let mut task_run = TaskRun::new("Repair the parser and add a regression test");
+        task_run.relevant_files = vec!["src/parser.rs".into()];
+        task_run.changed_files = vec!["src/parser.rs".into()];
+        task_run.commands_executed = vec!["cargo test -p parser".to_owned()];
+        task_run.unresolved_errors =
+            vec!["verification:cargo test -p parser :: expected token".to_owned()];
+        task_run.remaining_work = vec!["Fix the unexpected-token assertion".to_owned()];
+        task_run.verification_results = vec![TaskVerificationResult {
+            command: "cargo test -p parser".to_owned(),
+            category: "test".to_owned(),
+            passed: false,
+            exit_code: Some(1),
+            summary: "parser regression failed".to_owned(),
+            ..TaskVerificationResult::default()
+        }];
+        let resumed_artifact = compact_state_from_task_run(&task_run);
+        assert!(resumed_artifact.render().contains("cargo test -p parser"));
+        let previous = CompactState {
+            discoveries: vec!["Earlier discovery: parser uses a token cursor".to_owned()],
+            decisions: vec!["Decision: keep the parser API stable".to_owned()],
+            ..CompactState::default()
+        };
+        let results = vec![
+            ToolContextResult {
+                name: "find_symbol".to_owned(),
+                result: ToolResult::new("src/parser.rs: fn parse_primary at line 41"),
+                is_shell: false,
+                already_in_model_history: false,
+            },
+            ToolContextResult {
+                name: "shell".to_owned(),
+                result: ToolResult::new("routine shell output must not be copied to a summary"),
+                is_shell: true,
+                already_in_model_history: false,
+            },
+        ];
+
+        let artifact = super::DeriveCompactionStrategy
+            .compact(&super::CompactionRequest {
+                task: &task_run.original_goal,
+                goal: Some(&task_run.goal),
+                execution_plan: None,
+                task_run: &task_run,
+                conversation: &[],
+                tool_results: &results,
+                previous: Some(&previous),
+                current_git_diff: Some("+fixed parser branch\n"),
+            })
+            .unwrap();
+        let rendered = artifact.render();
+
+        for section in [
+            "GOAL",
+            "CURRENT STATE",
+            "DECISIONS",
+            "FILES CHANGED",
+            "IMPORTANT SYMBOLS",
+            "COMMANDS/TESTS",
+            "KNOWN FAILURES",
+            "WHAT HAS BEEN TRIED",
+            "NEXT STEPS",
+            "CURRENT GIT DIFF",
+        ] {
+            assert!(rendered.contains(section), "missing {section}");
+        }
+        assert!(rendered.contains("Earlier discovery: parser uses a token cursor"));
+        assert!(rendered.contains("parse_primary"));
+        assert!(rendered.contains("cargo test -p parser"));
+        assert!(rendered.contains("expected token"));
+        assert!(rendered.contains("+fixed parser branch"));
+        assert!(!rendered.contains("routine shell output must not be copied"));
+    }
+
+    #[test]
+    fn compaction_drops_resolved_failures_and_preserves_diff_when_git_is_unavailable() {
+        let mut task_run = TaskRun::new("Fix the parser regression");
+        task_run.verification_results = vec![
+            TaskVerificationResult {
+                command: "cargo test -p parser".to_owned(),
+                category: "test".to_owned(),
+                passed: false,
+                summary: "old parser failure".to_owned(),
+                ..TaskVerificationResult::default()
+            },
+            TaskVerificationResult {
+                command: "cargo test -p parser".to_owned(),
+                category: "test".to_owned(),
+                passed: true,
+                summary: "parser tests pass".to_owned(),
+                ..TaskVerificationResult::default()
+            },
+        ];
+        let previous = CompactState {
+            current_git_diff: Some("+last known patch\n".to_owned()),
+            known_failures: vec!["old parser failure".to_owned()],
+            ..CompactState::default()
+        };
+
+        let artifact = super::DeriveCompactionStrategy
+            .compact(&super::CompactionRequest {
+                task: &task_run.original_goal,
+                goal: Some(&task_run.goal),
+                execution_plan: None,
+                task_run: &task_run,
+                conversation: &[],
+                tool_results: &[],
+                previous: Some(&previous),
+                current_git_diff: None,
+            })
+            .unwrap();
+
+        assert!(artifact.known_failures.is_empty());
+        assert_eq!(
+            artifact.current_git_diff.as_deref(),
+            Some("+last known patch\n")
+        );
+        assert!(artifact.render().contains("+last known patch"));
+    }
+
+    #[test]
+    fn context_metrics_track_per_turn_estimates_and_exact_reuse() {
+        let item = ContextItem {
+            id: "project-instructions".to_owned(),
+            category: ContextCategory::Instruction,
+            source: "AGENTS.md".to_owned(),
+            reason: ContextReason::Required,
+            content: "Use focused tests.".to_owned(),
+            original_bytes: 18,
+            estimated_tokens: 5,
+            included: true,
+            truncated: false,
+            limits: Vec::new(),
+        };
+        assert_eq!(
+            context_reuse_tokens(std::slice::from_ref(&item), std::slice::from_ref(&item)),
+            5
+        );
+
+        let mut metrics = ContextMetrics::default();
+        record_context_request(&mut metrics, 120, 5);
+        record_context_response(&mut metrics, Some(98));
+        record_context_request(&mut metrics, 140, 0);
+
+        assert_eq!(metrics.estimated_tokens_per_turn, [120, 140]);
+        assert_eq!(metrics.reported_input_tokens_per_turn, [Some(98), None]);
+        assert_eq!(metrics.estimated_tokens_sent, 260);
+        assert_eq!(metrics.reused_context_tokens, 5);
+    }
+
+    #[test]
+    fn trimming_protocol_history_keeps_tool_pairing_and_caps_repeated_input() {
+        let mut history = vec![
+            Message::assistant_tool_calls(vec![ToolCall {
+                id: "call-edit-1".to_owned(),
+                name: "apply_patch".to_owned(),
+                arguments: serde_json::json!({ "patch": "large patch payload".repeat(200) }),
+            }]),
+            Message {
+                role: Role::Tool,
+                content: vec![ContentBlock::Text {
+                    text: "important result line\n".repeat(500),
+                }],
+                name: None,
+                tool_call_id: Some("call-edit-1".to_owned()),
+                tool_calls: Vec::new(),
+                is_error: false,
+            },
+        ];
+
+        trim_model_history_to_budget(&mut history, 256);
+
+        assert!(estimate_model_history_tokens(&history) <= 256);
+        assert_eq!(history[0].tool_calls[0].id, "call-edit-1");
+        assert_eq!(history[0].tool_calls[0].name, "apply_patch");
+        assert_eq!(history[1].tool_call_id.as_deref(), Some("call-edit-1"));
+        assert!(history[1].content.iter().any(|block| matches!(
+            block,
+            ContentBlock::Text { text } if text.contains("tool history trimmed")
+        )));
+    }
+
+    #[test]
     fn tool_errors_are_marked_and_large_utf8_results_are_bounded() {
         let error = tool_error_result("read_file".to_owned(), "missing file".to_owned());
         assert!(error.is_error);
         assert!(error.output.contains("missing file"));
 
         let long = "🙂".repeat(20_000);
-        let (bounded, truncated) = bound_tool_result_output(&long, false);
+        let (bounded, truncated) = bound_tool_result_output(&long, false, false);
         assert!(truncated);
         assert!(bounded.len() <= 16 * 1024);
         assert!(bounded.ends_with("[truncated]"));

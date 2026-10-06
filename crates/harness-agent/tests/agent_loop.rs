@@ -335,6 +335,8 @@ fn mock_agent_reads_edits_runs_observes_and_finishes() {
         harness_session::TaskCompletionStatus::Done
     );
     assert!(task_run.relevant_files.contains(&"file.txt".into()));
+    assert_eq!(task_run.context_metrics.retrieval_queries, 1);
+    assert_eq!(task_run.context_metrics.retrieved_files_used, 1);
     assert!(task_run
         .changed_files
         .iter()
@@ -1053,7 +1055,11 @@ fn long_runs_keep_the_goal_and_plan_across_compaction_at_ten_and_one_hundred_tur
         let mut responses = Vec::with_capacity(expected_turns as usize);
         for index in 0..tool_turns {
             let path = format!("fixture-{index:03}.txt");
-            std::fs::write(workspace.join(&path), format!("fixture {index}\n")).unwrap();
+            std::fs::write(
+                workspace.join(&path),
+                format!("fixture-output-{index:03}\n"),
+            )
+            .unwrap();
             let text = if index == 0 {
                 "Plan:\n- Read the requested fixture files\n- Summarize the findings"
             } else {
@@ -1111,6 +1117,30 @@ fn long_runs_keep_the_goal_and_plan_across_compaction_at_ten_and_one_hundred_tur
         assert_eq!(task_run.goal.objective, objective);
         assert_eq!(task_run.goal.constraints, ["Read only."]);
         assert_eq!(task_run.goal.acceptance_criteria, task.acceptance_criteria);
+        assert_eq!(
+            task_run.context_metrics.estimated_tokens_per_turn.len(),
+            expected_turns as usize
+        );
+        assert_eq!(
+            task_run
+                .context_metrics
+                .reported_input_tokens_per_turn
+                .len(),
+            expected_turns as usize
+        );
+        assert!(task_run
+            .context_metrics
+            .reported_input_tokens_per_turn
+            .iter()
+            .all(Option::is_some));
+        assert!(task_run.context_metrics.estimated_tokens_sent > 0);
+        assert!(task_run.context_metrics.reused_context_tokens > 0);
+        assert_eq!(
+            task_run.context_metrics.compactions,
+            u32::try_from(state.context_compactions).unwrap()
+        );
+        assert_eq!(task_run.context_metrics.retrieval_queries, tool_turns);
+        assert_eq!(task_run.context_metrics.retrieved_files_used, 0);
         let plan = task_run.execution_plan.unwrap();
         assert_eq!(
             plan.revision, 1,
@@ -1138,6 +1168,22 @@ fn long_runs_keep_the_goal_and_plan_across_compaction_at_ten_and_one_hundred_tur
             .expect("later turns should receive the persisted task state");
         assert!(compacted_prompt.contains(&goal));
         assert!(compacted_prompt.contains("Execution plan revision 1"));
+        if expected_turns == 100 {
+            let final_prompt = requests
+                .last()
+                .unwrap()
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|block| match block {
+                    harness_models::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!final_prompt.contains("fixture-output-000"));
+            assert!(final_prompt.contains("fixture-output-098"));
+        }
     }
 }
 

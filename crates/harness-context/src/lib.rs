@@ -8,10 +8,13 @@ use harness_tools::ToolResult;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ContextBudget {
     pub max_individual_file_bytes: usize,
     pub max_tool_result_bytes: usize,
     pub max_shell_output_bytes: usize,
+    pub max_git_diff_bytes: usize,
+    pub max_compaction_summary_bytes: usize,
     pub max_working_context_tokens: u32,
 }
 
@@ -21,8 +24,41 @@ impl Default for ContextBudget {
             max_individual_file_bytes: 256 * 1024,
             max_tool_result_bytes: 64 * 1024,
             max_shell_output_bytes: 16 * 1024,
+            max_git_diff_bytes: 12 * 1024,
+            max_compaction_summary_bytes: 8 * 1024,
             max_working_context_tokens: 32 * 1024,
         }
+    }
+}
+
+/// Derives a safe prompt budget from the selected model's known input window.
+/// Unknown windows use the configured local budget without fabricating model
+/// metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextBudgetManager {
+    base: ContextBudget,
+    context_fraction_percent: u32,
+}
+
+impl ContextBudgetManager {
+    pub fn new(base: ContextBudget) -> Self {
+        Self {
+            base,
+            context_fraction_percent: 75,
+        }
+    }
+
+    pub fn budget_for_context_window(&self, context_window: Option<u32>) -> ContextBudget {
+        let mut budget = self.base.clone();
+        if let Some(context_window) = context_window {
+            let model_budget = context_window
+                .saturating_mul(self.context_fraction_percent)
+                .checked_div(100)
+                .unwrap_or(0)
+                .max(1);
+            budget.max_working_context_tokens = budget.max_working_context_tokens.min(model_budget);
+        }
+        budget
     }
 }
 
@@ -58,6 +94,8 @@ pub struct ToolContextResult {
     pub name: String,
     pub result: ToolResult,
     pub is_shell: bool,
+    #[serde(default)]
+    pub already_in_model_history: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -71,6 +109,8 @@ pub struct ContextInput {
     pub tool_results: Vec<ToolContextResult>,
     pub compacted_state: Option<harness_session::CompactState>,
     pub git_status: Option<GitStatus>,
+    #[serde(default)]
+    pub git_diff: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,6 +119,7 @@ pub enum ContextCategory {
     Workspace,
     Instruction,
     Git,
+    GitDiff,
     UserRequest,
     Conversation,
     File,
@@ -104,6 +145,8 @@ pub enum ContextLimit {
     FileSize,
     ToolResultSize,
     ShellOutputSize,
+    GitDiffSize,
+    CompactionSummarySize,
     WorkingBudget,
 }
 
@@ -137,7 +180,7 @@ impl ContextAssembly {
 }
 
 pub struct ContextBuilder {
-    budget: ContextBudget,
+    budget_manager: ContextBudgetManager,
 }
 
 impl Default for ContextBuilder {
@@ -148,17 +191,54 @@ impl Default for ContextBuilder {
 
 impl ContextBuilder {
     pub fn new(budget: ContextBudget) -> Self {
-        Self { budget }
+        Self {
+            budget_manager: ContextBudgetManager::new(budget),
+        }
     }
 
     pub fn build(&self, input: &ContextInput) -> Result<ContextAssembly, Error> {
-        self.budget.validate()?;
+        self.build_for_context_window(input, None)
+    }
+
+    pub fn build_for_context_window(
+        &self,
+        input: &ContextInput,
+        context_window: Option<u32>,
+    ) -> Result<ContextAssembly, Error> {
+        self.build_for_context_window_reserving(input, context_window, 0)
+    }
+
+    pub fn budget_for_context_window(&self, context_window: Option<u32>) -> ContextBudget {
+        self.budget_manager
+            .budget_for_context_window(context_window)
+    }
+
+    pub fn build_for_context_window_reserving(
+        &self,
+        input: &ContextInput,
+        context_window: Option<u32>,
+        reserved_tokens: u32,
+    ) -> Result<ContextAssembly, Error> {
+        let mut budget = self
+            .budget_manager
+            .budget_for_context_window(context_window);
+        budget.validate()?;
+        budget.max_working_context_tokens = budget
+            .max_working_context_tokens
+            .saturating_sub(reserved_tokens)
+            .max(1);
+        budget.validate()?;
+        const MAX_RECENT_CONVERSATION_MESSAGES: usize = 8;
+        const MAX_RECENT_TOOL_RESULTS: usize = 24;
         let mut items = Vec::new();
         let mut used_tokens = 0;
-        add_item(
-            &mut items,
-            &mut used_tokens,
-            self.budget.clone(),
+        let mut candidates = Vec::<(u8, usize, Candidate)>::new();
+        let mut add = |priority, recency, candidate| {
+            candidates.push((priority, recency, candidate));
+        };
+        add(
+            0,
+            0,
             Candidate {
                 id: "system-instructions".to_owned(),
                 category: ContextCategory::System,
@@ -169,33 +249,59 @@ impl ContextBuilder {
                 limit: None,
             },
         );
-        if input.workspace.root.is_some()
-            || !input.workspace.languages.is_empty()
-            || !input.workspace.manifests.is_empty()
-            || !input.workspace.details.is_empty()
-        {
-            add_item(
-                &mut items,
-                &mut used_tokens,
-                self.budget.clone(),
+        add(
+            0,
+            1,
+            Candidate {
+                id: "user-request".to_owned(),
+                category: ContextCategory::UserRequest,
+                source: "conversation".to_owned(),
+                reason: ContextReason::CurrentUserRequest,
+                content: input.user_request.clone(),
+                required: true,
+                limit: None,
+            },
+        );
+        if let Some(compacted) = &input.compacted_state {
+            add(
+                3,
+                usize::MAX,
                 Candidate {
-                    id: "workspace-metadata".to_owned(),
-                    category: ContextCategory::Workspace,
-                    source: "workspace".to_owned(),
-                    reason: ContextReason::WorkspaceMetadata,
-                    content: workspace_text(&input.workspace),
+                    id: "compacted-state".to_owned(),
+                    category: ContextCategory::CompactionSummary,
+                    source: "session.context.compacted".to_owned(),
+                    reason: ContextReason::CompactionSummary,
+                    content: compacted.render(),
+                    // Current goal/plan/failures are also present in the
+                    // runtime-owned task state. This historical supplement
+                    // must not displace instructions, relevant code, or the
+                    // current diff when the working budget is tight.
                     required: false,
-                    limit: None,
+                    limit: Some(ContextLimit::CompactionSummarySize),
+                },
+            );
+        }
+        if let Some(diff) = &input.git_diff {
+            add(
+                1,
+                0,
+                Candidate {
+                    id: "current-git-diff".to_owned(),
+                    category: ContextCategory::GitDiff,
+                    source: "workspace task changes".to_owned(),
+                    reason: ContextReason::GitState,
+                    content: diff.clone(),
+                    required: false,
+                    limit: Some(ContextLimit::GitDiffSize),
                 },
             );
         }
         let mut instructions = input.instructions.clone();
         instructions.sort_by_key(|instruction| instruction.precedence);
-        for instruction in &instructions {
-            add_item(
-                &mut items,
-                &mut used_tokens,
-                self.budget.clone(),
+        for (index, instruction) in instructions.iter().enumerate() {
+            add(
+                1,
+                index,
                 Candidate {
                     id: format!("instruction-{}", instruction.precedence),
                     category: ContextCategory::Instruction,
@@ -210,10 +316,9 @@ impl ContextBuilder {
             );
         }
         if let Some(git_status) = &input.git_status {
-            add_item(
-                &mut items,
-                &mut used_tokens,
-                self.budget.clone(),
+            add(
+                1,
+                instructions.len() + 1,
                 Candidate {
                     id: "git-status".to_owned(),
                     category: ContextCategory::Git,
@@ -225,43 +330,38 @@ impl ContextBuilder {
                 },
             );
         }
-        if let Some(compacted) = &input.compacted_state {
-            add_item(
-                &mut items,
-                &mut used_tokens,
-                self.budget.clone(),
+        if input.workspace.root.is_some()
+            || !input.workspace.languages.is_empty()
+            || !input.workspace.manifests.is_empty()
+            || !input.workspace.details.is_empty()
+        {
+            add(
+                3,
+                0,
                 Candidate {
-                    id: "compacted-state".to_owned(),
-                    category: ContextCategory::CompactionSummary,
-                    source: "session.context.compacted".to_owned(),
-                    reason: ContextReason::CompactionSummary,
-                    content: compacted.render(),
-                    required: true,
-                    limit: Some(ContextLimit::ToolResultSize),
-                },
-            );
-        }
-        if !input.user_request.trim().is_empty() {
-            add_item(
-                &mut items,
-                &mut used_tokens,
-                self.budget.clone(),
-                Candidate {
-                    id: "user-request".to_owned(),
-                    category: ContextCategory::UserRequest,
-                    source: "conversation".to_owned(),
-                    reason: ContextReason::CurrentUserRequest,
-                    content: input.user_request.clone(),
-                    required: true,
+                    id: "workspace-metadata".to_owned(),
+                    category: ContextCategory::Workspace,
+                    source: "workspace".to_owned(),
+                    reason: ContextReason::WorkspaceMetadata,
+                    content: workspace_text(&input.workspace),
+                    required: false,
                     limit: None,
                 },
             );
         }
-        for (index, message) in input.conversation.iter().enumerate() {
-            add_item(
-                &mut items,
-                &mut used_tokens,
-                self.budget.clone(),
+        let conversation_start = input
+            .conversation
+            .len()
+            .saturating_sub(MAX_RECENT_CONVERSATION_MESSAGES);
+        for (index, message) in input
+            .conversation
+            .iter()
+            .enumerate()
+            .skip(conversation_start)
+        {
+            add(
+                3,
+                input.conversation.len() - index,
                 Candidate {
                     id: format!("conversation-{index}"),
                     category: ContextCategory::Conversation,
@@ -273,11 +373,10 @@ impl ContextBuilder {
                 },
             );
         }
-        for file in &input.files {
-            add_item(
-                &mut items,
-                &mut used_tokens,
-                self.budget.clone(),
+        for (index, file) in input.files.iter().enumerate() {
+            add(
+                2,
+                index,
                 Candidate {
                     id: format!("file-{}", file.path.display()),
                     category: ContextCategory::File,
@@ -289,17 +388,46 @@ impl ContextBuilder {
                 },
             );
         }
-        for result in &input.tool_results {
-            add_item(
-                &mut items,
-                &mut used_tokens,
-                self.budget.clone(),
+        let visible_tool_results = input
+            .tool_results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| !result.already_in_model_history)
+            .collect::<Vec<_>>();
+        let visible_tool_count = visible_tool_results.len();
+        let tool_start = visible_tool_count.saturating_sub(MAX_RECENT_TOOL_RESULTS);
+        for (visible_index, (index, result)) in visible_tool_results
+            .into_iter()
+            .enumerate()
+            .skip(tool_start)
+            .rev()
+        {
+            let is_failure = result.result.is_error
+                || result.name == "task_completion_check"
+                || (result.name == "verification" && result.result.output.contains("passed=false"));
+            let priority = if is_failure || result.name == "read_file" {
+                2
+            } else if result.is_shell {
+                5
+            } else if is_repository_retrieval_source(&result.name) {
+                3
+            } else {
+                4
+            };
+            let content = if result.is_shell {
+                summarize_shell_output(&result.result.output, budget.max_shell_output_bytes)
+            } else {
+                result.result.output.clone()
+            };
+            add(
+                priority,
+                visible_tool_count - visible_index,
                 Candidate {
-                    id: format!("tool-{}", result.name),
+                    id: format!("tool-{index}-{}", result.name),
                     category: ContextCategory::ToolResult,
                     source: result.name.clone(),
                     reason: ContextReason::RelevantToolResult,
-                    content: result.result.output.clone(),
+                    content,
                     required: false,
                     limit: Some(if result.is_shell {
                         ContextLimit::ShellOutputSize
@@ -309,13 +437,17 @@ impl ContextBuilder {
                 },
             );
         }
+        candidates.sort_by_key(|(priority, recency, _)| (*priority, *recency));
+        for (_, _, candidate) in candidates {
+            add_item(&mut items, &mut used_tokens, budget.clone(), candidate);
+        }
         let excluded_items = items.iter().filter(|item| !item.included).count();
         let prompt = render_prompt(&items);
         Ok(ContextAssembly {
             prompt,
             items,
             estimated_tokens: used_tokens,
-            budget: self.budget.clone(),
+            budget,
             excluded_items,
         })
     }
@@ -350,10 +482,24 @@ fn add_item(
             vec![ContextLimit::ToolResultSize],
         ),
         Some(ContextLimit::ShellOutputSize) if original_bytes > budget.max_shell_output_bytes => (
-            truncate_bytes(&candidate.content, budget.max_shell_output_bytes),
+            summarize_shell_output(&candidate.content, budget.max_shell_output_bytes),
             true,
             vec![ContextLimit::ShellOutputSize],
         ),
+        Some(ContextLimit::GitDiffSize) if original_bytes > budget.max_git_diff_bytes => (
+            truncate_bytes(&candidate.content, budget.max_git_diff_bytes),
+            true,
+            vec![ContextLimit::GitDiffSize],
+        ),
+        Some(ContextLimit::CompactionSummarySize)
+            if original_bytes > budget.max_compaction_summary_bytes =>
+        {
+            (
+                truncate_bytes(&candidate.content, budget.max_compaction_summary_bytes),
+                true,
+                vec![ContextLimit::CompactionSummarySize],
+            )
+        }
         _ => (candidate.content, false, Vec::new()),
     };
     let estimated_tokens = estimate_tokens(&content);
@@ -416,13 +562,70 @@ pub fn estimate_tokens(value: &str) -> u32 {
     value.len().saturating_add(3) as u32 / 4
 }
 
+pub fn summarize_shell_output(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let lines = value.lines().collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    selected.extend(lines.iter().take(4).copied());
+    let mut diagnostic_count = 0;
+    for line in &lines {
+        let lower = line.to_ascii_lowercase();
+        if [
+            "error",
+            "failed",
+            "failure",
+            "warning",
+            "passed",
+            "test result",
+        ]
+        .iter()
+        .any(|signal| lower.contains(signal))
+        {
+            selected.push(*line);
+            diagnostic_count += 1;
+            if diagnostic_count >= 20 {
+                break;
+            }
+        }
+    }
+    selected.extend(lines.iter().rev().take(8).rev().copied());
+    selected.dedup();
+    let omitted = lines.len().saturating_sub(selected.len());
+    let summary = format!(
+        "[shell output summarized: {} lines, omitted {omitted}]\n{}",
+        lines.len(),
+        selected.join("\n")
+    );
+    truncate_bytes(&summary, max_bytes)
+}
+
+fn is_repository_retrieval_source(name: &str) -> bool {
+    matches!(
+        name,
+        "search_files"
+            | "search_text"
+            | "find_symbol"
+            | "find_references"
+            | "goto_definition"
+            | "get_diagnostics"
+            | "get_file_outline"
+            | "get_repo_tree"
+    )
+}
+
 fn truncate_bytes(value: &str, max_bytes: usize) -> String {
     const MARKER: &str = "\n[truncated]";
     if value.len() <= max_bytes {
         return value.to_owned();
     }
     if max_bytes <= MARKER.len() {
-        return value[..max_bytes].to_owned();
+        let mut end = max_bytes.min(value.len());
+        while !value.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        return value[..end].to_owned();
     }
     let mut end = max_bytes - MARKER.len();
     while !value.is_char_boundary(end) {
@@ -469,6 +672,7 @@ fn render_prompt(items: &[ContextItem]) -> String {
             ContextCategory::Workspace => "Workspace metadata",
             ContextCategory::Instruction => "Project instructions",
             ContextCategory::Git => "Git status",
+            ContextCategory::GitDiff => "Current Git diff",
             ContextCategory::UserRequest => "User request",
             ContextCategory::Conversation => "Recent conversation",
             ContextCategory::File => "Selected files",

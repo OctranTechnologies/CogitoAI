@@ -63,6 +63,17 @@ mark a task done while recorded failures remain unresolved; repeated identical
 calls and repeated failures become `blocked`. A model can request a decision with
 `[USER_INPUT_REQUIRED]`.
 
+**Bounded coding context.** The session event log remains the durable history;
+each model turn receives a freshly assembled, model-window-aware working context
+instead of an indefinitely growing transcript. Current request, saved goal and
+plan, project instructions, relevant files, recent failures, and the current Git
+diff take priority over old shell output and redundant history. Large tool and
+shell results are trimmed or summarized while retaining useful diagnostics. A
+structured compaction artifact preserves the goal, decisions, changed files,
+tests, failures, tried approaches, and next steps for resume. Task snapshots
+record estimated and provider-reported input tokens, reusable context, compaction
+count, and repository-retrieval effectiveness where known.
+
 **CLI and desktop over one runtime.** Both clients use the shared loopback RPC
 bootstrap for agent runs and drive the same agent core, policy engine, and session
 store. They reuse a healthy runtime or start a detached runtime process when none

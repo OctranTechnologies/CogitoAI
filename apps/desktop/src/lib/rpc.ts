@@ -180,6 +180,15 @@ export interface TaskRunSnapshot {
   original_goal: string;
   goal: GoalSnapshot;
   execution_plan: ExecutionPlanSnapshot | null;
+  context_metrics?: {
+    estimated_tokens_per_turn: number[];
+    reported_input_tokens_per_turn: (number | null)[];
+    estimated_tokens_sent: number;
+    reused_context_tokens: number;
+    compactions: number;
+    retrieval_queries: number;
+    retrieved_files_used: number;
+  };
   current_phase: string;
   completion_status: string;
 }

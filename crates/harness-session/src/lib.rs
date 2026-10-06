@@ -12,9 +12,10 @@ pub mod events;
 
 pub use bus::{EventBus, EventSubscriber, EventSubscription};
 pub use events::{
-    CompactState, EventId, EventPayload, EventType, ExecutionMilestone, ExecutionPlan,
-    ExecutionTask, FileChange, Goal, HarnessEvent, ImplementationPlan, PlanItemStatus,
-    TaskCompletionStatus, TaskMode, TaskPhase, TaskRun, TaskVerificationResult, Timestamp,
+    CompactState, ContextMetrics, EventId, EventPayload, EventType, ExecutionMilestone,
+    ExecutionPlan, ExecutionTask, FileChange, Goal, HarnessEvent, ImplementationPlan,
+    PlanItemStatus, TaskCompletionStatus, TaskMode, TaskPhase, TaskRun, TaskVerificationResult,
+    Timestamp,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
