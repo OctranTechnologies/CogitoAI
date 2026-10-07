@@ -1,0 +1,88 @@
+name: Publish desktop release
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Build ${{ matrix.platform }} installers
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      # Tauri's release action creates or updates the release for each target.
+      # Serializing avoids two runners racing to create the same release.
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: windows-latest
+            bundles: msi,nsis
+          - platform: ubuntu-22.04
+            bundles: deb,appimage
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            wget \
+            xdg-utils
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and publish installers
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          args: --bundles ${{ matrix.bundles }}
+          tagName: ${{ github.ref_name }}
+          releaseName: CogitoAI ${{ github.ref_name }}
+          releaseBody: |
+            CogitoAI v0.1 is a local coding agent. Windows and Linux desktop installers include the Harness RPC runtime.
+
+            Windows x64: NSIS setup executable or MSI installer.
+            Linux x64: AppImage or Debian/Ubuntu package.
+
+            Linux requires GTK and WebKitGTK 4.1 runtime libraries. The AppImage may require FUSE compatibility support. These v0.1 installers are unsigned; Windows may show a SmartScreen warning.
+
+            See the repository README for setup instructions and current limitations.
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: false

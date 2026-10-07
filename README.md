@@ -925,6 +925,14 @@ cd apps/desktop
 pnpm tauri build --debug
 ```
 
+Windows and Linux desktop installers are published on the
+[GitHub Releases page](https://github.com/OctranTechnologies/CogitoAI/releases).
+The release workflow builds Windows x64 MSI/NSIS installers and Linux x64
+`.deb`/AppImage packages from version tags. Installers include the matching
+Harness RPC runtime. Linux requires GTK and WebKitGTK 4.1 runtime libraries; the
+`.deb` declares its package dependencies. The v0.1 installers are unsigned, so
+Windows may display a SmartScreen warning.
+
 The packaged application includes a target-specific
 `cogito-harness-runtime` sidecar. The shared Rust launcher searches the Tauri
 resource directory and executable-relative build locations using native paths,
