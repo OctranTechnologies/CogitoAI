@@ -33,6 +33,37 @@ export interface RuntimeDiagnostics {
   last_error: string | null;
 }
 
+export interface McpToolDescriptor {
+  server_id: string;
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  estimated_definition_tokens: number;
+}
+
+export interface McpResourceDescriptor {
+  server_id: string;
+  name: string;
+  uri: string;
+  description: string;
+  mime_type: string | null;
+}
+
+export interface McpServerSnapshot {
+  server_id: string;
+  transport: "stdio" | "streamable_http";
+  state: "disconnected" | "connecting" | "connected" | "failed";
+  tools: McpToolDescriptor[];
+  resources: McpResourceDescriptor[];
+  error: string | null;
+}
+
+export interface McpSnapshot {
+  servers: McpServerSnapshot[];
+  total_tools: number;
+  estimated_tool_definition_tokens: number;
+}
+
 const runtimeEvents = [
   "runtime.disconnected",
   "runtime.discovering",
@@ -128,6 +159,8 @@ export interface HarnessEvent {
 
 export interface ApprovalRequest {
   approval_id: string;
+  risk_categories?: string[];
+  reason?: string;
   tool: {
     name: string;
     arguments: Record<string, unknown>;
@@ -137,6 +170,7 @@ export interface ApprovalRequest {
 export interface AgentTask {
   workspace_root: string;
   user_task: string;
+  attachments?: InputAttachment[];
   task_mode: TaskMode;
   system_instructions: string;
   workspace: Record<string, unknown>;
@@ -148,6 +182,10 @@ export interface AgentTask {
   verification_plan: null;
   resume_session: string | null;
 }
+
+export type InputAttachment =
+  | { kind: "image"; file_name: string; media_type: string; data: string }
+  | { kind: "text"; file_name: string; media_type: string; text: string };
 
 export type TaskMode = "explore" | "plan" | "code";
 

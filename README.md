@@ -179,6 +179,15 @@ undo without disturbing unrelated dirty Git work. The runtime also refreshes its
 repository index and requests best-effort quick diagnostics when a supported
 language server is available.
 
+The coding agent can delegate up to three independent investigations to isolated
+Explore, Review, Test, or Documentation children. Children receive only their
+explicit task, selected context, and repository instructions; their tool catalog
+is read-only and excludes file edits, commands, networking, and recursive
+delegation. Each child has an eight-turn, twenty-tool-call, 90-second, and
+12,000-model-token ceiling. Results return as structured findings for the parent
+to assess. Parent and child sessions are linked in the event history. This v0
+feature supports concurrent research only; children cannot modify source files.
+
 
 See [`docs/architecture.md`](docs/architecture.md) for crate responsibilities and
 dependency direction, and [`docs/development.md`](docs/development.md) for a crate
@@ -504,6 +513,62 @@ starts the secure credential flow. Equivalent shell commands include
 Desktop clients use the `models.list` and `models.refresh` RPC methods; provider
 API requests and credentials stay in the runtime process.
 
+## MCP integrations
+
+The runtime can connect to configured Model Context Protocol servers over local
+stdio or Streamable HTTP. MCP servers are not a separate plugin system: their
+tools are exposed through the harness's regular tool registry and policy engine.
+In the interactive CLI, use `/mcp` to inspect status, `/mcp refresh [server]` to
+connect and discover tools, `/mcp resources <server>` to list resources, and
+`/mcp disconnect <server>` to close a connection. The shell equivalents are
+`harness mcp`, `harness mcp refresh [server]`, `harness mcp resources <server>`,
+and `harness mcp disconnect <server>`. The Desktop Settings → MCP page shows
+cached connection state, discovered tools, resource counts, and estimated
+definition tokens. Opening the page does not start configured servers; clicking
+**Connect & discover** is an explicit user-initiated action and still obeys the
+workspace network policy.
+
+Configure servers in `.agent/mcp.toml`. Credentials are referenced by
+environment variable name and are resolved only inside the runtime; do not put
+secret values in this file. Example:
+
+```toml
+[servers.git]
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-git"]
+# Child variable name = name of the parent environment variable.
+env = { GITHUB_TOKEN = "GITHUB_TOKEN" }
+
+[servers.docs]
+transport = "streamable_http"
+url = "https://docs.example.com/mcp"
+bearer_token_env = "DOCS_MCP_TOKEN"
+```
+
+Set environment variables before starting the CLI or desktop runtime. stdio
+servers run directly as child processes (without a shell), with only a small set
+of operating-system environment variables plus explicitly mapped variables.
+HTTP URLs must use HTTPS; plain HTTP is allowed for localhost only. Bearer
+authentication is supported through `bearer_token_env`; interactive OAuth
+authorization is not implemented yet.
+
+MCP tool definitions are discovered only when the agent searches for an
+integration capability, rather than being permanently added to every model
+request. A selected agent tool call still goes through the normal permission
+decision and approval flow. Network-denied workspaces block it; otherwise MCP
+network actions require approval unless the user has explicitly allowed network
+access. Direct CLI/Desktop connect and resource-list actions also evaluate that
+policy; an explicit user action satisfies an ASK decision, while DENY remains
+final.
+Remote descriptions, schemas, resources, and results are treated as untrusted
+data, and results are size-limited. A failed or cancelled call is not replayed;
+the runtime reconnects only on the next independent request. MCP server
+configuration is local to the open repository. Credential values never enter
+RPC responses; tool results remain normal bounded, untrusted tool output.
+
+Protocol references: [transports](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports), [tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools), and [resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources).
+
 ### Troubleshooting
 
 - If a provider appears disconnected, check the environment of the process that
@@ -556,9 +621,17 @@ Everything in this list is implemented and covered by tests.
 - Default safeguards support up to 256 model turns, 512 tool calls, one hour of
   runtime, and one million reported model tokens; environment limits can lower or
   raise these bounds. Plan revisions remain limited to three per task.
-- Fifteen bounded tools: file and process operations plus repository intelligence
+- Bounded file, process, customization, and repository-intelligence tools
   (`search_files`, `search_text`, `find_symbol`, `find_references`,
   `goto_definition`, `get_diagnostics`, `get_file_outline`, and `get_repo_tree`).
+- Policy-gated `web_search` and `web_fetch` tools for current documentation,
+  API references, library behavior, and issue research. Retrieved pages and
+  search snippets are bounded, labeled as untrusted data, and cannot change
+  runtime policy or system instructions.
+- Task attachments for screenshots, diagrams, mockups, and UTF-8 text. Images
+  use canonical model input blocks and are rejected with a capability error if
+  the selected model does not support vision. The desktop accepts file picker
+  selection and drag/drop; the CLI accepts repeated `--attach FILE` flags.
 - A lazy per-workspace repository index records source languages, declarations,
   imports/exports, package ownership, test files, and configuration files. It is
   queried incrementally; the full index is never added to model context. Text
@@ -767,7 +840,7 @@ mode in the session. Resuming a PLAN session in CODE carries its saved plan and
 repository discoveries forward.
 
 The interactive slash commands are `/help`, `/run`, `/resume`, `/inspect`,
-`/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/models`, `/connect`, `/mode`,
+`/sessions`, `/status`, `/diff`, `/undo`, `/config`, `/model`, `/models`, `/connect`, `/mcp`, `/mode`,
 `/explore`, `/plan`, `/code`, `/goal`, and `/plan-status`,
 `/clear`, `/cancel`, and `/exit`. `/models` shows the cached model registry;
 `/models refresh [provider-id]` refreshes all catalogs or one provider. `/model`
@@ -796,9 +869,11 @@ requires terminal stdin and stdout; for pipes, scripts, and automation, keep usi
 the existing commands such as `harness run` and `--json`. The interactive UI cannot
 be combined with `--json`.
 
-The TUI runs one foreground task at a time. It does not keep tasks running in the
-background after the interface exits. Use the existing `run`, `resume`, and
-`--json` commands for scripts and automation.
+The TUI runs one foreground task at a time. Agent-started background commands
+belong to the persistent RPC runtime instead: their handles can be inspected from
+a later CLI or desktop session, and the runtime stops them during graceful
+shutdown. Cancelling the task that started a process terminates its process tree.
+Use the existing `run`, `resume`, and `--json` commands for scripts and automation.
 
 If the RPC runtime exits during an active task, the CLI reconnects and refreshes
 the saved session state without resubmitting the task. It reports the preserved
@@ -860,6 +935,64 @@ tool does not.
 
 See [`apps/desktop/README.md`](apps/desktop/README.md) for the desktop-specific
 behaviour, including the human-versus-agent terminal boundary.
+
+## Coding-agent evaluations
+
+`evals/tasks.json` defines ten isolated coding tasks: a small bug, a feature,
+failing-test repair, cross-file refactor, API update, code-path investigation,
+validation, type annotation repair, an ambiguous request, and a dirty Git tree.
+Each task is materialized as a temporary repository, independently checked
+before and after the agent run, and deleted when the run finishes.
+
+Run the deterministic harness lane (fixed tool traces through the real CLI and
+runtime):
+
+```bash
+python evals/run.py --provider mock --output evals/reports/harness-baseline.json
+```
+
+Run the same tasks against one configured provider/model. Credentials come from
+the normal environment or OS credential store; set explicit per-million token
+rates only when you want a cost estimate:
+
+```bash
+python evals/run.py --provider openai --model "<openai-model-id>" --output evals/reports/openai.json
+python evals/run.py --provider anthropic --model "<anthropic-model-id>" --output evals/reports/anthropic.json
+python evals/run.py --provider gemini --model "<gemini-model-id>" --output evals/reports/gemini.json
+python evals/run.py --provider opencode-zen --model opencode-zen/<model-id> --output evals/reports/zen.json
+python evals/run.py --provider opencode-go --model opencode-go/<model-id> --output evals/reports/go.json
+```
+
+The runner builds the CLI and runtime if needed, then stops only the runtime it
+started for each disposable fixture. Use `--harness PATH` with a prebuilt CLI or
+`--keep-workspaces` to inspect fixture results. Reports contain per-task
+completion, checks, regressions, turns, tool calls, reported or estimated
+tokens, priced cost when explicit rates are supplied, duration, approval
+requests, files read/changed, compactions, and repeated failures. The mock lane
+reports context estimates rather than invented provider tokens. Live provider
+costs and model quality are never mixed into the harness-lane score.
+
+Compare like-for-like baseline and candidate reports; the comparison fails if
+there is no meaningful improvement or if a configured regression is exceeded:
+
+```bash
+python evals/compare.py evals/reports/baseline.json evals/reports/candidate.json
+python -m unittest discover -s evals/tests -v
+```
+
+The suite is a v1 baseline, not a broad public leaderboard. Live evaluations
+require local credentials and may incur provider charges. See
+[`docs/evaluation-policy.md`](docs/evaluation-policy.md) for the reliability
+gate and the feature categories deferred until the single-agent loop is proven
+reliable.
+
+The current deterministic harness baseline is recorded in
+[`evals/reports/harness-baseline.md`](evals/reports/harness-baseline.md). It
+covers the mock harness lane only; a passing mock result does not establish
+real-model quality. The report includes the source commit and a fingerprint of
+the evaluated working tree so runs made with uncommitted changes remain
+identifiable. No credentialed provider/model lanes were run for this baseline;
+they are opt-in because they can incur provider charges.
 
 ## Running tests
 
@@ -941,6 +1074,7 @@ engine:
 ```toml
 [policy]
 mode = "normal"
+network_access = "ask" # also gates WebSearch/WebFetch; ask, allow, or deny
 
 [[policy.rules]]
 name = "deny-credentials"
@@ -960,8 +1094,11 @@ operations = ["read", "search"]
 ```
 
 A rule accepts `name`, `action` (`allow`, `ask`, or `deny`), `priority`, and the
-optional matchers `tools`, `operations`, `modes`, `paths`, and
-`command_patterns`. Paths are globs relative to the repository root.
+optional matchers `tools`, `operations`, `modes`, `paths`, `command_patterns`,
+and `risks`. Risk names include `READ`, `PROJECT_WRITE`, `PROCESS`,
+`PACKAGE_INSTALL`, `NETWORK`, `GIT_MUTATION`, `DESTRUCTIVE`,
+`OUTSIDE_WORKSPACE`, and `SECRET_ACCESS`. Paths are globs relative to the
+repository root.
 
 `.agent/policy.toml` uses the same schema and is what the desktop Permissions
 screen reads to list your configured rules. See
@@ -977,19 +1114,84 @@ being silently ignored.
 
 ### Policy rule enforcement
 
-This differs between the two clients in v0, and it is worth being explicit:
+Both CLI and desktop agent runs use the shared Rust policy engine. The runtime
+loads `[policy]` from `.agent/config.toml`; the selected execution mode is
+authoritative for the active run. `.agent/policy.toml` is still shown by the
+desktop Permissions screen for compatibility, but it is not an enforcement
+source in v0. Do not put rules there and assume the runtime applies them.
 
-- The **CLI** loads both the mode and the rules from `.agent/config.toml` and
-  enforces them. If that file is absent it runs in `normal` mode with no rules.
-- The **desktop** enforces the execution mode, which is runtime state you can
-  change in the Permissions screen without editing a file. The development
-  runtime constructs its policy engine from the mode alone, so the rules in
-  `.agent/policy.toml` are listed in the Permissions screen but are not loaded
-  into the engine that authorises tool calls.
+## Security and execution policy
 
-The two built-in protections described under [Permissions](#permissions) — the
-workspace boundary and credential-path denial — are enforced by the engine
-itself and therefore apply in both clients regardless of configuration.
+Every tool action is evaluated by deterministic runtime policy before it runs.
+The model cannot grant itself permission. A request classified as `ASK` pauses
+the active run and sends the exact tool and arguments, risk labels, and policy
+reason to the CLI or desktop. Approving resumes that same run; denying leaves
+the operation unexecuted. Sensitive package installs, Git mutations,
+destructive commands, and secret access still require approval even when a broad
+`allow` rule matches. Explicit `deny` rules and built-in protections take
+precedence. `read-only` is a hard ceiling: it denies every process or mutation,
+even when an `allow` rule matches.
+
+File tools are restricted to the canonical workspace root, including symlink
+checks. Writes use atomic replacement and compare the source snapshot so a
+concurrent edit is reported as a conflict. Credential paths are denied in every
+mode. Protected paths include `.env` files, SSH/AWS/Azure/GnuPG/Kubernetes and
+Docker credential locations, OpenCode and Git credential stores, common shell
+profiles, private-key formats, and related credential files.
+
+The local process backend runs commands on the host. It checks that the working
+directory is inside the workspace, uses a bounded/cancellable process runner,
+and inherits only an allowlist of system and toolchain environment variables;
+variables named like keys, tokens, credentials, passwords, authorization, or
+secrets are filtered. Direct environment lookup uses that same safe allowlist.
+The `network_access` setting defaults to `ask`; `deny` refuses recognized
+network commands and WebSearch/WebFetch, while `allow` permits those actions
+when the execution mode permits them. Local mode is not an operating-system network
+firewall or a complete shell sandbox: command classification is conservative
+and deterministic, but it cannot reliably detect paths or network access built
+dynamically through shell variables or arbitrary scripts. Use approval prompts
+for commands whose effects are unclear. A container-backed execution
+environment is not included in v1; the common environment interface leaves
+room for one.
+
+Long-running work uses runtime-owned process handles. The agent can call
+`run_command`, `start_background_command`, `wait_for_process_output`,
+`read_process_output`, `list_processes`, and `stop_process`. Log reads use cursors
+and return bounded chunks; each process retains at most 256 KB of logs, and the
+runtime allows at most 16 active background processes. A readiness wait can watch
+for a command-specific output marker. Process start/stop calls pass through the
+same policy and approval flow as foreground commands. Cancelling the originating
+task or shutting down the runtime terminates the process tree. Desktop activity
+and the CLI status line show active handles compactly.
+
+The same setting gates `web_search` and `web_fetch`: `deny` disables them,
+`ask` requires approval before any request, and `allow` permits them subject to
+the selected execution mode and explicit policy rules. Search results and fetched
+page text are returned as JSON-quoted `UNTRUSTED EXTERNAL DATA`. The fetcher
+allows public HTTPS text pages only, blocks local/private addresses and
+credential-bearing URLs, follows a small bounded number of redirects, and caps
+response size. Search results should be checked against official project
+documentation when possible.
+
+To attach files in a one-shot CLI task, use for example:
+
+```powershell
+harness run "Explain this error screenshot" --attach .\error.png --attach .\notes.txt
+```
+
+The desktop composer supports the same image and text types through its paperclip
+button or by dropping files onto the composer. At most eight files can be added;
+images are limited to 10 MiB each and text to 512 KiB each, with combined limits
+of 16 MiB raw image data and 2 MiB text. Credential and shell-profile names are
+rejected. PDF extraction is not included yet; export the relevant pages as
+images or text. Attachment contents are sent only with the task request and are
+not written to session events or frontend persistence. Web results and file
+attachments are untrusted reference data: instructions found in them cannot
+change runtime policy, system instructions, or approval requirements.
+
+Mutating RPC calls carry request IDs and idempotency keys. Clients do not
+automatically replay an uncertain mutation after reconnecting, because the
+server may already have completed it.
 
 ## Session storage
 
@@ -1013,39 +1215,10 @@ previously completed or failed.
 
 ## Permissions
 
-Every privileged operation resolves to one of three decisions:
-
-- **allow** — run it without asking.
-- **ask** — stream an approval request and wait for an explicit allow-once or
-  deny-once answer.
-- **deny** — refuse it and tell the model why.
-
-The execution mode sets the default, and configured rules override it. An explicit
-`deny` rule always wins; otherwise the highest-priority matching rule wins, and
-mode defaults apply when no rule matches.
-
-| Mode | Reads and searches | Writes and patches | Commands |
-| --- | --- | --- | --- |
-| `read-only` | allow | deny | deny |
-| `safe` | allow | ask | ask |
-| `normal` | allow | allow | allow for known-safe commands, otherwise ask |
-| `auto` | allow | allow | allow for known-safe commands, otherwise ask, with explicit denies preserved |
-
-Two built-in protections apply in every mode, including `auto`, and are not
-overridable by a rule that merely asks:
-
-- The workspace is a hard boundary. Paths resolving outside it are denied.
-- Credential-bearing paths are denied outright rather than gated on approval, so
-  a mistaken "allow" cannot expose them. The protected set is `.env`, `.env.*`,
-  anything under `.ssh/`, `id_rsa`, `id_ed25519`, `id_ecdsa`, and files ending in
-  `.pem`, `.key`, `.p12`, or `.pfx`.
-
-The shell tool cannot be path-checked the way file tools are, because a command is
-an arbitrary string. `cat .env` is therefore evaluated as a command and prompts,
-rather than being denied by path. Approval is the mitigation.
-
-The engine's configured mode is authoritative. A request cannot widen the
-permission level you selected.
+Execution modes (`read-only`, `safe`, `normal`, and `auto`) set defaults for the
+same `allow`, `ask`, and `deny` policy decisions. They are separate from task
+modes (`EXPLORE`, `PLAN`, `CODE`). See [Security and execution policy](#security-and-execution-policy)
+for the approval flow, protected paths, command limitations, and network setting.
 
 ## Checkpoints and undo
 
@@ -1103,14 +1276,17 @@ should be read as promising them:
   service. Planning, repair, and completion checks happen inside the single
   provider-neutral agent loop, with runtime safeguards around repeated calls,
   failures, and resource limits.
-- **No subagents.** There is no multi-agent orchestration, delegation, or
-  parallelism. `harness-agent` runs exactly one agent per task.
-- **No MCP.** There is no Model Context Protocol client or server, and no external
-  tool server integration. Tools are compiled-in Rust implementations.
-- **No plugin system.** There is no runtime tool or provider discovery, and no
-  third-party extension loading. Providers and tools are registered in Rust at
-  build time. The `@tauri-apps/plugin-dialog` dependency is Tauri's own native
-  file dialog, not a CogitoAI extension point.
+- **Constrained subagents only.** A parent run may delegate up to three parallel,
+  read-only Explore, Review, Test, or Documentation investigations. Children
+  have isolated context and bounded turns, tools, runtime, and tokens. They
+  cannot edit files, run commands, access the network, or delegate again; all
+  implementation and final decisions stay with the parent agent. There is no
+  generalized swarm or concurrent source modification.
+- **No integration marketplace.** Configured MCP tools use the standard client
+  protocol, but there is no generalized plugin marketplace or arbitrary
+  third-party code loading. Built-in tools and model providers are still
+  registered in Rust. The `@tauri-apps/plugin-dialog` dependency is Tauri's own
+  native file dialog, not a CogitoAI extension point.
 - **No remote execution.** The runtime runs as a local process on the machine.
   There is no container sandbox, no SSH or remote host execution, and no
   distributed scheduling.

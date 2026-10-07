@@ -54,6 +54,25 @@ pub enum ContentBlock {
     Reasoning { text: String },
 }
 
+/// User-selected, provider-neutral task input. Image bytes stay in memory and
+/// are converted to canonical content blocks immediately before a model call;
+/// text files are carried as untrusted quoted text. Attachment payloads are
+/// not written to session events.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputAttachment {
+    Image {
+        file_name: String,
+        media_type: String,
+        data: String,
+    },
+    Text {
+        file_name: String,
+        media_type: String,
+        text: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,

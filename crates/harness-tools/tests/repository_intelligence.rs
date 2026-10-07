@@ -16,6 +16,7 @@ fn execute(
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,
@@ -151,6 +152,7 @@ fn repository_queries_obey_read_search_policy_and_workspace_boundaries() {
     let context = ToolContext {
         policy: &DenyAllPolicy,
         working_directory: &root,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,

@@ -1,13 +1,13 @@
 import { useState } from "react";
 import { Bot } from "lucide-react";
 import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
-import type { TaskMode } from "../lib/rpc";
+import type { InputAttachment, TaskMode } from "../lib/rpc";
 import { ComposerNotice, PromptComposer } from "./prompt-composer";
 
 export interface LandingViewProps {
   value: string;
   onChange: (value: string) => void;
-  onSubmit: (text: string) => void;
+  onSubmit: (text: string, attachments?: InputAttachment[]) => void | Promise<void>;
   disabled: boolean;
   running: boolean;
   onCancel: () => void;
@@ -29,6 +29,8 @@ export interface LandingViewProps {
   pendingMode: string | null;
   /** Shown as a dismissible banner above the composer. */
   runtimeError: string | null;
+  attachments?: InputAttachment[];
+  onAttachmentsChange?: (attachments: InputAttachment[]) => void;
 }
 
 /**
@@ -62,6 +64,8 @@ export function LandingView({
   onSelectTaskMode,
   pendingMode,
   runtimeError,
+  attachments,
+  onAttachmentsChange,
 }: LandingViewProps) {
   // A notice is a nudge, not a blocker, so it can be dismissed for the session.
   const [noticeDismissed, setNoticeDismissed] = useState(false);
@@ -121,6 +125,8 @@ export function LandingView({
             size="landing"
             notice={notice}
             connected={connected}
+            attachments={attachments}
+            onAttachmentsChange={onAttachmentsChange}
           />
         </div>
       </div>

@@ -1,4 +1,4 @@
-import type { HarnessEvent } from "./rpc";
+import type { ApprovalRequest, HarnessEvent } from "./rpc";
 
 /**
  * The conversation/activity workspace is derived from the runtime event log and
@@ -66,6 +66,7 @@ export interface ToolBlock {
   /** Populated while the call is waiting on a human decision. */
   approvalId: string | null;
   approvalReason: string | null;
+  approvalRisks: string[];
 }
 
 export interface VerificationBlock {
@@ -88,6 +89,8 @@ export interface ApprovalBlock {
   tool: string;
   arguments: Record<string, unknown>;
   timestamp: number;
+  reason: string;
+  risks: string[];
 }
 
 export interface ErrorBlock {
@@ -119,7 +122,14 @@ export type ActivityBlock =
   | NoticeBlock;
 
 /** Arguments worth showing when a tool row is expanded. */
-const ARGUMENT_HIDDEN = new Set(["content", "old_text", "new_text", "patch"]);
+const ARGUMENT_HIDDEN = new Set([
+  "content",
+  "old_text",
+  "new_text",
+  "patch",
+  "tasks",
+  "selected_context",
+]);
 
 /** Maximum characters of a tool's output kept for the expanded row. */
 const OUTPUT_LIMIT = 8000;
@@ -195,7 +205,37 @@ export function describeTool(tool: string, args: Record<string, unknown>): strin
     case "grep":
       return pattern ? `Searching ${pattern}` : "Searching";
     case "shell":
+    case "run_command":
       return command ? `Running ${commandLabel(command)}` : "Running a command";
+    case "start_background_command":
+      return command ? `Starting ${commandLabel(command)}` : "Starting a background command";
+    case "read_process_output":
+      return "Reading process logs";
+    case "list_processes":
+      return "Inspecting processes";
+    case "stop_process":
+      return "Stopping a process";
+    case "wait_for_process_output":
+      return "Waiting for process readiness";
+    case "delegate_subagents": {
+      let tasks = Array.isArray(args.tasks) ? args.tasks.length : 1;
+      if (typeof args.tasks === "string") {
+        try {
+          const parsed: unknown = JSON.parse(args.tasks);
+          if (parsed && typeof parsed === "object" && "length" in parsed) {
+            const value = (parsed as { length?: unknown }).length;
+            if (typeof value === "number") tasks = value;
+          } else if (parsed && typeof parsed === "object" && "tasks" in parsed) {
+            const value = (parsed as { tasks?: unknown }).tasks;
+            if (Array.isArray(value)) tasks = value.length;
+          }
+        } catch {
+          // Event payloads from older runtime builds may contain a truncated
+          // argument string; keep the compact single-agent fallback.
+        }
+      }
+      return `Delegating to ${tasks} read-only agent${tasks === 1 ? "" : "s"}`;
+    }
     default:
       return detail ? `${tool} ${detail}` : tool;
   }
@@ -387,6 +427,7 @@ export function buildActivityStream(events: HarnessEvent[], options: BuildOption
           path: toolPath(tool, args),
           approvalId: null,
           approvalReason: null,
+          approvalRisks: [],
         };
         blocks.push(block);
         const queue = openTools.get(tool) ?? [];
@@ -529,6 +570,35 @@ export function buildActivityStream(events: HarnessEvent[], options: BuildOption
         break;
       }
 
+      case "background_process.started": {
+        const processId = stringField(event, "process_id");
+        if (!processId) break;
+        blocks.push({
+          kind: "notice",
+          id: event.event_id,
+          label: "Background process running",
+          detail: `${processId} · ${stringField(event, "command")} · PID ${numberField(event, "pid") ?? "?"}`,
+          timestamp: event.timestamp,
+          tone: "running",
+          reference: processId,
+        });
+        break;
+      }
+
+      case "background_process.status": {
+        const processId = stringField(event, "process_id");
+        const status = stringField(event, "status");
+        const processNotice = [...blocks].reverse().find(
+          (block): block is NoticeBlock => block.kind === "notice" && block.reference === processId,
+        );
+        if (!processNotice) break;
+        processNotice.label = `Background process ${status}`;
+        processNotice.detail = `${processNotice.detail} · ${status}${event.payload.data.exit_code === null || event.payload.data.exit_code === undefined ? "" : ` (${numberField(event, "exit_code")})`}`;
+        processNotice.timestamp = event.timestamp;
+        processNotice.tone = status === "failed" ? "failure" : status === "exited" ? "success" : status === "running" ? "running" : "neutral";
+        break;
+      }
+
       case "session.resumed": {
         closeAssistant();
         blocks.push({
@@ -637,7 +707,7 @@ export function buildActivityStream(events: HarnessEvent[], options: BuildOption
  */
 function linkApprovals(
   blocks: ActivityBlock[],
-  approvals: { approval_id: string; tool: { name: string; arguments: Record<string, unknown> } }[],
+  approvals: ApprovalRequest[],
 ): void {
   for (const approval of approvals) {
     const name = approval.tool.name;
@@ -652,6 +722,8 @@ function linkApprovals(
       candidate.phase = "awaiting_approval";
       candidate.tone = "attention";
       candidate.approvalId = approval.approval_id;
+      candidate.approvalReason = approval.reason ?? null;
+      candidate.approvalRisks = approval.risk_categories ?? [];
       // The notification's arguments are the authoritative ones.
       if (Object.keys(approval.tool.arguments).length > 0) {
         candidate.arguments = approval.tool.arguments;
@@ -668,6 +740,8 @@ function linkApprovals(
       tool: name,
       arguments: approval.tool.arguments,
       timestamp: Date.now(),
+      reason: approval.reason ?? "",
+      risks: approval.risk_categories ?? [],
     });
   }
 }

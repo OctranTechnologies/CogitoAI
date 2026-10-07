@@ -50,7 +50,7 @@ use harness_session::{
     EventPayload, HarnessEvent, Session, SessionLoadReport, SessionState, SessionStore,
     SessionSummary,
 };
-use harness_tools::{ToolContext, ToolRegistry, ToolRequest, ToolResult};
+use harness_tools::{McpManager, ToolContext, ToolRegistry, ToolRequest, ToolResult};
 use harness_verification::{VerificationReport, VerificationRequest, Verifier};
 
 pub struct Runtime {
@@ -88,6 +88,9 @@ pub struct Runtime {
     /// Privileged environment/keychain access. Secret values are never passed
     /// to the frontend or session store.
     credential_store: Arc<dyn CredentialStore>,
+    /// MCP connections are owned by the RPC runtime; UI clients only receive
+    /// status and the agent reaches them through policy-checked tools.
+    mcp_manager: Arc<McpManager>,
 }
 
 /// Builds an [`AgentRunner`] for a selected model and execution mode.
@@ -135,6 +138,7 @@ impl Runtime {
             model: RwLock::new(model),
             model_registry,
             credential_store,
+            mcp_manager: Arc::new(McpManager::default()),
         }
     }
 
@@ -147,6 +151,15 @@ impl Runtime {
     pub fn with_instance_id(mut self, instance_id: String) -> Self {
         self.instance_id = instance_id;
         self
+    }
+
+    pub fn with_mcp_manager(mut self, manager: Arc<McpManager>) -> Self {
+        self.mcp_manager = manager;
+        self
+    }
+
+    pub fn mcp_manager(&self) -> Arc<McpManager> {
+        Arc::clone(&self.mcp_manager)
     }
 
     pub fn with_agent_runner(self, agent_runner: Arc<AgentRunner>) -> Self {
@@ -386,6 +399,7 @@ impl Runtime {
         let context = ToolContext {
             policy: policy.as_ref(),
             working_directory,
+            execution_environment: harness_tools::local_execution_environment(),
             cancellation: None,
             event_bus: None,
             session_id: None,

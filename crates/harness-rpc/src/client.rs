@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::protocol::{RpcRequest, RpcResponse, ServerMessage, RPC_PROTOCOL_VERSION};
 
-const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = 26 * 1024 * 1024;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, thiserror::Error)]

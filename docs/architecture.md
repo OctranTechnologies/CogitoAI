@@ -140,6 +140,20 @@ decides whether an otherwise permitted operation is allowed, needs approval, or
 is denied. This keeps PLAN plus Safe and CODE plus ReadOnly meaningful without
 duplicating the permission system.
 
+The optional `delegate_subagents` tool is registered at the runtime boundary and
+uses the same model provider and workspace policy. It accepts one to three
+independent Explore, Review, Test, or Documentation tasks. Each child gets a new
+session, repository instructions, bounded selected snippets, and a fresh model
+context; the parent's conversation is never copied. Child registries contain
+only reads, repository queries (including a bounded sensitive-path-filtered Git
+diff), instructions, and skill loading. They have no edit, process, network, or
+delegation tools, and each run is capped at eight turns, twenty tool calls, 90
+seconds, and 12,000 model tokens. The parent receives a structured report and
+decides whether to act. `subagent.*` events link the child session to the parent
+run, while the CLI and desktop render one compact delegation activity row. This
+is bounded parallel research, not a general orchestration system; source changes
+remain serial and parent-owned.
+
 PLAN ends with an `ImplementationPlan` snapshot containing the goal, relevant
 architecture, likely files, steps, validation, and risks. Continuing that session
 in CODE retains the original goal and plan in runtime-owned context, so the model
@@ -153,6 +167,73 @@ permission selector and shows compact persisted goal/milestone progress. The
 clients send the mode on a task request and display persisted session state; the
 runtime owns enforcement, plan state, and continuation. `/goal` and
 `/plan-status` read the active session or an explicitly supplied session ID.
+
+## MCP integrations
+
+`harness-mcp` owns MCP configuration, RMCP client transports, authentication,
+connection state, tool/resource discovery, cancellation, reconnect behavior,
+and bounded untrusted results. Its public surface uses harness-owned JSON
+descriptors; provider-native MCP types do not enter the model or agent crates.
+The initial transports are stdio child processes and Streamable HTTP. HTTP
+requires TLS except for loopback, and credentials are referenced by environment
+variable name and resolved only in the runtime.
+
+`harness-tools` adapts configured servers into four ordinary tools:
+`mcp_search_tools`, `mcp_call_tool`, `mcp_list_resources`, and
+`mcp_read_resource`. Only these small meta-tool schemas are always available;
+remote definitions are fetched on search and only matching definitions enter
+the model's working context. Every agent call is evaluated as `OperationKind::Mcp`
+with `NETWORK` risk before connection or invocation. ASK pauses the task for the
+normal approval broker, DENY is final, cancellation tears down an uncertain
+connection, and failed calls are not replayed. Tool requests/results therefore
+use the existing event log and policy path. Remote names, schemas, resources,
+and results are untrusted data and are size-limited.
+
+The CLI and desktop use `mcp.inspect` for passive cached status and explicit
+`mcp.refresh`/`mcp.resources` controls for connection or discovery. Those
+user-initiated controls evaluate the same MCP policy; ASK requires an explicit
+human action, and DENY cannot be overridden. Disconnect only closes the
+runtime-owned connection. The UI never opens transports or receives credentials.
+There is no proprietary integration plugin layer.
+
+## Execution environment and authorization
+
+`harness-tools::ExecutionEnvironment` is the boundary for workspace file access,
+process spawning, the safe subset of process environment variables, network
+policy metadata, cancellation, and optional workspace snapshots.
+`LocalExecutionEnvironment` is the v1 implementation and keeps commands on the
+host. The interface is ready for a container adapter, but no container backend
+is shipped. Filesystem tools use workspace-relative paths, canonicalize existing
+ancestors to reject symlink escapes, write atomically, and compare the contents
+they read before replacing or removing them. Process spawning rejects a working
+directory outside the workspace. The agent loop and `harness-policy` own
+authorization; an environment adapter cannot grant itself access.
+
+The policy engine produces deterministic `ALLOW`, `ASK`, or `DENY` decisions
+and attaches risk categories to policy events and approval requests. Sensitive
+actions still require a human decision when a broad allow rule matches. An
+approval is bound to the exact request and is consumed once; it is not available
+to lifecycle hooks that run before the approved tool. The RPC approval broker
+pauses the active run and resumes it after an explicit answer. Requests carry
+IDs/idempotency keys, and clients do not replay an uncertain mutation after a
+disconnect.
+
+The local backend filters secret-like variables from the child process
+environment and only exposes a small system/toolchain allowlist. Network policy
+is enforced against recognized command patterns; local execution cannot enforce
+OS-level egress isolation or reliably detect commands that construct paths or
+network requests dynamically. Treat approval prompts as the local safety
+boundary, not as a container-grade security sandbox.
+
+The RPC runtime shares one `ProcessManager` across model changes and task runs.
+Foreground commands remain bounded and synchronous; background commands return
+runtime-local handles with PID, command, workspace path, start time, and lifecycle
+status. A bounded ring retains at most 256 KB per process, with cursor reads for
+incremental stdout/stderr retrieval. The runtime caps active handles at 16 and
+each optional command lifetime at 24 hours. A readiness-marker wait is available
+for local development servers. Explicit stop, task cancellation, and graceful
+runtime shutdown terminate process trees; handles are not replayed or restored
+after a runtime restart.
 
 Agent safeguards can be tuned in the runtime environment with
 `COGITO_AGENT_MAX_TURNS`, `COGITO_AGENT_MAX_TOOL_CALLS`,
@@ -312,14 +393,14 @@ under the system temporary directory.
 | --- | --- | --- |
 | `harness-core` | Provider-neutral orchestration traits, shared errors, IDs, configuration, logging setup, workspace discovery | Provider APIs, filesystem or shell execution |
 | `harness-models` | Model-provider adapters and provider capabilities | Agent lifecycle, tool execution policy |
-| `harness-tools` | Tool contracts, tool requests/results, registry, filesystem/process tools, bounded repository index and queries | Authorization decisions, provider logic |
+| `harness-tools` | Tool contracts, registry, filesystem/process tools, bounded repository index, and read-only delegation tool contract | Authorization decisions, provider logic |
 | `harness-policy` | Permissions, decisions, and policy enforcement | Tool implementations, UI concerns |
 | `harness-session` | Sessions, events, and persistence | Git operations, provider adapters |
 | `harness-git` | Git/checkpoint contracts and shadow checkpoint storage | General session state |
 | `harness-context` | Context assembly from workspace, instructions, and Git state | Agent lifecycle, provider adapters |
 | `harness-verification` | Test, lint, and typecheck verification contracts | Agent orchestration |
 | `harness-pty` | Human terminal sessions over a native pseudo-terminal | Any `Tool` implementation, so the agent cannot reach it |
-| `harness-agent` | The agent loop, approvals, checkpoint recording, verification feedback | Transport, UI concerns |
+| `harness-agent` | The agent loop, bounded read-only child execution, approvals, checkpoint recording, verification feedback | Transport, UI concerns |
 | `harness-rpc` | Runtime composition, connector lifecycle, and client-facing RPC boundary | UI code or direct UI access to privileged implementations |
 | `harness-cli` | Command-line parsing, RPC client presentation, and focused read/config commands | The agent loop and direct shell execution for agent tasks |
 

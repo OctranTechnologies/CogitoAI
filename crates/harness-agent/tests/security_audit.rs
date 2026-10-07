@@ -15,6 +15,10 @@ use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::SessionStore;
 use harness_tools::{ProcessRunner, ToolContext, ToolRegistry, ToolRequest};
 
+fn workspace_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap()
+}
+
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(root)
@@ -35,7 +39,7 @@ fn git(root: &Path, args: &[&str]) {
 /// beside the workspace in the shared system temp directory would let one test
 /// delete another's decoy file.
 fn workspace() -> (tempfile::TempDir, PathBuf) {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = workspace_tempdir();
     let root = temporary.path().join("workspace");
     fs::create_dir_all(&root).unwrap();
     git(&root, &["init", "--quiet"]);
@@ -63,6 +67,7 @@ fn attempt(
     let context = ToolContext {
         policy: &policy,
         working_directory: root,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,
@@ -612,6 +617,8 @@ impl harness_agent::ApprovalHandler for AllowNothing {
 
 #[test]
 fn a_workspace_that_is_not_a_repository_is_still_usable_or_clearly_rejected() {
+    // This fixture must live outside the repository containing the tests so
+    // workspace discovery does not find that parent repository.
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     fs::write(root.join("notes.txt"), "hello\n").unwrap();
@@ -628,6 +635,55 @@ fn a_workspace_that_is_not_a_repository_is_still_usable_or_clearly_rejected() {
         git_client.is_err(),
         "expected Git to refuse a non-repository"
     );
+}
+
+#[test]
+fn dangerous_shell_requests_are_blocked_before_a_process_can_run() {
+    let (_temporary, root) = workspace();
+    let root = root.as_path();
+    let marker = root.join("should-not-exist.txt");
+    let commands = [
+        ("Remove-Item -Recurse -Force src", "DESTRUCTIVE"),
+        ("Get-Content .env", "SECRET_ACCESS"),
+        ("pnpm add untrusted-package", "PACKAGE_INSTALL"),
+        ("curl https://example.invalid/collect", "NETWORK"),
+        ("cmd /c echo escaped > should-not-exist.txt", "PROCESS"),
+        ("type ..\\audit-outside-secret.txt", "OUTSIDE_WORKSPACE"),
+    ];
+
+    for (command, expected_risk) in commands {
+        let result = attempt(
+            root,
+            ExecutionMode::Normal,
+            "shell",
+            serde_json::json!({"command": command}),
+        );
+        assert!(
+            result.is_err(),
+            "{expected_risk} command unexpectedly ran: {command}"
+        );
+        let request = harness_policy::PolicyRequest {
+            tool_name: "shell".to_owned(),
+            operation: harness_policy::OperationKind::Command,
+            workspace_root: root.to_path_buf(),
+            path: Some(root.to_path_buf()),
+            command: Some(command.to_owned()),
+            mode: ExecutionMode::Normal,
+        };
+        let risks = request
+            .risk_categories()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            risks.iter().any(|risk| risk == expected_risk),
+            "{command:?} was missing its {expected_risk} label: {risks:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a blocked shell action created its marker file"
+        );
+    }
 }
 
 #[test]

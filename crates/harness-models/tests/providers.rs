@@ -450,3 +450,33 @@ fn capability_validation_rejects_tools_for_text_only_model() {
         })
     ));
 }
+
+#[test]
+fn capability_validation_rejects_images_for_models_without_vision() {
+    let provider = DeterministicMockProvider::text_only("text-fixture", "hello");
+    let request = ModelRequest::new(
+        "text-fixture",
+        vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "inspect".to_owned(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_owned(),
+                    data: "iVBORw0KGgo=".to_owned(),
+                },
+            ],
+            name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            is_error: false,
+        }],
+    );
+    assert!(matches!(
+        provider.generate(&request, &mut |_| Ok(())),
+        Err(ProviderError::UnsupportedCapability {
+            capability: "image input"
+        })
+    ));
+}

@@ -7,7 +7,10 @@ use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine}
 use harness_session::{EventBus, EventType};
 use harness_tools::{ToolContext, ToolRegistry, ToolRequest};
 use serde_json::json;
-use tempfile::tempdir;
+
+fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap()
+}
 
 fn request(name: &str, arguments: serde_json::Value) -> ToolRequest {
     ToolRequest::new(name, arguments)
@@ -22,6 +25,7 @@ fn execute(
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace.as_ref(),
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,
@@ -32,7 +36,7 @@ fn execute(
 
 #[test]
 fn reads_writes_patches_lists_globs_and_greps() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     fs::create_dir_all(workspace.join("src")).unwrap();
     fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -109,7 +113,7 @@ fn reads_writes_patches_lists_globs_and_greps() {
 
 #[test]
 fn rejects_patch_conflicts_missing_files_and_path_traversal() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
     fs::write(workspace.join("file.txt"), "one\ntwo\n").unwrap();
@@ -165,7 +169,7 @@ fn rejects_patch_conflicts_missing_files_and_path_traversal() {
 
 #[test]
 fn rejects_binary_and_large_files() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     fs::write(workspace.join("binary.dat"), [0, 159, 146, 150]).unwrap();
     fs::write(workspace.join("large.txt"), vec![b'a'; 1_048_577]).unwrap();
@@ -195,7 +199,7 @@ fn records_tool_arguments_as_the_model_wrote_them() {
     // The event log is persisted and read back by every client, so a string
     // argument must be stored as the string itself. Serialising the JSON value
     // would store its encoding instead, and readers would show literal quotes.
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     fs::write(workspace.join("file.txt"), "content").unwrap();
     let registry = ToolRegistry::with_workspace_tools();
@@ -213,6 +217,7 @@ fn records_tool_arguments_as_the_model_wrote_them() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
@@ -238,7 +243,7 @@ fn records_tool_arguments_as_the_model_wrote_them() {
 fn records_non_string_tool_arguments_as_json() {
     // Numbers, booleans, and objects have no plain-string form, so they keep
     // their JSON representation rather than being flattened.
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     fs::write(workspace.join("file.txt"), "content").unwrap();
     let registry = ToolRegistry::with_workspace_tools();
@@ -256,6 +261,7 @@ fn records_non_string_tool_arguments_as_json() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
@@ -280,7 +286,7 @@ fn records_non_string_tool_arguments_as_json() {
 
 #[test]
 fn emits_tool_lifecycle_events_through_the_common_registry() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     fs::write(workspace.join("file.txt"), "content").unwrap();
     let registry = ToolRegistry::with_workspace_tools();
@@ -294,6 +300,7 @@ fn emits_tool_lifecycle_events_through_the_common_registry() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
@@ -322,7 +329,7 @@ fn emits_tool_lifecycle_events_through_the_common_registry() {
 
 #[test]
 fn emits_file_change_lifecycle_events() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let registry = ToolRegistry::with_workspace_tools();
     let bus = EventBus::new();
@@ -335,6 +342,7 @@ fn emits_file_change_lifecycle_events() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
@@ -363,6 +371,12 @@ fn emits_file_change_lifecycle_events() {
             "glob",
             "grep",
             "shell",
+            "run_command",
+            "start_background_command",
+            "read_process_output",
+            "list_processes",
+            "stop_process",
+            "wait_for_process_output",
             "search_files",
             "search_text",
             "find_symbol",
@@ -370,14 +384,19 @@ fn emits_file_change_lifecycle_events() {
             "goto_definition",
             "get_diagnostics",
             "get_file_outline",
-            "get_repo_tree"
+            "get_repo_tree",
+            "get_instructions",
+            "list_skills",
+            "load_skill",
+            "web_search",
+            "web_fetch"
         ]
     );
 }
 
 #[test]
 fn emits_denied_event_without_executing_a_tool() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let registry = ToolRegistry::with_workspace_tools();
     let bus = EventBus::new();
@@ -390,6 +409,7 @@ fn emits_denied_event_without_executing_a_tool() {
     let context = ToolContext {
         policy: &DenyAllPolicy,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
@@ -418,7 +438,7 @@ fn emits_denied_event_without_executing_a_tool() {
 
 #[test]
 fn safe_mode_asks_before_mutation_and_auto_mode_denies_secret_paths() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     fs::write(workspace.join(".env"), "SECRET=value").unwrap();
     let registry = ToolRegistry::with_workspace_tools();
@@ -433,6 +453,7 @@ fn safe_mode_asks_before_mutation_and_auto_mode_denies_secret_paths() {
     let context = ToolContext {
         policy: &safe,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
@@ -456,6 +477,7 @@ fn safe_mode_asks_before_mutation_and_auto_mode_denies_secret_paths() {
     let context = ToolContext {
         policy: &auto,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),
@@ -470,13 +492,14 @@ fn safe_mode_asks_before_mutation_and_auto_mode_denies_secret_paths() {
 
 #[test]
 fn every_mutable_tool_is_checked_by_policy() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     fs::write(workspace.join("file.txt"), "before").unwrap();
     let registry = ToolRegistry::with_workspace_tools();
     let context = ToolContext {
         policy: &DenyAllPolicy,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,
@@ -522,7 +545,7 @@ fn every_mutable_tool_is_checked_by_policy() {
 
 #[test]
 fn detects_a_stale_revision_even_when_the_patch_text_is_still_present() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let root = temporary.path();
     fs::write(root.join("source.txt"), "keep this line\nold value\n").unwrap();
     let registry = ToolRegistry::with_workspace_tools();
@@ -550,7 +573,7 @@ fn detects_a_stale_revision_even_when_the_patch_text_is_still_present() {
 
 #[test]
 fn sequential_edits_refresh_the_session_revision() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let root = temporary.path();
     fs::write(root.join("source.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
     let registry = ToolRegistry::with_workspace_tools();
@@ -579,7 +602,7 @@ fn sequential_edits_refresh_the_session_revision() {
 
 #[test]
 fn rejects_ambiguous_text_and_supports_crlf_and_unicode_edits() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let root = temporary.path();
     let registry = ToolRegistry::with_workspace_tools();
     fs::write(root.join("ambiguous.txt"), "same\nsame\n").unwrap();
@@ -614,7 +637,7 @@ fn rejects_ambiguous_text_and_supports_crlf_and_unicode_edits() {
 
 #[test]
 fn replaces_a_verified_line_range_and_preserves_utf8_bom_and_crlf() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let root = temporary.path();
     let registry = ToolRegistry::with_workspace_tools();
     fs::write(
@@ -651,7 +674,7 @@ fn replaces_a_verified_line_range_and_preserves_utf8_bom_and_crlf() {
 
 #[test]
 fn creates_empty_files_deletes_and_renames_with_structured_results() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let root = temporary.path();
     let registry = ToolRegistry::with_workspace_tools();
     let empty = execute(
@@ -700,7 +723,7 @@ fn creates_empty_files_deletes_and_renames_with_structured_results() {
 
 #[test]
 fn rejects_binary_mutation_and_keeps_large_edit_results_bounded() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let root = temporary.path();
     let registry = ToolRegistry::with_workspace_tools();
     fs::write(root.join("binary.bin"), [0, 1, 2, 3]).unwrap();
@@ -725,7 +748,7 @@ fn rejects_binary_mutation_and_keeps_large_edit_results_bounded() {
 
 #[test]
 fn large_files_can_be_read_and_edited_by_bounded_line_range() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let root = temporary.path();
     let registry = ToolRegistry::with_workspace_tools();
     let contents = (0..40_000)
@@ -756,7 +779,7 @@ fn large_files_can_be_read_and_edited_by_bounded_line_range() {
 
 #[test]
 fn file_mutation_tools_reject_workspace_traversal() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
     fs::write(temporary.path().join("outside.txt"), "outside").unwrap();
@@ -791,7 +814,7 @@ fn file_mutation_tools_reject_workspace_traversal() {
 
 #[test]
 fn rename_checks_policy_for_both_source_and_destination() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let root = temporary.path();
     fs::write(root.join("source.txt"), "safe\n").unwrap();
     let registry = ToolRegistry::with_workspace_tools();
@@ -799,6 +822,7 @@ fn rename_checks_policy_for_both_source_and_destination() {
     let context = ToolContext {
         policy: &policy,
         working_directory: root,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,

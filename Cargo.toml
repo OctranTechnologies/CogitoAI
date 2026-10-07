@@ -17,6 +17,7 @@ harness-context = { path = "crates/harness-context" }
 harness-agent = { path = "crates/harness-agent" }
 harness-models = { path = "crates/harness-models" }
 harness-tools = { path = "crates/harness-tools" }
+harness-mcp = { path = "crates/harness-mcp" }
 harness-policy = { path = "crates/harness-policy" }
 harness-session = { path = "crates/harness-session" }
 harness-git = { path = "crates/harness-git" }
@@ -26,6 +27,7 @@ harness-rpc = { path = "crates/harness-rpc" }
 harness-cli = { path = "crates/harness-cli" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
 globset = "0.4"
 regex = "1.11"
 thiserror = "2.0"
@@ -38,6 +40,8 @@ ureq = { version = "2.12", features = ["json"] }
 ratatui = "0.28.1"
 crossterm = "0.28.1"
 zeroize = "1.8"
+rmcp = { version = "3.5.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "process", "macros", "sync", "net"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

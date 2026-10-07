@@ -1,7 +1,8 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { FolderGit2, LoaderCircle, Send, Square, X } from "lucide-react";
+import { FolderGit2, LoaderCircle, Paperclip, Send, Square, X } from "lucide-react";
 import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
-import type { TaskMode } from "../lib/rpc";
+import type { InputAttachment, TaskMode } from "../lib/rpc";
+import { readInputAttachments, validateAttachmentCollection } from "../lib/attachments";
 import { Button, IconButton, Tooltip, cx } from "./ui";
 import { ComposerShell } from "./composer-parts";
 import { useAutoGrow } from "../lib/composer";
@@ -11,7 +12,7 @@ import { desktopShortcutLabel, matchesDesktopShortcut } from "../lib/keyboard";
 export interface PromptComposerProps {
   value: string;
   onChange: (value: string) => void;
-  onSubmit: (text: string) => void;
+  onSubmit: (text: string, attachments?: InputAttachment[]) => void | Promise<void>;
   disabled: boolean;
   running: boolean;
   onCancel: () => void;
@@ -35,6 +36,8 @@ export interface PromptComposerProps {
   /** Rendered between the workspace row and the textarea. */
   notice?: ReactNode;
   connected: boolean;
+  attachments?: InputAttachment[];
+  onAttachmentsChange?: (attachments: InputAttachment[]) => void;
 }
 
 const LANDING_PLACEHOLDER = "Do anything in this workspace";
@@ -72,15 +75,32 @@ export function PromptComposer({
   size = "compact",
   notice,
   connected,
+  attachments = [],
+  onAttachmentsChange,
 }: PromptComposerProps) {
   const textareaRef = useAutoGrow(value, size === "landing" ? 220 : 160, 24);
   const [focused, setFocused] = useState(false);
-  const canSubmit = !disabled && !running && value.trim().length > 0;
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [draggingFiles, setDraggingFiles] = useState(false);
+  const canSubmit = !disabled && !running && (value.trim().length > 0 || attachments.length > 0);
+
+  async function addFiles(files: File[]) {
+    if (files.length === 0) return;
+    try {
+      const added = await readInputAttachments(files);
+      const combined = [...attachments, ...added];
+      validateAttachmentCollection(combined);
+      onAttachmentsChange?.(combined);
+      setAttachmentError(null);
+    } catch (error) {
+      setAttachmentError(error instanceof Error ? error.message : "Could not read the selected files.");
+    }
+  }
 
   function submit(event?: FormEvent) {
     event?.preventDefault();
     if (!canSubmit) return;
-    onSubmit(value.trim());
+    void onSubmit(value.trim(), attachments);
   }
 
   function onKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -103,8 +123,30 @@ export function PromptComposer({
         : COMPACT_PLACEHOLDER;
 
   return (
-    <form onSubmit={submit} className="w-full">
+    <form
+      onSubmit={submit}
+      className="relative w-full"
+      onDragOver={(event) => {
+        if (!event.dataTransfer.types.includes("Files")) return;
+        event.preventDefault();
+        if (!disabled && !running) setDraggingFiles(true);
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDraggingFiles(false);
+      }}
+      onDrop={(event) => {
+        if (!event.dataTransfer.files.length) return;
+        event.preventDefault();
+        setDraggingFiles(false);
+        if (!disabled && !running) void addFiles(Array.from(event.dataTransfer.files));
+      }}
+    >
       {notice}
+      {draggingFiles ? (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl border border-accent/60 bg-app/90 text-sm text-primary">
+          Drop screenshots or text files to attach
+        </div>
+      ) : null}
       <ComposerShell size={size}>
         {size === "landing" ? (
           <div className="mb-2 flex items-center gap-2 border-b border-line pb-2">
@@ -120,6 +162,29 @@ export function PromptComposer({
             >
               Change
             </Button>
+          </div>
+        ) : null}
+
+        {attachments.length ? (
+          <div className="mb-2 flex flex-wrap gap-1.5" aria-label="Attached files">
+            {attachments.map((attachment, index) => (
+              <span
+                key={`${attachment.file_name}-${index}`}
+                className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-line bg-panel px-2 py-1 text-2xs text-secondary"
+                title={attachment.file_name}
+              >
+                <Paperclip className="size-icon-xs shrink-0 text-faint" />
+                <span className="max-w-48 truncate">{attachment.file_name}</span>
+                <button
+                  type="button"
+                  aria-label={`Remove ${attachment.file_name}`}
+                  className="rounded text-faint hover:text-primary"
+                  onClick={() => onAttachmentsChange?.(attachments.filter((_, itemIndex) => itemIndex !== index))}
+                >
+                  <X className="size-3" />
+                </button>
+              </span>
+            ))}
           </div>
         ) : null}
 
@@ -142,7 +207,7 @@ export function PromptComposer({
         />
 
         <div className="mt-2 flex flex-wrap items-center gap-2">
-          <AttachButton />
+          <AttachButton disabled={disabled || running} onFilesSelected={(files) => void addFiles(files)} />
           <ModeSelector
             permissions={permissions}
             onSelect={onSelectMode}
@@ -207,6 +272,7 @@ export function PromptComposer({
             </Tooltip>
           </div>
         </div>
+        {attachmentError ? <p role="alert" className="mt-2 text-xs text-error">{attachmentError}</p> : null}
       </ComposerShell>
       {size === "landing" ? (
         <p className="mt-2 text-center text-2xs text-faint">

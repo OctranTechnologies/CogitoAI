@@ -1,0 +1,212 @@
+{
+  "suite_id": "coding-agent-core-v1",
+  "version": 1,
+  "default_test_command": ["python", "-m", "unittest", "discover", "-s", "tests", "-v"],
+  "tasks": [
+    {
+      "id": "small-bug-tax-calculation",
+      "category": "small_bug",
+      "baseline_tests_expected_pass": false,
+      "prompt": "Fix the tax calculation: 100 at a 10% rate should total 110. Keep the public function name and run the tests.",
+      "expected_status": "done",
+      "final_contains": ["tax", "test"],
+      "files": {
+        "src/calc.py": "def total_with_tax(amount: float, rate: float) -> float:\n    return amount * rate\n",
+        "tests/test_calc.py": "import unittest\nfrom src.calc import total_with_tax\n\nclass TaxTests(unittest.TestCase):\n    def test_adds_tax_to_amount(self):\n        self.assertAlmostEqual(total_with_tax(100, 0.10), 110)\n\nif __name__ == '__main__':\n    unittest.main()\n",
+        "src/__init__.py": ""
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/calc.py"}},
+        {"tool": "read_file", "arguments": {"path": "tests/test_calc.py"}},
+        {"tool": "apply_patch", "arguments": {"path": "src/calc.py", "old_text": "return amount * rate", "new_text": "return amount * (1 + rate)"}},
+        {"tool": "shell", "arguments": {"command": "python -m unittest discover -s tests -v"}},
+        {"text": "Fixed the tax calculation and verified it with the test suite."}
+      ]
+    },
+    {
+      "id": "feature-slugify",
+      "category": "feature",
+      "baseline_tests_expected_pass": false,
+      "prompt": "Implement slugify(text) so it lowercases text, converts runs of non-alphanumeric characters to one hyphen, and trims edge hyphens. Add the implementation and run tests.",
+      "expected_status": "done",
+      "final_contains": ["slug", "test"],
+      "files": {
+        "src/slug.py": "\"\"\"Text slug helpers.\"\"\"\n",
+        "src/__init__.py": "",
+        "tests/test_slug.py": "import unittest\nfrom src.slug import slugify\n\nclass SlugTests(unittest.TestCase):\n    def test_normalizes_words_and_punctuation(self):\n        self.assertEqual(slugify('Hello, World!'), 'hello-world')\n\n    def test_trims_edge_separators(self):\n        self.assertEqual(slugify('  A / B  '), 'a-b')\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "tests/test_slug.py"}},
+        {"tool": "write_file", "arguments": {"path": "src/slug.py", "content": "\"\"\"Text slug helpers.\"\"\"\nimport re\n\ndef slugify(text: str) -> str:\n    words = re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')\n    return words\n"}},
+        {"tool": "shell", "arguments": {"command": "python -m unittest discover -s tests -v"}},
+        {"text": "Implemented slugify and verified punctuation and separator handling with tests."}
+      ]
+    },
+    {
+      "id": "repair-failing-discount-test",
+      "category": "failing_test_repair",
+      "baseline_tests_expected_pass": false,
+      "prompt": "The discount test is failing. Fix apply_discount so a 10% discount on 100 returns 90, then run the tests.",
+      "expected_status": "done",
+      "final_contains": ["discount", "test"],
+      "files": {
+        "src/discount.py": "def apply_discount(price: float, rate: float) -> float:\n    return price - rate\n",
+        "src/__init__.py": "",
+        "tests/test_discount.py": "import unittest\nfrom src.discount import apply_discount\n\nclass DiscountTests(unittest.TestCase):\n    def test_applies_rate_to_price(self):\n        self.assertEqual(apply_discount(100, 0.10), 90)\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/discount.py"}},
+        {"tool": "read_file", "arguments": {"path": "tests/test_discount.py"}},
+        {"tool": "apply_patch", "arguments": {"path": "src/discount.py", "old_text": "return price - rate", "new_text": "return price * (1 - rate)"}},
+        {"tool": "shell", "arguments": {"command": "python -m unittest discover -s tests -v"}},
+        {"text": "Repaired apply_discount and verified the failing test now passes."}
+      ]
+    },
+    {
+      "id": "refactor-shared-total-across-files",
+      "category": "cross_file_refactor",
+      "baseline_tests_expected_pass": true,
+      "prompt": "Remove the duplicated sum calculation from report.py by using the existing total() helper in math_ops.py. Preserve the report output and run tests.",
+      "expected_status": "done",
+      "final_contains": ["report", "test"],
+      "files": {
+        "src/math_ops.py": "def total(values):\n    return sum(values) + 0\n",
+        "src/report.py": "def total_label(values):\n    return f'Total: {sum(values)}'\n",
+        "src/__init__.py": "",
+        "tests/test_report.py": "import unittest\nfrom src.report import total_label\n\nclass ReportTests(unittest.TestCase):\n    def test_report_total(self):\n        self.assertEqual(total_label([1, 2, 3]), 'Total: 6')\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/math_ops.py"}},
+        {"tool": "read_file", "arguments": {"path": "src/report.py"}},
+        {"tool": "apply_patch", "arguments": {"path": "src/math_ops.py", "old_text": "return sum(values) + 0", "new_text": "return sum(values)"}},
+        {"tool": "apply_patch", "arguments": {"path": "src/report.py", "old_text": "def total_label(values):\n    return f'Total: {sum(values)}'", "new_text": "from .math_ops import total\n\ndef total_label(values):\n    return f'Total: {total(values)}'"}},
+        {"tool": "shell", "arguments": {"command": "python -m unittest discover -s tests -v"}},
+        {"text": "Removed duplicate total logic by routing report.py through math_ops.total; tests pass."}
+      ]
+    },
+    {
+      "id": "update-greeting-api",
+      "category": "api_update",
+      "baseline_tests_expected_pass": false,
+      "prompt": "Extend greet(name) with a backward-compatible keyword-only formal option. Normal mode should keep returning 'Hello NAME'; formal mode should return 'Good day, NAME.'. Add tests and run them.",
+      "expected_status": "done",
+      "final_contains": ["greet", "test"],
+      "files": {
+        "src/greeting.py": "def greet(name: str) -> str:\n    return f'Hello {name}'\n",
+        "src/__init__.py": "",
+        "tests/test_greeting.py": "import unittest\nfrom src.greeting import greet\n\nclass GreetingTests(unittest.TestCase):\n    def test_default_stays_compatible(self):\n        self.assertEqual(greet('Ada'), 'Hello Ada')\n\n    def test_formal_greeting(self):\n        self.assertEqual(greet('Ada', formal=True), 'Good day, Ada.')\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/greeting.py"}},
+        {"tool": "read_file", "arguments": {"path": "tests/test_greeting.py"}},
+        {"tool": "apply_patch", "arguments": {"path": "src/greeting.py", "old_text": "def greet(name: str) -> str:\n    return f'Hello {name}'", "new_text": "def greet(name: str, *, formal: bool = False) -> str:\n    if formal:\n        return f'Good day, {name}.'\n    return f'Hello {name}'"}},
+        {"tool": "shell", "arguments": {"command": "python -m unittest discover -s tests -v"}},
+        {"text": "Added a backward-compatible formal option to greet; both API tests pass."}
+      ]
+    },
+    {
+      "id": "trace-request-routing",
+      "category": "unfamiliar_code_trace",
+      "baseline_tests_expected_pass": null,
+      "prompt": "Trace how a request moves through this small unfamiliar repository. Explain the call order from handle_request to the final transport and where headers are normalized. Do not edit files.",
+      "expected_status": "done",
+      "final_contains": ["handle_request", "normalize_headers", "route_request", "send_http"],
+      "no_file_changes": true,
+      "test_commands": [],
+      "files": {
+        "src/entry.py": "from .headers import normalize_headers\nfrom .router import route_request\n\ndef handle_request(request):\n    normalized = normalize_headers(request)\n    return route_request(normalized)\n",
+        "src/headers.py": "def normalize_headers(request):\n    result = dict(request)\n    result['headers'] = {key.lower(): value for key, value in request.get('headers', {}).items()}\n    return result\n",
+        "src/router.py": "from .transport import send_http\n\ndef route_request(request):\n    if request.get('path', '').startswith('/internal'):\n        return {'handler': 'internal'}\n    return send_http(request)\n",
+        "src/transport.py": "def send_http(request):\n    return {'transport': 'http', 'path': request.get('path')}\n",
+        "src/__init__.py": ""
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/entry.py"}},
+        {"tool": "read_file", "arguments": {"path": "src/headers.py"}},
+        {"tool": "read_file", "arguments": {"path": "src/router.py"}},
+        {"tool": "read_file", "arguments": {"path": "src/transport.py"}},
+        {"text": "handle_request first calls normalize_headers, then route_request. For ordinary paths route_request calls send_http; paths under /internal return through the internal handler instead."}
+      ]
+    },
+    {
+      "id": "add-port-validation",
+      "category": "validation",
+      "baseline_tests_expected_pass": false,
+      "prompt": "Add validation to parse_port: accept integer ports from 1 through 65535, reject malformed strings and out-of-range values with ValueError, and run tests.",
+      "expected_status": "done",
+      "final_contains": ["parse_port", "test"],
+      "files": {
+        "src/ports.py": "def parse_port(value):\n    return int(value)\n",
+        "src/__init__.py": "",
+        "tests/test_ports.py": "import unittest\nfrom src.ports import parse_port\n\nclass PortTests(unittest.TestCase):\n    def test_valid_bounds(self):\n        self.assertEqual(parse_port('1'), 1)\n        self.assertEqual(parse_port('65535'), 65535)\n\n    def test_rejects_invalid_values(self):\n        for value in ('0', '65536', 'abc'):\n            with self.subTest(value=value):\n                with self.assertRaises(ValueError):\n                    parse_port(value)\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/ports.py"}},
+        {"tool": "read_file", "arguments": {"path": "tests/test_ports.py"}},
+        {"tool": "apply_patch", "arguments": {"path": "src/ports.py", "old_text": "def parse_port(value):\n    return int(value)", "new_text": "def parse_port(value):\n    try:\n        port = int(value)\n    except (TypeError, ValueError) as error:\n        raise ValueError('port must be an integer') from error\n    if not 1 <= port <= 65535:\n        raise ValueError('port must be between 1 and 65535')\n    return port"}},
+        {"tool": "shell", "arguments": {"command": "python -m unittest discover -s tests -v"}},
+        {"text": "Added bounded integer validation for parse_port; validation tests pass for valid and invalid inputs."}
+      ]
+    },
+    {
+      "id": "fix-type-annotation",
+      "category": "type_error",
+      "baseline_tests_expected_pass": false,
+      "prompt": "Fix the incorrect return type annotation on subtotal so it matches its numeric result. Keep behavior unchanged and run tests.",
+      "expected_status": "done",
+      "final_contains": ["subtotal", "type", "test"],
+      "files": {
+        "src/price.py": "def subtotal(items: list[float]) -> str:\n    return sum(items)\n",
+        "src/__init__.py": "",
+        "tests/test_price.py": "import unittest\nfrom typing import get_type_hints\nfrom src.price import subtotal\n\nclass PriceTests(unittest.TestCase):\n    def test_numeric_result_and_annotation(self):\n        self.assertEqual(subtotal([1.25, 2.75]), 4.0)\n        self.assertIs(get_type_hints(subtotal)['return'], float)\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/price.py"}},
+        {"tool": "read_file", "arguments": {"path": "tests/test_price.py"}},
+        {"tool": "apply_patch", "arguments": {"path": "src/price.py", "old_text": "def subtotal(items: list[float]) -> str:", "new_text": "def subtotal(items: list[float]) -> float:"}},
+        {"tool": "shell", "arguments": {"command": "python -m unittest discover -s tests -v"}},
+        {"text": "Corrected subtotal's return type annotation without changing its numeric behavior; tests pass."}
+      ]
+    },
+    {
+      "id": "clarify-ambiguous-output-request",
+      "category": "ambiguous_requirement",
+      "baseline_tests_expected_pass": null,
+      "prompt": "Make the output better.",
+      "expected_status": "user_input_required",
+      "final_contains": ["which outcome"],
+      "no_file_changes": true,
+      "test_commands": [],
+      "files": {
+        "src/output.py": "def render(items):\n    return ', '.join(str(item) for item in items)\n",
+        "src/__init__.py": ""
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/output.py"}},
+        {"text": "[USER_INPUT_REQUIRED] Which outcome should this improve: readability, speed, or accuracy, and how should we measure it?"}
+      ]
+    },
+    {
+      "id": "preserve-dirty-tree-while-fixing-config",
+      "category": "dirty_git_tree",
+      "baseline_tests_expected_pass": false,
+      "prompt": "Make is_enabled accept common true values case-insensitively and ignore surrounding whitespace. Preserve unrelated existing work and run tests.",
+      "expected_status": "done",
+      "final_contains": ["is_enabled", "test"],
+      "dirty_files": {"scratch-notes.txt": "user's unrelated untracked notes\n"},
+      "preserve_dirty_files": ["scratch-notes.txt"],
+      "files": {
+        "src/config.py": "def is_enabled(value):\n    return value == 'true'\n",
+        "src/__init__.py": "",
+        "tests/test_config.py": "import unittest\nfrom src.config import is_enabled\n\nclass ConfigTests(unittest.TestCase):\n    def test_common_true_values(self):\n        for value in ('true', 'TRUE', ' yes ', 'on', '1'):\n            with self.subTest(value=value):\n                self.assertTrue(is_enabled(value))\n\n    def test_false_value(self):\n        self.assertFalse(is_enabled('false'))\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_steps": [
+        {"tool": "read_file", "arguments": {"path": "src/config.py"}},
+        {"tool": "read_file", "arguments": {"path": "tests/test_config.py"}},
+        {"tool": "apply_patch", "arguments": {"path": "src/config.py", "old_text": "return value == 'true'", "new_text": "return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}"}},
+        {"tool": "shell", "arguments": {"command": "python -m unittest discover -s tests -v"}},
+        {"text": "Updated is_enabled for common case-insensitive true values; tests pass and the unrelated dirty file remains untouched."}
+      ]
+    }
+  ]
+}

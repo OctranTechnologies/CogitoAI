@@ -13,6 +13,9 @@ use harness_agent::{AgentError, AgentTask, ApprovalHandler};
 use harness_core::{discover_workspace, CheckpointId, RunId, SessionId};
 use harness_git::{is_runtime_state_path, GitClient, GitError};
 use harness_models::ModelRegistryFilter;
+use harness_policy::{
+    ExecutionMode, OperationKind, Policy, PolicyDecision, PolicyRequest, RiskCategory,
+};
 use harness_pty::{PtyError, PtyRequest, SessionOrigin, TerminalEvent};
 use harness_session::{EventId, EventSubscriber, EventSubscription, HarnessEvent};
 use harness_tools::{CancellationToken, ToolRequest};
@@ -29,7 +32,7 @@ use crate::protocol::{
 use crate::settings::SecretStore;
 use crate::Runtime;
 
-const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = 26 * 1024 * 1024;
 const MAX_IDEMPOTENCY_ENTRIES: usize = 1024;
 
 #[derive(Debug, Error)]
@@ -531,7 +534,12 @@ impl ApprovalBroker {
         }
     }
 
-    fn request(&self, request: &ToolRequest) -> Result<bool, AgentError> {
+    fn request(
+        &self,
+        request: &ToolRequest,
+        risks: &[RiskCategory],
+        reason: &str,
+    ) -> Result<bool, AgentError> {
         let approval_id = format!(
             "approval-{}-{}",
             std::process::id(),
@@ -548,6 +556,8 @@ impl ApprovalBroker {
             params: json!({
                 "approval_id": approval_id,
                 "tool": request,
+                "risk_categories": risks,
+                "reason": reason,
             }),
         };
         let client_sender = self
@@ -639,7 +649,16 @@ impl RpcApprovalHandler {
 
 impl ApprovalHandler for RpcApprovalHandler {
     fn request(&self, request: &ToolRequest) -> Result<bool, AgentError> {
-        self.broker.request(request)
+        self.broker.request(request, &[], "")
+    }
+
+    fn request_with_details(
+        &self,
+        request: &ToolRequest,
+        risks: &[RiskCategory],
+        reason: &str,
+    ) -> Result<bool, AgentError> {
+        self.broker.request(request, risks, reason)
     }
 }
 
@@ -859,6 +878,9 @@ fn is_mutating_method(method: &str) -> bool {
             | "settings.update_permissions"
             | "credentials.disconnect"
             | "models.refresh"
+            | "mcp.refresh"
+            | "mcp.disconnect"
+            | "mcp.resources"
             | "config.update"
             | "session.create"
             | "session.resume"
@@ -944,6 +966,10 @@ fn dispatch_validated(
         "credentials.disconnect" => credentials_disconnect(state, runtime, &request.params),
         "models.list" => models_list(runtime, &request.params),
         "models.refresh" => models_refresh(runtime, &request.params),
+        "mcp.inspect" => Ok(json!(runtime.mcp_manager().snapshot())),
+        "mcp.refresh" => mcp_refresh(runtime, &request.params),
+        "mcp.disconnect" => mcp_disconnect(runtime, &request.params),
+        "mcp.resources" => mcp_resources(runtime, &request.params),
         "session.create" => session_create(runtime, &request.params),
         "session.list" => session_list(runtime, &request.params),
         "session.inspect" => session_inspect(runtime, &request.params),
@@ -1544,6 +1570,93 @@ fn models_refresh(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerE
     serde_json::to_value(report).map_err(Into::into)
 }
 
+fn mcp_refresh(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    authorize_mcp_control(runtime, "connect and discover", params)?;
+    let server_id = params.get("server_id").and_then(Value::as_str);
+    let snapshot = runtime
+        .mcp_manager()
+        .refresh(server_id)
+        .map_err(|error| RpcServerError::Runtime(error.to_string()))?;
+    Ok(serde_json::to_value(snapshot)?)
+}
+
+fn mcp_disconnect(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    let server_id = params
+        .get("server_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcServerError::Runtime("missing server_id".to_owned()))?;
+    runtime
+        .mcp_manager()
+        .disconnect(server_id)
+        .map_err(|error| RpcServerError::Runtime(error.to_string()))
+        .and_then(|snapshot| serde_json::to_value(snapshot).map_err(Into::into))
+}
+
+fn mcp_resources(runtime: &Runtime, params: &Value) -> Result<Value, RpcServerError> {
+    authorize_mcp_control(runtime, "list resources", params)?;
+    let server_id = params
+        .get("server_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcServerError::Runtime("missing server_id".to_owned()))?;
+    let resources = runtime
+        .mcp_manager()
+        .list_resources(server_id)
+        .map_err(|error| RpcServerError::Runtime(error.to_string()))?;
+    Ok(json!({"resources": resources}))
+}
+
+/// The settings/CLI control surface is initiated by the human rather than a
+/// model tool call. Still evaluate the same MCP policy as the agent. An ASK
+/// decision is satisfied only by the explicit one-shot approval attached to
+/// this direct user action; DENY rules can never be overridden by that flag.
+fn authorize_mcp_control(
+    runtime: &Runtime,
+    action: &str,
+    params: &Value,
+) -> Result<(), RpcServerError> {
+    let fallback_root = PathBuf::from(".");
+    let workspace_root = runtime.workspace_root().unwrap_or(&fallback_root);
+    authorize_mcp_control_with_policy(
+        runtime.policy().as_ref(),
+        workspace_root,
+        runtime.execution_mode(),
+        action,
+        params,
+    )
+}
+
+fn authorize_mcp_control_with_policy(
+    policy: &dyn Policy,
+    workspace_root: &std::path::Path,
+    mode: ExecutionMode,
+    action: &str,
+    params: &Value,
+) -> Result<(), RpcServerError> {
+    let request = PolicyRequest {
+        tool_name: format!("mcp_{action}"),
+        operation: OperationKind::Mcp,
+        workspace_root: workspace_root.to_path_buf(),
+        path: None,
+        command: None,
+        mode,
+    };
+    let evaluation = policy.evaluate(&request);
+    match evaluation.decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::Deny => Err(RpcServerError::Runtime(format!(
+            "MCP {action} denied by policy: {}",
+            evaluation.reason
+        ))),
+        PolicyDecision::Ask if params.get("approved").and_then(Value::as_bool) == Some(true) => {
+            Ok(())
+        }
+        PolicyDecision::Ask => Err(RpcServerError::Runtime(format!(
+            "MCP {action} requires explicit user approval: {}",
+            evaluation.reason
+        ))),
+    }
+}
+
 fn session_id(params: &Value) -> Result<SessionId, RpcServerError> {
     let value = params
         .get("session_id")
@@ -1617,5 +1730,51 @@ fn error_code_agent(error: &AgentError) -> &'static str {
         AgentError::Model(_) => "model_error",
         AgentError::Core(_) => "core_error",
         AgentError::Tool(_) => "tool_error",
+    }
+}
+
+#[cfg(test)]
+mod mcp_control_policy_tests {
+    use super::*;
+    use harness_policy::{NetworkAccess, PolicyEngine};
+
+    #[test]
+    fn direct_mcp_connect_requires_explicit_approval_for_ask() {
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = PolicyEngine::new(ExecutionMode::Normal, workspace.path());
+        let params = json!({});
+        assert!(authorize_mcp_control_with_policy(
+            &policy,
+            workspace.path(),
+            ExecutionMode::Normal,
+            "connect and discover",
+            &params,
+        )
+        .is_err());
+        assert!(authorize_mcp_control_with_policy(
+            &policy,
+            workspace.path(),
+            ExecutionMode::Normal,
+            "connect and discover",
+            &json!({"approved": true}),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn direct_mcp_approval_cannot_override_network_deny() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut policy = PolicyEngine::new(ExecutionMode::Normal, workspace.path());
+        policy.network_access = NetworkAccess::Deny;
+        assert!(authorize_mcp_control_with_policy(
+            &policy,
+            workspace.path(),
+            ExecutionMode::Normal,
+            "connect and discover",
+            &json!({"approved": true}),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("denied by policy"));
     }
 }

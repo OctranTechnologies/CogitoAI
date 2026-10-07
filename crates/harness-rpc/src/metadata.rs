@@ -274,10 +274,10 @@ pub(crate) fn process_exists(pid: u32) -> Option<bool> {
         let script = format!(
             "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
         );
-        let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-            .ok()?;
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        hide_console_window(&mut command);
+        let output = command.output().ok()?;
         return Some(output.status.success());
     }
 
@@ -296,6 +296,16 @@ pub(crate) fn process_exists(pid: u32) -> Option<bool> {
     #[allow(unreachable_code)]
     None
 }
+
+#[cfg(windows)]
+fn hide_console_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console_window(_command: &mut std::process::Command) {}
 
 fn workspace_key(workspace_root: &Path) -> String {
     let canonical =

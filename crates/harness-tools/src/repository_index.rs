@@ -836,14 +836,15 @@ fn query_language_server(
             ))
         }
     };
-    let mut child = match Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    crate::process::configure_process_group(&mut command);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
             return Ok(format!(
@@ -1517,6 +1518,7 @@ fn ripgrep_files(root: &Path) -> Option<Vec<PathBuf>> {
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    crate::process::configure_process_group(&mut command);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let reader = BufReader::new(stdout);
@@ -1781,6 +1783,7 @@ fn ripgrep_search(
             .current_dir(root)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        crate::process::configure_process_group(&mut command);
         if let Ok(mut child) = command.spawn() {
             let Some(stdout) = child.stdout.take() else {
                 return Err(ToolError::Process {
@@ -1916,12 +1919,13 @@ fn native_search(
 fn has_ripgrep() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        Command::new("rg")
+        let mut command = Command::new("rg");
+        command
             .arg("--version")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
+            .stderr(Stdio::null());
+        crate::process::configure_process_group(&mut command);
+        command.status().is_ok()
     })
 }
 

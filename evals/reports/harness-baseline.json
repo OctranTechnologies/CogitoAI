@@ -1,0 +1,633 @@
+{
+  "schema_version": 1,
+  "suite_id": "coding-agent-core-v1",
+  "suite_version": 1,
+  "started_at": "2026-10-07T19:10:49.829745+00:00",
+  "lane": "harness",
+  "provider": {
+    "id": "mock",
+    "model": "mock-eval"
+  },
+  "commit": "7346a09782825d6a7c50e204ef888960c5531626",
+  "status": "completed",
+  "tasks": [
+    {
+      "task_id": "small-bug-tax-calculation",
+      "category": "small_bug",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 1,
+      "tests_total": 1,
+      "baseline_tests_passed": 0,
+      "baseline_tests_total": 1,
+      "regressions": 0,
+      "turn_count": 5,
+      "tool_calls": 4,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 5873,
+        "context_estimated_sent": 5873,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 14.225980499992147,
+      "agent_wall_clock_seconds": 3.35,
+      "human_approvals": 0,
+      "approval_events": 4,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 2,
+      "safety_violations": 0,
+      "files_read": [
+        "src/calc.py",
+        "tests/test_calc.py"
+      ],
+      "files_modified": [
+        "src/calc.py"
+      ],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [
+        {
+          "command": "pytest tests/test_calc.py",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 1 item\r\n\r\ntests\\test_calc.py .                                                     [100%]\r\n\r\n============================== 1 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/calc.py ---\ndiff --git a/src/calc.py b/src/calc.py\nindex e133728..10583d5 100644\n--- a/src/calc.py\n+++ b/src/calc.py\n@@ -1,2 +1,2 @@\n def total_with_tax(amount: float, rate: float) -> float:\n-    return amount * rate\n+    return amount * (1 + rate)\n"
+        }
+      ],
+      "final_response": "Fixed the tax calculation and verified it with the test suite.",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "feature-slugify",
+      "category": "feature",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 2,
+      "tests_total": 2,
+      "baseline_tests_passed": 0,
+      "baseline_tests_total": 1,
+      "regressions": 0,
+      "turn_count": 4,
+      "tool_calls": 3,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 5139,
+        "context_estimated_sent": 5139,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 13.995314999949187,
+      "agent_wall_clock_seconds": 3.378,
+      "human_approvals": 0,
+      "approval_events": 3,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 2,
+      "safety_violations": 0,
+      "files_read": [
+        "src/slug.py",
+        "tests/test_slug.py"
+      ],
+      "files_modified": [
+        "src/slug.py"
+      ],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [
+        {
+          "command": "pytest tests/test_slug.py",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 2 items\r\n\r\ntests\\test_slug.py ..                                                    [100%]\r\n\r\n============================== 2 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/slug.py ---\ndiff --git a/src/slug.py b/src/slug.py\nindex 1c81014..bf4eddd 100644\n--- a/src/slug.py\n+++ b/src/slug.py\n@@ -1 +1,6 @@\n \"\"\"Text slug helpers.\"\"\"\n+import re\n+\n+def slugify(text: str) -> str:\n+    words = re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')\n+    return words\n"
+        }
+      ],
+      "final_response": "Implemented slugify and verified punctuation and separator handling with tests.",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "repair-failing-discount-test",
+      "category": "failing_test_repair",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 1,
+      "tests_total": 1,
+      "baseline_tests_passed": 0,
+      "baseline_tests_total": 1,
+      "regressions": 0,
+      "turn_count": 5,
+      "tool_calls": 4,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 5945,
+        "context_estimated_sent": 5945,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 14.810829299967736,
+      "agent_wall_clock_seconds": 3.702,
+      "human_approvals": 0,
+      "approval_events": 4,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 2,
+      "safety_violations": 0,
+      "files_read": [
+        "src/discount.py",
+        "tests/test_discount.py"
+      ],
+      "files_modified": [
+        "src/discount.py"
+      ],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [
+        {
+          "command": "pytest tests/test_discount.py",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 1 item\r\n\r\ntests\\test_discount.py .                                                 [100%]\r\n\r\n============================== 1 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/discount.py ---\ndiff --git a/src/discount.py b/src/discount.py\nindex 98fc7e2..e6cc5ea 100644\n--- a/src/discount.py\n+++ b/src/discount.py\n@@ -1,2 +1,2 @@\n def apply_discount(price: float, rate: float) -> float:\n-    return price - rate\n+    return price * (1 - rate)\n"
+        }
+      ],
+      "final_response": "Repaired apply_discount and verified the failing test now passes.",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "refactor-shared-total-across-files",
+      "category": "cross_file_refactor",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 1,
+      "tests_total": 1,
+      "baseline_tests_passed": 1,
+      "baseline_tests_total": 1,
+      "regressions": 0,
+      "turn_count": 6,
+      "tool_calls": 5,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 8332,
+        "context_estimated_sent": 8332,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 17.181913600070402,
+      "agent_wall_clock_seconds": 6.222,
+      "human_approvals": 0,
+      "approval_events": 5,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 3,
+      "safety_violations": 0,
+      "files_read": [
+        "src/math_ops.py",
+        "src/report.py"
+      ],
+      "files_modified": [
+        "src/math_ops.py",
+        "src/report.py"
+      ],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [
+        {
+          "command": "pytest",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 1 item\r\n\r\ntests\\test_report.py .                                                   [100%]\r\n\r\n============================== 1 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/math_ops.py ---\ndiff --git a/src/math_ops.py b/src/math_ops.py\nindex 2c2ae28..5dcb752 100644\n--- a/src/math_ops.py\n+++ b/src/math_ops.py\n@@ -1,2 +1,2 @@\n def total(values):\n-    return sum(values) + 0\n+    return sum(values)\n"
+        },
+        {
+          "command": "pytest tests/test_report.py",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 1 item\r\n\r\ntests\\test_report.py .                                                   [100%]\r\n\r\n============================== 1 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/report.py ---\ndiff --git a/src/report.py b/src/report.py\nindex f638873..0fa35e9 100644\n--- a/src/report.py\n+++ b/src/report.py\n@@ -1,2 +1,4 @@\n+from .math_ops import total\n+\n def total_label(values):\n-    return f'Total: {sum(values)}'\n+    return f'Total: {total(values)}'\n"
+        }
+      ],
+      "final_response": "Removed duplicate total logic by routing report.py through math_ops.total; tests pass.",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "update-greeting-api",
+      "category": "api_update",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 2,
+      "tests_total": 2,
+      "baseline_tests_passed": 1,
+      "baseline_tests_total": 2,
+      "regressions": 0,
+      "turn_count": 5,
+      "tool_calls": 4,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 6346,
+        "context_estimated_sent": 6346,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 14.414254099945538,
+      "agent_wall_clock_seconds": 3.477,
+      "human_approvals": 0,
+      "approval_events": 4,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 2,
+      "safety_violations": 0,
+      "files_read": [
+        "src/greeting.py",
+        "tests/test_greeting.py"
+      ],
+      "files_modified": [
+        "src/greeting.py"
+      ],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [
+        {
+          "command": "pytest tests/test_greeting.py",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 2 items\r\n\r\ntests\\test_greeting.py ..                                                [100%]\r\n\r\n============================== 2 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/greeting.py ---\ndiff --git a/src/greeting.py b/src/greeting.py\nindex d79ada1..52f7df7 100644\n--- a/src/greeting.py\n+++ b/src/greeting.py\n@@ -1,2 +1,4 @@\n-def greet(name: str) -> str:\n+def greet(name: str, *, formal: bool = False) -> str:\n+    if formal:\n+        return f'Good day, {name}.'\n     return f'Hello {name}'\n"
+        }
+      ],
+      "final_response": "Added a backward-compatible formal option to greet; both API tests pass.",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "trace-request-routing",
+      "category": "unfamiliar_code_trace",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 0,
+      "tests_total": 0,
+      "baseline_tests_passed": 0,
+      "baseline_tests_total": 0,
+      "regressions": 0,
+      "turn_count": 5,
+      "tool_calls": 4,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 4910,
+        "context_estimated_sent": 4910,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 12.180062499945052,
+      "agent_wall_clock_seconds": 1.033,
+      "human_approvals": 0,
+      "approval_events": 4,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 0,
+      "safety_violations": 0,
+      "files_read": [
+        "src/entry.py",
+        "src/headers.py",
+        "src/router.py",
+        "src/transport.py"
+      ],
+      "files_modified": [],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [],
+      "final_response": "handle_request first calls normalize_headers, then route_request. For ordinary paths route_request calls send_http; paths under /internal return through the internal handler instead.",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "add-port-validation",
+      "category": "validation",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 2,
+      "tests_total": 2,
+      "baseline_tests_passed": 0,
+      "baseline_tests_total": 2,
+      "regressions": 0,
+      "turn_count": 5,
+      "tool_calls": 4,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 6520,
+        "context_estimated_sent": 6520,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 14.214907100074925,
+      "agent_wall_clock_seconds": 3.616,
+      "human_approvals": 0,
+      "approval_events": 4,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 2,
+      "safety_violations": 0,
+      "files_read": [
+        "src/ports.py",
+        "tests/test_ports.py"
+      ],
+      "files_modified": [
+        "src/ports.py"
+      ],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [
+        {
+          "command": "pytest tests/test_ports.py",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 2 items\r\n\r\ntests\\test_ports.py ..                                                   [100%]\r\n\r\n============================== 2 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/ports.py ---\ndiff --git a/src/ports.py b/src/ports.py\nindex a8a7c1d..8cf820c 100644\n--- a/src/ports.py\n+++ b/src/ports.py\n@@ -1,2 +1,8 @@\n def parse_port(value):\n-    return int(value)\n+    try:\n+        port = int(value)\n+    except (TypeError, ValueError) as error:\n+        raise ValueError('port must be an integer') from error\n+    if not 1 <= port <= 65535:\n+        raise ValueError('port must be between 1 and 65535')\n+    return port\n"
+        }
+      ],
+      "final_response": "Added bounded integer validation for parse_port; validation tests pass for valid and invalid inputs.",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "fix-type-annotation",
+      "category": "type_error",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 1,
+      "tests_total": 1,
+      "baseline_tests_passed": 0,
+      "baseline_tests_total": 1,
+      "regressions": 0,
+      "turn_count": 5,
+      "tool_calls": 4,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 5951,
+        "context_estimated_sent": 5951,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 14.94402109994553,
+      "agent_wall_clock_seconds": 3.567,
+      "human_approvals": 0,
+      "approval_events": 4,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 2,
+      "safety_violations": 0,
+      "files_read": [
+        "src/price.py",
+        "tests/test_price.py"
+      ],
+      "files_modified": [
+        "src/price.py"
+      ],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [
+        {
+          "command": "pytest tests/test_price.py",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 1 item\r\n\r\ntests\\test_price.py .                                                    [100%]\r\n\r\n============================== 1 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/price.py ---\ndiff --git a/src/price.py b/src/price.py\nindex 4f85441..8a38ead 100644\n--- a/src/price.py\n+++ b/src/price.py\n@@ -1,2 +1,2 @@\n-def subtotal(items: list[float]) -> str:\n+def subtotal(items: list[float]) -> float:\n     return sum(items)\n"
+        }
+      ],
+      "final_response": "Corrected subtotal's return type annotation without changing its numeric behavior; tests pass.",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "clarify-ambiguous-output-request",
+      "category": "ambiguous_requirement",
+      "success": true,
+      "completion_status": "user_input_required",
+      "expected_status": "user_input_required",
+      "tests_passed": 0,
+      "tests_total": 0,
+      "baseline_tests_passed": 0,
+      "baseline_tests_total": 0,
+      "regressions": 0,
+      "turn_count": 2,
+      "tool_calls": 1,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 1685,
+        "context_estimated_sent": 1685,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 11.030808999901637,
+      "agent_wall_clock_seconds": 0.371,
+      "human_approvals": 0,
+      "approval_events": 1,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 0,
+      "safety_violations": 0,
+      "files_read": [
+        "src/output.py"
+      ],
+      "files_modified": [],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [],
+      "final_response": "Which outcome should this improve: readability, speed, or accuracy, and how should we measure it?",
+      "dirty_files_preserved": {},
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    },
+    {
+      "task_id": "preserve-dirty-tree-while-fixing-config",
+      "category": "dirty_git_tree",
+      "success": true,
+      "completion_status": "done",
+      "expected_status": "done",
+      "tests_passed": 2,
+      "tests_total": 2,
+      "baseline_tests_passed": 0,
+      "baseline_tests_total": 2,
+      "regressions": 0,
+      "turn_count": 5,
+      "tool_calls": 4,
+      "tokens": {
+        "reported_input": null,
+        "reported_output": null,
+        "total": 6218,
+        "context_estimated_sent": 6218,
+        "source": "context_estimate"
+      },
+      "estimated_cost_usd": null,
+      "wall_clock_seconds": 14.855002900003456,
+      "agent_wall_clock_seconds": 3.691,
+      "human_approvals": 0,
+      "approval_events": 4,
+      "approval_mode": "automatic_noninteractive",
+      "approval_requests": 2,
+      "safety_violations": 0,
+      "files_read": [
+        "src/config.py",
+        "tests/test_config.py"
+      ],
+      "files_modified": [
+        "src/config.py"
+      ],
+      "context_compactions": 0,
+      "repeated_failures": 0,
+      "verification": [
+        {
+          "command": "pytest tests/test_config.py",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "stdout:\n============================= test session starts =============================\r\nplatform win32 -- Python 3.14.6, pytest-9.1.1, pluggy-1.6.0\r\nrootdir: <workspace>\r\nconfigfile: pytest.ini\r\nplugins: anyio-4.15.1, asyncio-1.4.0\r\nasyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function\r\ncollected 2 items\r\n\r\ntests\\test_config.py ..                                                  [100%]\r\n\r\n============================== 2 passed in 0.02s ==============================\r\n"
+        },
+        {
+          "command": "git diff --no-ext-diff --no-color",
+          "passed": true,
+          "exit_code": 0,
+          "failure_origin": null,
+          "affected_files": [],
+          "relevant_output": "--- task change: src/config.py ---\ndiff --git a/src/config.py b/src/config.py\nindex 0d7d503..5d1a02c 100644\n--- a/src/config.py\n+++ b/src/config.py\n@@ -1,2 +1,2 @@\n def is_enabled(value):\n-    return value == 'true'\n+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}\n"
+        }
+      ],
+      "final_response": "Updated is_enabled for common case-insensitive true values; tests pass and the unrelated dirty file remains untouched.",
+      "dirty_files_preserved": {
+        "scratch-notes.txt": true
+      },
+      "cli_exit_code": 0,
+      "error": null,
+      "failure_output": ""
+    }
+  ],
+  "summary": {
+    "tasks_total": 10,
+    "tasks_completed": 10,
+    "success_rate": 1.0,
+    "test_pass_rate": 1.0,
+    "tests_passed": 12,
+    "tests_total": 12,
+    "regressions": 0,
+    "median_wall_clock_seconds": 14.320117299968842,
+    "median_agent_wall_clock_seconds": 3.5220000000000002,
+    "total_reported_or_estimated_tokens": 56919,
+    "token_source": "context_estimate",
+    "estimated_cost_usd": null,
+    "human_approval_events": 0,
+    "approval_events": 37,
+    "approval_requests": 17,
+    "safety_violations": 0,
+    "context_compactions": 0,
+    "repeated_failures": 0
+  },
+  "source_fingerprint": {
+    "commit": "7346a09782825d6a7c50e204ef888960c5531626",
+    "working_tree_dirty": true,
+    "sha256": "1abf141b47c8bcc0cc4c9814667c5a940548d6ec8e69f53ea0509a97181c570f"
+  },
+  "finished_at": "2026-10-07T19:13:20.530922+00:00"
+}

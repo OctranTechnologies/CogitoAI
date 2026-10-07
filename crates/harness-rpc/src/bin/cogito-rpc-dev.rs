@@ -104,6 +104,7 @@ impl AgentRunnerFactory for DevRunnerFactory {
                 Arc::new(RpcApprovalHandler::new(Arc::clone(&self.approvals))),
             )
             .with_event_bus(self.event_bus.clone())
+            .with_subagents()
             .with_reasoning_config(model.reasoning_config())
             .with_checkpoints(Arc::clone(&self.checkpoints)),
         ))
@@ -169,6 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(RpcApprovalHandler::new(Arc::clone(&approvals))),
     )
     .with_event_bus(event_bus.clone())
+    .with_subagents()
     .with_checkpoints(Arc::clone(&checkpoints));
     // Clone the shared state the rebuild factory needs before it is moved into
     // the runtime.

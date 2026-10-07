@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harness_core::{CommandSpec, Error, WorkspaceDescription};
-use harness_tools::{CancellationToken, ProcessEvent, ProcessRequest, ProcessRunner};
+use harness_tools::{CancellationToken, ExecutionEnvironment, ProcessEvent, ProcessRequest};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -85,13 +85,13 @@ pub trait Verifier: Send + Sync {
 
 #[derive(Clone)]
 pub struct CommandVerifier {
-    runner: Arc<dyn ProcessRunner>,
+    runner: Arc<dyn ExecutionEnvironment>,
     cancellation: CancellationToken,
     max_output_bytes: usize,
 }
 
 impl CommandVerifier {
-    pub fn new(runner: Arc<dyn ProcessRunner>) -> Self {
+    pub fn new(runner: Arc<dyn ExecutionEnvironment>) -> Self {
         Self {
             runner,
             cancellation: CancellationToken::new(),
@@ -149,21 +149,24 @@ impl CommandVerifier {
             let mut stdout = String::new();
             let mut stderr = String::new();
             let mut output_truncated = false;
-            let result =
-                self.runner
-                    .execute(process_request, cancellation, &mut |event| match event {
-                        ProcessEvent::Stdout { chunk } => {
-                            output_truncated |=
-                                append_bounded(&mut stdout, &chunk, self.max_output_bytes);
-                            Ok(())
-                        }
-                        ProcessEvent::Stderr { chunk } => {
-                            output_truncated |=
-                                append_bounded(&mut stderr, &chunk, self.max_output_bytes);
-                            Ok(())
-                        }
-                        ProcessEvent::Started { .. } | ProcessEvent::Exited { .. } => Ok(()),
-                    });
+            let result = self.runner.spawn_process(
+                &request.working_directory,
+                process_request,
+                cancellation,
+                &mut |event| match event {
+                    ProcessEvent::Stdout { chunk } => {
+                        output_truncated |=
+                            append_bounded(&mut stdout, &chunk, self.max_output_bytes);
+                        Ok(())
+                    }
+                    ProcessEvent::Stderr { chunk } => {
+                        output_truncated |=
+                            append_bounded(&mut stderr, &chunk, self.max_output_bytes);
+                        Ok(())
+                    }
+                    ProcessEvent::Started { .. } | ProcessEvent::Exited { .. } => Ok(()),
+                },
+            );
             if cancellation.is_cancelled() {
                 return Err(Error::Verification {
                     message: "verification cancelled".to_owned(),

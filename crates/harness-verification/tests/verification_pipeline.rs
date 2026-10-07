@@ -5,7 +5,7 @@ use harness_core::{
     CommandSpec, GitDescription, Manifest, MonorepoDescription, PackageManager, ProjectCommands,
     WorkingTreeState, WorkspaceConfiguration, WorkspaceDescription,
 };
-use harness_tools::LocalProcessRunner;
+use harness_tools::LocalExecutionEnvironment;
 use harness_verification::{
     CommandVerifier, VerificationCategory, VerificationPlan, VerificationPlanner,
     VerificationRequest, Verifier,
@@ -347,7 +347,7 @@ fn runs_success_and_failure_with_structured_reports() {
         changed_files: Vec::new(),
         max_output_bytes: 1024,
     };
-    let verifier = CommandVerifier::new(Arc::new(LocalProcessRunner));
+    let verifier = CommandVerifier::new(Arc::new(LocalExecutionEnvironment::default()));
 
     let reports = verifier.verify(&request).unwrap();
 
@@ -379,7 +379,8 @@ fn bounds_large_verification_output() {
         changed_files: Vec::new(),
         max_output_bytes: 128,
     };
-    let verifier = CommandVerifier::new(Arc::new(LocalProcessRunner)).with_output_limit(128);
+    let verifier =
+        CommandVerifier::new(Arc::new(LocalExecutionEnvironment::default())).with_output_limit(128);
 
     let report = verifier.verify(&request).unwrap().remove(0);
 
@@ -403,7 +404,7 @@ fn structured_failures_include_attribution_and_relevant_output() {
         changed_files: vec![temporary.path().join("src/lib.rs")],
         max_output_bytes: 1024,
     };
-    let verifier = CommandVerifier::new(Arc::new(LocalProcessRunner));
+    let verifier = CommandVerifier::new(Arc::new(LocalExecutionEnvironment::default()));
 
     let report = verifier.verify(&request).unwrap().remove(0);
     let failure = report.failure.unwrap();
@@ -429,7 +430,7 @@ fn structured_failures_include_attribution_and_relevant_output() {
 #[test]
 fn lint_and_compile_failures_retain_distinct_categories() {
     let temporary = tempdir().unwrap();
-    let verifier = CommandVerifier::new(Arc::new(LocalProcessRunner));
+    let verifier = CommandVerifier::new(Arc::new(LocalExecutionEnvironment::default()));
     for (category, name) in [
         (VerificationCategory::Lint, "lint"),
         (VerificationCategory::Build, "compile"),
@@ -458,7 +459,7 @@ fn lint_and_compile_failures_retain_distinct_categories() {
 #[test]
 fn unrelated_and_stale_test_failures_are_not_claimed_as_patch_regressions() {
     let temporary = tempdir().unwrap();
-    let verifier = CommandVerifier::new(Arc::new(LocalProcessRunner));
+    let verifier = CommandVerifier::new(Arc::new(LocalExecutionEnvironment::default()));
     let run = |output: &str| {
         let command = format!("echo {output} & exit /B 1");
         verifier
@@ -524,7 +525,7 @@ fn command_verifier_stops_after_the_first_failure() {
         max_output_bytes: 1024,
     };
 
-    let reports = CommandVerifier::new(Arc::new(LocalProcessRunner))
+    let reports = CommandVerifier::new(Arc::new(LocalExecutionEnvironment::default()))
         .verify(&request)
         .unwrap();
 

@@ -174,7 +174,7 @@ export interface CredentialActionResult {
   providers: ProviderCredentialStatus[];
 }
 
-export type SettingsScreen = "models" | "runtime" | "permissions" | "project" | "verification";
+export type SettingsScreen = "models" | "runtime" | "permissions" | "project" | "verification" | "mcp";
 
 export const SETTINGS_SCREENS: { id: SettingsScreen; label: string }[] = [
   { id: "models", label: "Models" },
@@ -182,6 +182,7 @@ export const SETTINGS_SCREENS: { id: SettingsScreen; label: string }[] = [
   { id: "permissions", label: "Permissions" },
   { id: "project", label: "Project" },
   { id: "verification", label: "Verification" },
+  { id: "mcp", label: "MCP" },
 ];
 
 export function isSettingsSnapshot(value: unknown): value is SettingsSnapshot {

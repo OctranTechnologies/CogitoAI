@@ -86,6 +86,14 @@ pub enum EventType {
     ToolCompleted,
     #[serde(rename = "tool.failed")]
     ToolFailed,
+    #[serde(rename = "subagent.started")]
+    SubagentStarted,
+    #[serde(rename = "subagent.completed")]
+    SubagentCompleted,
+    #[serde(rename = "subagent.failed")]
+    SubagentFailed,
+    #[serde(rename = "subagent.linked")]
+    SubagentLinked,
     #[serde(rename = "process.started")]
     ProcessStarted,
     #[serde(rename = "process.stdout")]
@@ -94,6 +102,10 @@ pub enum EventType {
     ProcessStderr,
     #[serde(rename = "process.exited")]
     ProcessExited,
+    #[serde(rename = "background_process.started")]
+    BackgroundProcessStarted,
+    #[serde(rename = "background_process.status")]
+    BackgroundProcessStatus,
     #[serde(rename = "policy.decision")]
     PolicyDecision,
     #[serde(rename = "file.changed")]
@@ -517,6 +529,33 @@ pub enum EventPayload {
     ToolCompleted { tool: String },
     #[serde(rename = "tool.failed")]
     ToolFailed { tool: String, error: String },
+    #[serde(rename = "subagent.started")]
+    SubagentStarted {
+        delegation_id: String,
+        child_session_id: SessionId,
+        role: String,
+        task: String,
+    },
+    #[serde(rename = "subagent.completed")]
+    SubagentCompleted {
+        delegation_id: String,
+        child_session_id: SessionId,
+        role: String,
+        summary: String,
+    },
+    #[serde(rename = "subagent.failed")]
+    SubagentFailed {
+        delegation_id: String,
+        child_session_id: SessionId,
+        role: String,
+        error: String,
+    },
+    #[serde(rename = "subagent.linked")]
+    SubagentLinked {
+        delegation_id: String,
+        parent_session_id: SessionId,
+        role: String,
+    },
     #[serde(rename = "process.started")]
     ProcessStarted {
         command: String,
@@ -533,6 +572,22 @@ pub enum EventPayload {
         timed_out: bool,
         cancelled: bool,
     },
+    #[serde(rename = "background_process.started")]
+    BackgroundProcessStarted {
+        process_id: String,
+        command: String,
+        working_directory: PathBuf,
+        pid: u32,
+        started_at_unix_ms: u64,
+    },
+    #[serde(rename = "background_process.status")]
+    BackgroundProcessStatus {
+        process_id: String,
+        pid: u32,
+        status: String,
+        exit_code: Option<i32>,
+        timed_out: bool,
+    },
     #[serde(rename = "policy.decision")]
     PolicyDecision {
         tool: String,
@@ -541,6 +596,8 @@ pub enum EventPayload {
         rule: String,
         operation: String,
         mode: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        risk_categories: Vec<String>,
     },
     #[serde(rename = "file.changed")]
     FileChanged { path: PathBuf, change: FileChange },
@@ -607,10 +664,16 @@ impl EventPayload {
             Self::ToolOutput { .. } => EventType::ToolOutput,
             Self::ToolCompleted { .. } => EventType::ToolCompleted,
             Self::ToolFailed { .. } => EventType::ToolFailed,
+            Self::SubagentStarted { .. } => EventType::SubagentStarted,
+            Self::SubagentCompleted { .. } => EventType::SubagentCompleted,
+            Self::SubagentFailed { .. } => EventType::SubagentFailed,
+            Self::SubagentLinked { .. } => EventType::SubagentLinked,
             Self::ProcessStarted { .. } => EventType::ProcessStarted,
             Self::ProcessStdout { .. } => EventType::ProcessStdout,
             Self::ProcessStderr { .. } => EventType::ProcessStderr,
             Self::ProcessExited { .. } => EventType::ProcessExited,
+            Self::BackgroundProcessStarted { .. } => EventType::BackgroundProcessStarted,
+            Self::BackgroundProcessStatus { .. } => EventType::BackgroundProcessStatus,
             Self::PolicyDecision { .. } => EventType::PolicyDecision,
             Self::FileChanged { .. } => EventType::FileChanged,
             Self::CheckpointCreated { .. } => EventType::CheckpointCreated,

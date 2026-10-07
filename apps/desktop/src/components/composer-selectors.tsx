@@ -456,17 +456,40 @@ export function TaskModeSelector({
  * explicitly disabled and labelled as unavailable rather than as a button that
  * quietly does nothing.
  */
-export function AttachButton() {
+export function AttachButton({
+  disabled,
+  onFilesSelected,
+}: {
+  disabled?: boolean;
+  onFilesSelected: (files: File[]) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
   return (
-    <Tooltip label="Attaching files is not available in v0">
-      <button
-        type="button"
-        disabled
-        aria-label="Attach files (not available in v0)"
-        className="flex size-control-sm cursor-not-allowed items-center justify-center rounded-md border border-line text-faint"
-      >
-        <Paperclip className="size-icon-sm" />
-      </button>
+    <Tooltip label="Attach screenshots, diagrams, or UTF-8 text files">
+      <span>
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept="image/png,image/jpeg,image/gif,image/webp,text/*,application/json,application/xml,.md,.csv,.yaml,.yml,.toml,.pdf"
+          className="sr-only"
+          tabIndex={-1}
+          aria-label="Choose attachments"
+          onChange={(event) => {
+            onFilesSelected(Array.from(event.currentTarget.files ?? []));
+            event.currentTarget.value = "";
+          }}
+        />
+        <button
+          type="button"
+          disabled={disabled}
+          aria-label="Attach files"
+          onClick={() => inputRef.current?.click()}
+          className="flex size-control-sm items-center justify-center rounded-md border border-line text-secondary transition-colors hover:border-line-strong hover:text-primary disabled:cursor-not-allowed disabled:text-faint"
+        >
+          <Paperclip className="size-icon-sm" />
+        </button>
+      </span>
     </Tooltip>
   );
 }

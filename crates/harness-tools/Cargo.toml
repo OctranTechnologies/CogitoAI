@@ -8,6 +8,8 @@ description = "Filesystem and shell tool contracts for the CogitoAI harness"
 
 [dependencies]
 harness-core.workspace = true
+harness-git.workspace = true
+harness-mcp.workspace = true
 harness-policy.workspace = true
 harness-session.workspace = true
 globset.workspace = true
@@ -17,6 +19,8 @@ serde_json.workspace = true
 sha2 = "0.10"
 tempfile = "3"
 thiserror.workspace = true
+ureq.workspace = true
+url = "2.5"
 
 [[bench]]
 name = "repository_index"

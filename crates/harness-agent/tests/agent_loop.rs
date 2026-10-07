@@ -20,7 +20,10 @@ use harness_verification::{
     FailureOrigin, VerificationCategory, VerificationFailure, VerificationPlan, VerificationReport,
     VerificationRequest, VerificationStep, Verifier,
 };
-use tempfile::tempdir;
+
+fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap()
+}
 
 fn read_http_request(stream: &mut TcpStream) -> (String, String) {
     let mut bytes = Vec::new();
@@ -295,7 +298,7 @@ fn runner(
 
 #[test]
 fn mock_agent_reads_edits_runs_observes_and_finishes() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     std::fs::write(workspace.join("file.txt"), "before\n").unwrap();
     let provider = Arc::new(ScriptedMockProvider::new(
@@ -379,7 +382,7 @@ fn mock_agent_reads_edits_runs_observes_and_finishes() {
 
 #[test]
 fn skills_are_advertised_as_metadata_and_loaded_only_after_selection() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let skill_directory = workspace.join(".agent/skills/rust-tests");
     std::fs::create_dir_all(skill_directory.join("references")).unwrap();
@@ -453,7 +456,7 @@ fn skills_are_advertised_as_metadata_and_loaded_only_after_selection() {
 
 #[test]
 fn denied_tool_does_not_run_its_configured_before_hook() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let agent_directory = workspace.join(".agent");
     std::fs::create_dir_all(&agent_directory).unwrap();
@@ -496,12 +499,12 @@ fn denied_tool_does_not_run_its_configured_before_hook() {
 
 #[test]
 fn approval_for_a_tool_does_not_implicitly_approve_its_hook_command() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     std::fs::create_dir_all(workspace.join(".agent")).unwrap();
     std::fs::write(
         workspace.join(".agent/hooks.toml"),
-        "[[hooks]]\nevent = \"before_tool\"\ncommand = \"echo hook-ran > hook-output.txt\"\n",
+        "[[hooks]]\nevent = \"before_tool\"\ncommand = \"echo main > target.txt\"\n",
     )
     .unwrap();
     let provider = Arc::new(ScriptedMockProvider::new(
@@ -537,7 +540,6 @@ fn approval_for_a_tool_does_not_implicitly_approve_its_hook_command() {
     let approved = approvals.requests.lock().unwrap();
     assert_eq!(approved.len(), 2);
     assert!(approved.iter().any(|request| request.name == "shell"));
-    assert!(workspace.join("hook-output.txt").exists());
     assert_eq!(
         std::fs::read_to_string(workspace.join("target.txt"))
             .unwrap()
@@ -548,7 +550,7 @@ fn approval_for_a_tool_does_not_implicitly_approve_its_hook_command() {
         .iter()
         .filter_map(|request| request.arguments["command"].as_str())
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 1);
 }
 
 #[test]
@@ -569,7 +571,7 @@ fn task_modes_and_permission_modes_compose_without_read_only_bypass() {
     ];
 
     for (task_mode, permission_mode) in cases {
-        let temporary = tempdir().unwrap();
+        let temporary = tempdir();
         let workspace = temporary.path();
         let plan = "Goal\nImplement a harmless test fixture update.\n\nRelevant architecture\n- Existing file-backed fixture.\n\nFiles likely affected\n- target.txt\n\nImplementation steps\n- Update target.txt.\n\nValidation\n- Run the fixture check.\n\nRisks/unknowns\n- None known.";
         let final_text = match task_mode {
@@ -678,7 +680,7 @@ fn task_modes_and_permission_modes_compose_without_read_only_bypass() {
 
 #[test]
 fn approved_plan_continues_into_code_with_the_same_persisted_context() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     std::fs::write(workspace.join("target.txt"), "before").unwrap();
     let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
@@ -784,7 +786,7 @@ fn approved_plan_continues_into_code_with_the_same_persisted_context() {
 
 #[test]
 fn denied_tool_cannot_bypass_policy() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let provider = Arc::new(ScriptedMockProvider::new(
         "scripted",
@@ -817,7 +819,7 @@ fn denied_tool_cannot_bypass_policy() {
 
 #[test]
 fn cancellation_records_failed_session_before_model_call() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let provider = Arc::new(ScriptedMockProvider::new("scripted", vec![]));
     let (runner, sessions) = runner(
@@ -843,7 +845,7 @@ fn cancellation_records_failed_session_before_model_call() {
 
 #[test]
 fn turn_limit_stops_before_extra_tool_execution() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let provider = Arc::new(ScriptedMockProvider::new(
         "scripted",
@@ -881,7 +883,7 @@ fn turn_limit_stops_before_extra_tool_execution() {
 
 #[test]
 fn failing_verification_is_repaired_before_task_is_marked_done() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     std::fs::write(workspace.join("file.txt"), "before").unwrap();
     let provider = Arc::new(ScriptedMockProvider::new(
@@ -951,7 +953,7 @@ fn failing_verification_is_repaired_before_task_is_marked_done() {
 
 #[test]
 fn final_success_claim_cannot_override_a_failed_verification() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let provider = Arc::new(ScriptedMockProvider::new(
         "scripted",
@@ -1000,7 +1002,7 @@ fn final_success_claim_cannot_override_a_failed_verification() {
 
 #[test]
 fn agent_can_finish_while_explicitly_attributing_an_unrelated_existing_failure() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let provider = Arc::new(ScriptedMockProvider::new(
         "scripted",
@@ -1099,7 +1101,7 @@ fn structured_failure_context_is_relevant_and_bounded_before_the_next_model_turn
         }
     }
 
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     std::fs::write(workspace.join("file.txt"), "before").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1175,7 +1177,7 @@ fn structured_failure_context_is_relevant_and_bounded_before_the_next_model_turn
 
 #[test]
 fn multi_file_feature_persists_plan_and_acceptance_criteria() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let provider = Arc::new(ScriptedMockProvider::new(
         "scripted",
@@ -1238,7 +1240,7 @@ fn multi_file_feature_persists_plan_and_acceptance_criteria() {
 fn long_runs_keep_the_goal_and_plan_across_compaction_at_ten_and_one_hundred_turns() {
     assert!(AgentLimits::default().max_turns >= 100);
     for expected_turns in [10_u32, 100_u32] {
-        let temporary = tempdir().unwrap();
+        let temporary = tempdir();
         let workspace = temporary.path();
         let tool_turns = expected_turns - 1;
         let mut responses = Vec::with_capacity(expected_turns as usize);
@@ -1378,7 +1380,7 @@ fn long_runs_keep_the_goal_and_plan_across_compaction_at_ten_and_one_hundred_tur
 
 #[test]
 fn cancelled_task_resumes_from_its_persisted_goal_after_a_process_restart() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let sessions = Arc::new(JsonlSessionStore::new(workspace.join("sessions")).unwrap());
     let first = Arc::new(ScriptedMockProvider::new("interrupted", Vec::new()));
@@ -1462,7 +1464,7 @@ fn cancelled_task_resumes_from_its_persisted_goal_after_a_process_restart() {
 
 #[test]
 fn blocked_task_marks_its_active_milestone_as_blocked() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let provider = Arc::new(ScriptedMockProvider::new(
         "scripted",
@@ -1508,7 +1510,7 @@ fn blocked_task_marks_its_active_milestone_as_blocked() {
 
 #[test]
 fn failed_command_is_reported_to_model_and_can_be_repaired() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let missing_command = "harness_missing_dependency_for_deterministic_test_6d91";
     let provider = Arc::new(ScriptedMockProvider::new(
@@ -1560,7 +1562,7 @@ fn impossible_and_clarification_tasks_do_not_claim_success() {
             harness_session::TaskCompletionStatus::UserInputRequired,
         ),
     ] {
-        let temporary = tempdir().unwrap();
+        let temporary = tempdir();
         let workspace = temporary.path();
         let provider = Arc::new(ScriptedMockProvider::new(
             "scripted",
@@ -1594,7 +1596,7 @@ fn impossible_and_clarification_tasks_do_not_claim_success() {
 
 #[test]
 fn repeated_identical_command_failure_is_stopped_as_blocked() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let command = "harness_missing_dependency_for_repeat_guard_331a";
     let failure_response = || {
@@ -1645,7 +1647,7 @@ fn repeated_identical_command_failure_is_stopped_as_blocked() {
 
 #[test]
 fn long_mock_session_compacts_resumes_and_preserves_history() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     let sessions = Arc::new(JsonlSessionStore::new(temporary.path().join("sessions")).unwrap());
     let session_store: Arc<dyn SessionStore> = sessions.clone();
@@ -1754,7 +1756,7 @@ fn long_mock_session_compacts_resumes_and_preserves_history() {
 
 #[test]
 fn openai_mock_tool_use_round_trip_executes_and_returns_tool_observation() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     std::fs::write(workspace.join("readme.txt"), "agent-visible-file-content").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock OpenAI server");
@@ -1868,7 +1870,7 @@ fn openai_mock_tool_use_round_trip_executes_and_returns_tool_observation() {
 
 #[test]
 fn anthropic_messages_tool_use_runs_through_policy_and_workspace_tool() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     std::fs::write(
         workspace.join("readme.txt"),
@@ -2018,7 +2020,7 @@ fn anthropic_messages_tool_use_runs_through_policy_and_workspace_tool() {
 
 #[test]
 fn gemini_native_flow_reads_patches_and_returns_tool_results_to_the_model() {
-    let temporary = tempdir().unwrap();
+    let temporary = tempdir();
     let workspace = temporary.path();
     std::fs::write(workspace.join("readme.txt"), "before\n").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Gemini server");

@@ -39,6 +39,7 @@ fn main() {
     let context = ToolContext {
         policy: &policy,
         working_directory: root,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,

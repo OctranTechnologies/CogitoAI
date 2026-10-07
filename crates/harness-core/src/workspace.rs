@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,6 +11,41 @@ use crate::Error;
 
 const MAX_SCAN_DEPTH: usize = 16;
 const MAX_SCAN_FILES: usize = 20_000;
+
+fn executable_available(program: &str) -> bool {
+    let Some(path_value) = env::var_os("PATH") else {
+        return false;
+    };
+    let search_paths = env::split_paths(&path_value).collect::<Vec<_>>();
+    let extensions = if cfg!(windows) {
+        env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        vec![String::new()]
+    };
+    executable_available_in(program, &search_paths, &extensions)
+}
+
+fn executable_available_in(program: &str, search_paths: &[PathBuf], extensions: &[String]) -> bool {
+    let file_name = Path::new(program)
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(program));
+    let has_extension = Path::new(program).extension().is_some();
+    search_paths.iter().any(|directory| {
+        if has_extension {
+            return directory.join(file_name).is_file();
+        }
+        extensions.iter().any(|extension| {
+            directory
+                .join(format!("{}{}", file_name.to_string_lossy(), extension))
+                .is_file()
+        })
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceDescription {
@@ -321,23 +357,32 @@ fn canonical_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let mut command = Command::new("git");
+    command.arg("--version");
+    configure_hidden_process(&mut command);
+    command.output().is_ok_and(|output| output.status.success())
 }
 
 fn run_git_output(directory: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(directory).args(args);
+    configure_hidden_process(&mut command);
+    let output = command.output().ok()?;
     output
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn configure_hidden_process(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 fn describe_git(available: bool, repository_root: Option<&Path>) -> GitDescription {
@@ -622,14 +667,17 @@ fn infer_commands(
         ));
     }
     if languages.contains(&Language::Python) {
-        commands
-            .test
-            .push(CommandSpec::new("pytest", Vec::<String>::new()));
-        commands
-            .build
-            .push(CommandSpec::new("python", ["-m", "build"]));
-        commands.lint.push(CommandSpec::new("ruff", ["check", "."]));
-        commands.typecheck.push(CommandSpec::new("mypy", ["."]));
+        if executable_available("pytest") {
+            commands
+                .test
+                .push(CommandSpec::new("pytest", Vec::<String>::new()));
+        }
+        if executable_available("ruff") {
+            commands.lint.push(CommandSpec::new("ruff", ["check", "."]));
+        }
+        if executable_available("mypy") {
+            commands.typecheck.push(CommandSpec::new("mypy", ["."]));
+        }
     }
     if manifests
         .iter()
@@ -875,6 +923,24 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn optional_executable_discovery_checks_path_and_windows_extensions() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("mypy.exe"), "test executable").unwrap();
+        let paths = vec![directory.path().to_path_buf()];
+        assert!(executable_available_in(
+            "mypy",
+            &paths,
+            &[".EXE".to_owned(), ".CMD".to_owned()]
+        ));
+        assert!(!executable_available_in(
+            "ruff",
+            &paths,
+            &[".EXE".to_owned(), ".CMD".to_owned()]
+        ));
+        assert!(executable_available_in("mypy.exe", &paths, &[]));
+    }
+
     fn write(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().expect("test path has parent")).unwrap();
         fs::write(path, contents).unwrap();
@@ -1097,6 +1163,22 @@ mod tests {
             .build
             .iter()
             .any(|command| command.program == "go"));
+    }
+
+    #[test]
+    fn bare_python_scripts_do_not_assume_a_packaging_build_tool() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path();
+        write(&root.join("main.py"), "print('hello')\n");
+
+        let description = discover_workspace(root).unwrap();
+
+        assert!(description
+            .configuration
+            .commands
+            .build
+            .iter()
+            .all(|command| command.program != "python"));
     }
 
     #[test]

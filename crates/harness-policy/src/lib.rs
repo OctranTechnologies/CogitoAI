@@ -36,6 +36,53 @@ pub enum OperationKind {
     Patch,
     Command,
     Network,
+    Mcp,
+}
+
+/// Deterministic risk labels attached to policy decisions and approval prompts.
+/// These are intentionally independent of execution modes: a command remains
+/// `PROCESS` risk in every mode, while the mode determines the default action.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RiskCategory {
+    Read,
+    ProjectWrite,
+    Process,
+    PackageInstall,
+    Network,
+    GitMutation,
+    Destructive,
+    OutsideWorkspace,
+    SecretAccess,
+}
+
+impl fmt::Display for RiskCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Read => "READ",
+            Self::ProjectWrite => "PROJECT_WRITE",
+            Self::Process => "PROCESS",
+            Self::PackageInstall => "PACKAGE_INSTALL",
+            Self::Network => "NETWORK",
+            Self::GitMutation => "GIT_MUTATION",
+            Self::Destructive => "DESTRUCTIVE",
+            Self::OutsideWorkspace => "OUTSIDE_WORKSPACE",
+            Self::SecretAccess => "SECRET_ACCESS",
+        })
+    }
+}
+
+/// Network handling for process and tool requests. Local execution cannot
+/// provide OS-level egress isolation, so `Deny` blocks recognized network
+/// actions at the policy boundary and sandbox implementations can enforce it
+/// at the transport boundary as well.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkAccess {
+    #[default]
+    Ask,
+    Allow,
+    Deny,
 }
 
 impl OperationKind {
@@ -45,6 +92,7 @@ impl OperationKind {
             Self::Write | Self::Patch => Permission::WriteWorkspace,
             Self::Command => Permission::ExecuteCommand,
             Self::Network => Permission::AccessNetwork,
+            Self::Mcp => Permission::AccessNetwork,
         }
     }
 }
@@ -160,6 +208,9 @@ pub struct PolicyRule {
     pub paths: Option<Vec<String>>,
     #[serde(default)]
     pub command_patterns: Option<Vec<String>>,
+    /// Optional risk filter. Missing means the rule matches any risk class.
+    #[serde(default)]
+    pub risks: Option<Vec<RiskCategory>>,
 }
 
 fn default_rule_name() -> String {
@@ -169,6 +220,8 @@ fn default_rule_name() -> String {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PolicyEngine {
     pub mode: ExecutionMode,
+    #[serde(default)]
+    pub network_access: NetworkAccess,
     pub workspace_root: PathBuf,
     pub rules: Vec<PolicyRule>,
 }
@@ -190,6 +243,8 @@ struct PolicyFile {
 struct PolicySettings {
     mode: Option<ExecutionMode>,
     #[serde(default)]
+    network_access: NetworkAccess,
+    #[serde(default)]
     rules: Vec<PolicyRule>,
 }
 
@@ -197,6 +252,7 @@ impl PolicyEngine {
     pub fn new(mode: ExecutionMode, workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             mode,
+            network_access: NetworkAccess::Ask,
             workspace_root: workspace_root.into(),
             rules: Vec::new(),
         }
@@ -221,9 +277,15 @@ impl PolicyEngine {
         let settings = file.policy.unwrap_or_default();
         Ok(Self {
             mode: settings.mode.unwrap_or(ExecutionMode::Normal),
+            network_access: settings.network_access,
             workspace_root: workspace_root.into(),
             rules: settings.rules,
         })
+    }
+
+    pub fn with_mode(mut self, mode: ExecutionMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn from_file(path: &Path, workspace_root: impl Into<PathBuf>) -> Result<Self, PolicyError> {
@@ -262,6 +324,14 @@ impl PolicyEngine {
                 ));
             }
         }
+        let risks = normalized_request.risk_categories();
+        if risks.contains(&RiskCategory::OutsideWorkspace) {
+            return Ok(PolicyEvaluation::new(
+                PolicyDecision::Deny,
+                "built-in:outside-workspace-command",
+                "commands that address paths outside the workspace are denied",
+            ));
+        }
         let mut matches = Vec::new();
         for (index, rule) in self.rules.iter().enumerate() {
             if rule_matches(rule, &normalized_request)? {
@@ -277,6 +347,55 @@ impl PolicyEngine {
                 rule.name.clone(),
                 "explicit deny rule matched",
             ));
+        }
+        if normalized_request.mode == ExecutionMode::ReadOnly
+            && !matches!(
+                normalized_request.operation,
+                OperationKind::Read | OperationKind::Search
+            )
+        {
+            return Ok(PolicyEvaluation::new(
+                PolicyDecision::Deny,
+                "built-in:read-only-mode",
+                "read-only mode denies every process or mutating operation",
+            ));
+        }
+        // Sensitive command classes always need a human decision, even when a
+        // broad allow rule matches. The language model cannot turn its own
+        // request into authorization. Explicit DENY rules above remain final.
+        if risks.iter().any(|risk| {
+            matches!(
+                risk,
+                RiskCategory::PackageInstall
+                    | RiskCategory::GitMutation
+                    | RiskCategory::Destructive
+                    | RiskCategory::SecretAccess
+            )
+        }) {
+            return Ok(PolicyEvaluation::new(
+                PolicyDecision::Ask,
+                "built-in:sensitive-command",
+                "this command affects packages, Git state, destructive state, or secrets",
+            ));
+        }
+        if risks.contains(&RiskCategory::Network) {
+            match self.network_access {
+                NetworkAccess::Deny => {
+                    return Ok(PolicyEvaluation::new(
+                        PolicyDecision::Deny,
+                        "built-in:network-denied",
+                        "network access is denied by workspace policy",
+                    ));
+                }
+                NetworkAccess::Ask => {
+                    return Ok(PolicyEvaluation::new(
+                        PolicyDecision::Ask,
+                        "built-in:network-approval",
+                        "network access requires explicit user approval",
+                    ));
+                }
+                NetworkAccess::Allow => {}
+            }
         }
         matches.sort_by_key(|(index, rule)| (-rule.priority, *index));
         if let Some((_, rule)) = matches.first() {
@@ -297,6 +416,9 @@ impl PolicyEngine {
             },
             ExecutionMode::Safe => match request.operation {
                 OperationKind::Read | OperationKind::Search => PolicyDecision::Allow,
+                OperationKind::Network if self.network_access == NetworkAccess::Allow => {
+                    PolicyDecision::Allow
+                }
                 _ => PolicyDecision::Ask,
             },
             ExecutionMode::Normal | ExecutionMode::Auto => match request.operation {
@@ -305,13 +427,29 @@ impl PolicyEngine {
                 | OperationKind::Write
                 | OperationKind::Patch => PolicyDecision::Allow,
                 OperationKind::Command => {
-                    if is_safe_command(request.command.as_deref().unwrap_or_default()) {
+                    if is_safe_command(request.command.as_deref().unwrap_or_default())
+                        || (self.network_access == NetworkAccess::Allow
+                            && request.risk_categories().contains(&RiskCategory::Network))
+                    {
                         PolicyDecision::Allow
                     } else {
                         PolicyDecision::Ask
                     }
                 }
-                OperationKind::Network => PolicyDecision::Ask,
+                OperationKind::Network => {
+                    if self.network_access == NetworkAccess::Allow {
+                        PolicyDecision::Allow
+                    } else {
+                        PolicyDecision::Ask
+                    }
+                }
+                OperationKind::Mcp => {
+                    if self.network_access == NetworkAccess::Allow {
+                        PolicyDecision::Allow
+                    } else {
+                        PolicyDecision::Ask
+                    }
+                }
             },
         };
         let reason = match decision {
@@ -385,6 +523,36 @@ fn ensure_decision(
 }
 
 impl PolicyRequest {
+    /// Returns a stable risk set derived from the requested operation and its
+    /// explicit path/command. Classification is deliberately conservative and
+    /// uses no model judgement.
+    pub fn risk_categories(&self) -> Vec<RiskCategory> {
+        let mut risks = Vec::new();
+        match self.operation {
+            OperationKind::Read | OperationKind::Search => risks.push(RiskCategory::Read),
+            OperationKind::Write | OperationKind::Patch => risks.push(RiskCategory::ProjectWrite),
+            OperationKind::Command => risks.push(RiskCategory::Process),
+            OperationKind::Network => risks.push(RiskCategory::Network),
+            OperationKind::Mcp => risks.push(RiskCategory::Network),
+        }
+        if let Some(path) = &self.path {
+            let root = normalize_path(&self.workspace_root);
+            let path = normalize_path(path);
+            if !path.starts_with(&root) {
+                risks.push(RiskCategory::OutsideWorkspace);
+            }
+            if is_high_risk_path(&path) {
+                risks.push(RiskCategory::SecretAccess);
+            }
+        }
+        if let Some(command) = &self.command {
+            classify_command_risks(command, &self.workspace_root, &mut risks);
+        }
+        risks.sort_unstable();
+        risks.dedup();
+        risks
+    }
+
     pub fn operation_name(&self) -> &'static str {
         match self.operation {
             OperationKind::Read => "read",
@@ -393,11 +561,18 @@ impl PolicyRequest {
             OperationKind::Patch => "patch",
             OperationKind::Command => "command",
             OperationKind::Network => "network",
+            OperationKind::Mcp => "mcp",
         }
     }
 }
 
 fn rule_matches(rule: &PolicyRule, request: &PolicyRequest) -> Result<bool, PolicyError> {
+    if let Some(risks) = &rule.risks {
+        let request_risks = request.risk_categories();
+        if !risks.iter().any(|risk| request_risks.contains(risk)) {
+            return Ok(false);
+        }
+    }
     if let Some(tools) = &rule.tools {
         let mut matched = false;
         for pattern in tools {
@@ -492,9 +667,44 @@ fn is_high_risk_path(path: &Path) -> bool {
         .to_ascii_lowercase();
     normalized.contains("/.ssh/")
         || normalized.ends_with("/.ssh")
+        || normalized.contains("/.aws/")
+        || normalized.ends_with("/.aws")
+        || normalized.contains("/.azure/")
+        || normalized.ends_with("/.azure")
+        || normalized.contains("/.gnupg/")
+        || normalized.ends_with("/.gnupg")
+        || normalized.contains("/.kube/")
+        || normalized.ends_with("/.kube")
+        || normalized.contains("/.docker/")
+        || normalized.ends_with("/.docker")
+        || normalized.contains("/.config/opencode/")
+        || normalized.ends_with("/.config/opencode")
+        || normalized.contains("/.local/share/opencode/")
+        || normalized.contains("/.config/gh/hosts.yml")
+        || normalized.contains("/.config/gcloud/")
+        || normalized.contains("/credentials/")
         || file_name == ".env"
         || file_name.starts_with(".env.")
-        || matches!(file_name.as_str(), "id_rsa" | "id_ed25519" | "id_ecdsa")
+        || matches!(
+            file_name.as_str(),
+            "id_rsa"
+                | "id_ed25519"
+                | "id_ecdsa"
+                | ".netrc"
+                | ".npmrc"
+                | ".pypirc"
+                | ".git-credentials"
+                | ".envrc"
+                | ".profile"
+                | ".bashrc"
+                | ".bash_profile"
+                | ".zshrc"
+                | ".zprofile"
+                | "config.fish"
+                | "profile.ps1"
+                | "microsoft.powershell_profile.ps1"
+                | "authorized_keys"
+        )
         || matches!(
             path.extension()
                 .and_then(|value| value.to_str())
@@ -502,6 +712,201 @@ fn is_high_risk_path(path: &Path) -> bool {
                 .as_deref(),
             Some("pem" | "key" | "p12" | "pfx")
         )
+}
+
+/// Returns whether an explicitly selected file is a credential or shell
+/// profile that should never be copied into model input.
+pub fn is_protected_path(path: &Path) -> bool {
+    is_high_risk_path(&normalize_path(path))
+}
+
+fn classify_command_risks(command: &str, workspace_root: &Path, risks: &mut Vec<RiskCategory>) {
+    let command = command.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| command.contains(needle));
+    if has(&[
+        "../",
+        "..\\",
+        "~/",
+        "$home",
+        "$userprofile",
+        "$env:userprofile",
+        "$env:appdata",
+        "%userprofile%",
+        "%appdata%",
+        "/etc/",
+    ]) || command_has_outside_absolute_path(&command, workspace_root)
+    {
+        risks.push(RiskCategory::OutsideWorkspace);
+    }
+    if has(&[
+        ".env",
+        ".ssh",
+        ".aws",
+        ".npmrc",
+        ".netrc",
+        ".pypirc",
+        "id_rsa",
+        "id_ed25519",
+        "credentials",
+        "printenv",
+        "export ",
+        "$env:",
+        "%openai_api_key%",
+        "get-childitem env:",
+        "get-item env:",
+        "dir env:",
+        "get-credential",
+        "credential-manager",
+        ".bashrc",
+        ".zshrc",
+        "profile.ps1",
+    ]) || matches!(command.trim(), "env" | "set")
+        || command.trim_start().starts_with("env ")
+        || command.trim_start().starts_with("set ")
+    {
+        risks.push(RiskCategory::SecretAccess);
+    }
+    if has(&[
+        "npm install",
+        "npm i ",
+        "npm ci",
+        "pnpm install",
+        "pnpm add ",
+        "yarn install",
+        "yarn add ",
+        "bun install",
+        "bun add ",
+        "cargo add ",
+        "cargo install ",
+        "pip install",
+        "pip3 install",
+        "python -m pip install",
+        "python3 -m pip install",
+        "pipx install",
+        "uv add ",
+        "uv tool install ",
+        "uv pip install",
+        "poetry add ",
+        "poetry install",
+        "bundle install",
+        "go get ",
+        "dotnet add package",
+        "gem install ",
+        "composer install",
+        "composer require ",
+        "brew install ",
+        "apt install ",
+        "apt-get install ",
+        "winget install ",
+        "choco install ",
+    ]) {
+        risks.push(RiskCategory::PackageInstall);
+    }
+    if has(&[
+        "curl ",
+        "wget ",
+        "invoke-webrequest",
+        "invoke-restmethod",
+        "irm ",
+        "fetch(",
+        "http://",
+        "https://",
+        "ftp ",
+    ]) {
+        risks.push(RiskCategory::Network);
+    }
+    if has(&[
+        "git add ",
+        "git commit",
+        "git checkout",
+        "git switch",
+        "git branch ",
+        "git reset",
+        "git clean",
+        "git stash",
+        "git merge",
+        "git push",
+        "git pull",
+        "git fetch",
+        "git rebase",
+        "git cherry-pick",
+        "git tag ",
+        "git clone ",
+    ]) {
+        risks.push(RiskCategory::GitMutation);
+        if has(&["git push", "git pull", "git fetch", "git clone"]) {
+            risks.push(RiskCategory::Network);
+        }
+    }
+    if has(&[
+        "rm ",
+        "rmdir ",
+        "del ",
+        "erase ",
+        "remove-item ",
+        "unlink ",
+        "shred ",
+        "format ",
+        "diskpart",
+        "truncate -s 0",
+        "git clean -f",
+        "cargo clean",
+    ]) {
+        risks.push(RiskCategory::Destructive);
+    }
+    if has(&[
+        "bash -c ",
+        "bash -lc ",
+        "sh -c ",
+        "sh -lc ",
+        "cmd /c ",
+        "cmd /k ",
+        "cmd.exe /c ",
+        "cmd.exe /k ",
+        "powershell -command",
+        "powershell -c ",
+        "powershell.exe -command",
+        "powershell.exe -c ",
+        "pwsh -command",
+        "pwsh -c ",
+        "python -c ",
+        "python3 -c ",
+        "node -e ",
+        "eval ",
+        "xargs ",
+        "sudo ",
+    ]) {
+        risks.push(RiskCategory::Process);
+    }
+}
+
+/// Conservatively recognizes explicit absolute paths in command text. This is
+/// a deterministic guardrail, not a shell parser; commands that hide a path in
+/// variables or construct it dynamically remain subject to normal approval.
+fn command_has_outside_absolute_path(command: &str, workspace_root: &Path) -> bool {
+    let workspace = normalize_path(workspace_root);
+    command
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '"' | '\'' | ';' | '|' | '&' | '(' | ')' | '<' | '>' | ','
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .flat_map(|token| {
+            token
+                .split_once('=')
+                .map_or(vec![token], |(_, value)| vec![value])
+        })
+        .map(|token| token.trim_matches(|character| matches!(character, '[' | ']' | '{' | '}')))
+        .any(|token| {
+            let path = Path::new(token);
+            if !path.is_absolute() {
+                return false;
+            }
+            !normalize_path(path).starts_with(&workspace)
+        })
 }
 
 fn is_safe_command(command: &str) -> bool {

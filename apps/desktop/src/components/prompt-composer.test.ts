@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { createElement } from "react";
 import { PromptComposer } from "./prompt-composer";
 import type { ModelSettings, PermissionSettings } from "../lib/settings";
+import type { InputAttachment } from "../lib/rpc";
 
 // The composer's real behaviour, driven through the DOM. Every control it shows
 // is exercised here so a control cannot quietly stop working.
@@ -52,6 +53,7 @@ function setup(overrides: Partial<Parameters<typeof PromptComposer>[0]> = {}) {
   const onSelectModel = vi.fn();
   const onSelectMode = vi.fn();
   const onSelectTaskMode = vi.fn();
+  const onAttachmentsChange = vi.fn();
   const props = {
     value: "",
     onChange,
@@ -76,11 +78,12 @@ function setup(overrides: Partial<Parameters<typeof PromptComposer>[0]> = {}) {
     onChooseWorkspace: vi.fn(),
     size: "landing" as const,
     connected: true,
+    onAttachmentsChange,
     ...overrides,
   };
   render(createElement(PromptComposer, props));
   const textarea = screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
-  return { textarea, onSubmit, onChange, onSelectModel, onSelectMode, onSelectTaskMode, props };
+  return { textarea, onSubmit, onChange, onSelectModel, onSelectMode, onSelectTaskMode, onAttachmentsChange, props };
 }
 
 describe("PromptComposer", () => {
@@ -336,11 +339,30 @@ describe("PromptComposer", () => {
     expect(props.onSelectReasoning).toHaveBeenCalledWith("high");
   });
 
-  it("marks attachment as unavailable rather than offering a dead button", () => {
-    setup();
-    const attach = screen.getByRole("button", { name: /attach files/i }) as HTMLButtonElement;
-    expect(attach.disabled).toBe(true);
-    expect(attach.getAttribute("aria-label")).toContain("not available");
+  it("offers an active attachment picker and passes selected files to the parent", async () => {
+    const { onAttachmentsChange } = setup();
+    const attach = screen.getByRole("button", { name: "Attach files" }) as HTMLButtonElement;
+    expect(attach.disabled).toBe(false);
+    const picker = screen.getByLabelText("Choose attachments") as HTMLInputElement;
+    const note = new File(["error details"], "error.txt", { type: "text/plain" });
+    Object.defineProperty(picker, "files", { configurable: true, value: [note] });
+    fireEvent.change(picker);
+    await waitFor(() => expect(onAttachmentsChange).toHaveBeenCalledWith([
+      { kind: "text", file_name: "error.txt", media_type: "text/plain", text: "error details" },
+    ] satisfies InputAttachment[]));
+  });
+
+  it("submits preselected attachment metadata with the prompt", () => {
+    const attachment: InputAttachment = {
+      kind: "text",
+      file_name: "notes.txt",
+      media_type: "text/plain",
+      text: "Relevant source excerpt",
+    };
+    const { onSubmit, textarea } = setup({ attachments: [attachment] });
+    fireEvent.change(textarea, { target: { value: "Investigate" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSubmit).toHaveBeenCalledWith("Investigate", [attachment]);
   });
 
   it("offers a workspace switch above the textarea", () => {

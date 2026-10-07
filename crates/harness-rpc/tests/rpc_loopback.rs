@@ -22,9 +22,7 @@ use harness_rpc::{
 };
 use harness_session::{EventBus, JsonlSessionStore, SessionStore};
 use harness_tools::{CancellationToken, ToolRegistry};
-use harness_verification::{
-    VerificationCategory, VerificationPlan, VerificationReport, VerificationRequest, Verifier,
-};
+use harness_verification::{VerificationReport, VerificationRequest, Verifier};
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
@@ -461,16 +459,6 @@ fn task(root: &Path, session: Option<SessionId>) -> AgentTask {
         system_instructions: "Use tools safely.".to_owned(),
         workspace: WorkspaceMetadata::default(),
         resume_session: session,
-        verification_plan: Some(VerificationPlan {
-            steps: vec![harness_verification::VerificationStep {
-                category: VerificationCategory::GeneralTest,
-                command: harness_core::CommandSpec {
-                    program: "mock-check".to_owned(),
-                    args: Vec::new(),
-                },
-                source: "deterministic RPC test fixture".to_owned(),
-            }],
-        }),
         ..AgentTask::default()
     }
 }
@@ -1424,7 +1412,7 @@ fn approval_requests_are_resolved_by_the_client() {
             response(None, "approved task complete"),
         ],
     ));
-    let (runtime, _sessions) = setup(root, ExecutionMode::Safe, provider, Arc::clone(&approvals));
+    let (runtime, sessions) = setup(root, ExecutionMode::Safe, provider, Arc::clone(&approvals));
     let (mut client, _address, shutdown, server) = start_server(runtime, approvals);
 
     let created = client.request("session.create", json!({})).unwrap();
@@ -1437,7 +1425,10 @@ fn approval_requests_are_resolved_by_the_client() {
     )
     .unwrap();
     let accepted = client
-        .request("agent.send", json!({"task": task(root, Some(session_id))}))
+        .request(
+            "agent.send",
+            json!({"task": task(root, Some(session_id.clone()))}),
+        )
         .unwrap();
     assert_ok(&accepted);
     let run_id = accepted.result.unwrap()["run_id"]
@@ -1449,6 +1440,13 @@ fn approval_requests_are_resolved_by_the_client() {
     for _ in 0..100 {
         if let ServerMessage::Notification(notification) = client.receive().unwrap() {
             if notification.method == "approval.request" {
+                assert_eq!(notification.params["tool"]["name"], "write_file");
+                assert_eq!(
+                    notification.params["tool"]["arguments"]["path"],
+                    "approved.txt"
+                );
+                assert_eq!(notification.params["risk_categories"][0], "PROJECT_WRITE");
+                assert!(notification.params["reason"].is_string());
                 approval_id = Some(
                     notification.params["approval_id"]
                         .as_str()
@@ -1480,6 +1478,16 @@ fn approval_requests_are_resolved_by_the_client() {
     }
     assert!(completed);
     assert!(root.join("approved.txt").is_file());
+    let persisted = sessions.load(&session_id).unwrap();
+    assert!(persisted.events.iter().any(|event| matches!(
+        &event.payload,
+        harness_session::EventPayload::PolicyDecision {
+            tool,
+            action,
+            risk_categories,
+            ..
+        } if tool == "write_file" && action == "ask" && risk_categories == &["PROJECT_WRITE"]
+    )));
     drop(client);
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     server.join().unwrap();

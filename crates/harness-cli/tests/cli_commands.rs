@@ -129,6 +129,51 @@ fn piped_plain_run_keeps_the_existing_human_readable_output() {
 }
 
 #[test]
+fn run_accepts_text_attachments_and_preserves_json_output() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let attachment = root.join("error-notes.txt");
+    fs::write(&attachment, "Observed error: expected 200, received 500").unwrap();
+    let output = cli(
+        root,
+        &[
+            "--json",
+            "--yes",
+            "run",
+            "Investigate the attached error",
+            "--attach",
+            &attachment.to_string_lossy(),
+        ],
+    );
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout
+        .lines()
+        .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()));
+    assert!(stdout.contains("completed"));
+}
+
+#[test]
+fn run_rejects_credential_attachments_before_starting_runtime() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    let attachment = root.join(".env.local");
+    fs::write(&attachment, "API_KEY=do-not-send").unwrap();
+    let output = cli(
+        root,
+        &[
+            "run",
+            "inspect configuration",
+            "--attach",
+            &attachment.to_string_lossy(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("credential and shell-profile files cannot be attached"));
+}
+
+#[test]
 fn no_subcommand_keeps_the_legacy_workspace_summary() {
     let temporary = tempdir().unwrap();
     let output = cli(temporary.path(), &[]);
@@ -242,6 +287,8 @@ fn active_cli_run_reconnects_after_runtime_is_stopped_without_replaying_task() {
     let mut child = cli_child(
         root,
         &[
+            "--log-level",
+            "debug",
             "--json",
             "--yes",
             "run",
@@ -269,10 +316,12 @@ fn active_cli_run_reconnects_after_runtime_is_stopped_without_replaying_task() {
     let deadline = std::time::Instant::now() + Duration::from_secs(35);
     let mut session_id = None;
     let mut reached_verification = false;
+    let mut observed_events = Vec::new();
     while std::time::Instant::now() < deadline {
         let Ok(line) = event_receiver.recv_timeout(Duration::from_millis(250)) else {
             continue;
         };
+        observed_events.push(line.clone());
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -284,10 +333,22 @@ fn active_cli_run_reconnects_after_runtime_is_stopped_without_replaying_task() {
             break;
         }
     }
-    assert!(
-        reached_verification,
-        "mock run did not reach its delayed verification step"
-    );
+    if !reached_verification {
+        let _ = child.kill();
+        let _ = child.wait();
+        let stderr = stderr_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|_| "<stderr did not close>".to_owned());
+        let tail = observed_events
+            .iter()
+            .rev()
+            .take(12)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!("mock run did not reach its delayed verification step\nrecent events:\n{tail}\nstderr:\n{stderr}");
+    }
     assert!(
         session_id.is_some(),
         "the active session identity should be known before recovery"

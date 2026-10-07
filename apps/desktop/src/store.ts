@@ -16,6 +16,8 @@ import {
   type GitDiff,
   type GitStatusSummary,
   type HarnessEvent,
+  type InputAttachment,
+  type McpSnapshot,
   type RestoreReport,
   type RuntimeStatus,
   type RuntimeConnectionState,
@@ -135,6 +137,8 @@ export interface DesktopStore {
   isStartingTerminal: boolean;
   terminalExit: TerminalExit | null;
   settings: SettingsSnapshot | null;
+  mcpSnapshot: McpSnapshot | null;
+  isLoadingMcp: boolean;
   modelCatalog: ModelCatalog | null;
   isLoadingModelCatalog: boolean;
   isLoadingSettings: boolean;
@@ -155,7 +159,7 @@ export interface DesktopStore {
   refreshSessions: () => Promise<void>;
   createSession: () => Promise<void>;
   resumeSession: (sessionId?: string) => Promise<void>;
-  sendMessage: (text: string) => Promise<void>;
+  sendMessage: (text: string, attachments?: InputAttachment[]) => Promise<boolean>;
   approve: (approvalId: string) => Promise<void>;
   deny: (approvalId: string) => Promise<void>;
   cancel: () => Promise<void>;
@@ -172,6 +176,9 @@ export interface DesktopStore {
   resizeTerminal: (cols: number, rows: number) => Promise<void>;
   closeTerminal: () => Promise<void>;
   refreshSettings: () => Promise<void>;
+  inspectMcp: () => Promise<void>;
+  refreshMcp: (serverId?: string) => Promise<void>;
+  disconnectMcp: (serverId: string) => Promise<void>;
   refreshModelCatalog: (providerId: string) => Promise<boolean>;
   loadModelCatalog: () => Promise<boolean>;
   updateModel: (request: UpdateModelRequest) => Promise<boolean>;
@@ -243,7 +250,13 @@ function eventText(event: HarnessEvent): string {
   return typeof event.payload.data.text === "string" ? event.payload.data.text : "";
 }
 
-function makeTask(workspacePath: string, text: string, sessionId: string, taskMode: TaskMode): AgentTask {
+function makeTask(
+  workspacePath: string,
+  text: string,
+  sessionId: string,
+  taskMode: TaskMode,
+  attachments: InputAttachment[] = [],
+): AgentTask {
   return {
     workspace_root: workspacePath,
     user_task: text,
@@ -257,6 +270,7 @@ function makeTask(workspacePath: string, text: string, sessionId: string, taskMo
     git_status: null,
     verification_plan: null,
     resume_session: sessionId,
+    ...(attachments.length ? { attachments } : {}),
   };
 }
 
@@ -359,6 +373,8 @@ export const useDesktopStore = create<DesktopStore>()(
       isStartingTerminal: false,
       terminalExit: null,
       settings: null,
+      mcpSnapshot: null,
+      isLoadingMcp: false,
       modelCatalog: null,
       isLoadingModelCatalog: false,
       isLoadingSettings: false,
@@ -376,6 +392,8 @@ export const useDesktopStore = create<DesktopStore>()(
           lastError: null,
           isLoadingWorkspace: true,
           modelCatalog: null,
+          mcpSnapshot: null,
+          isLoadingMcp: false,
         });
         try {
           const clientId = await connectRuntime(address, workspacePath, reconnect);
@@ -412,6 +430,8 @@ export const useDesktopStore = create<DesktopStore>()(
             runtimeState: "failed",
             clientId: null,
             isLoadingWorkspace: false,
+            mcpSnapshot: null,
+            isLoadingMcp: false,
             lastError:
               error instanceof RpcTransportError
                 ? error.message
@@ -497,6 +517,8 @@ export const useDesktopStore = create<DesktopStore>()(
           activeRunId: null,
           runPhase: "idle",
           modelCatalog: null,
+          mcpSnapshot: null,
+          isLoadingMcp: false,
         });
       },
 
@@ -521,6 +543,8 @@ export const useDesktopStore = create<DesktopStore>()(
           restoringCheckpointId: null,
           lastRestore: null,
           settings: null,
+          mcpSnapshot: null,
+          isLoadingMcp: false,
           modelCatalog: null,
           isLoadingModelCatalog: false,
           settingsError: null,
@@ -619,19 +643,23 @@ export const useDesktopStore = create<DesktopStore>()(
         }
       },
 
-      sendMessage: async (text) => {
+      sendMessage: async (text, attachments = []) => {
         const { clientId, workspacePath, activeSessionId, activeRunId, taskMode } = get();
-        if (!clientId || !workspacePath || activeRunId || !text.trim()) return;
+        if (!clientId || !workspacePath || activeRunId || (!text.trim() && attachments.length === 0)) return false;
         if (!activeSessionId) await get().createSession();
         const sessionId = get().activeSessionId;
-        if (!sessionId) return;
+        if (!sessionId) return false;
+        const visibleText = [
+          text.trim(),
+          attachments.length ? `Attached files: ${attachments.map(({ file_name }) => file_name).join(", ")}` : "",
+        ].filter(Boolean).join("\n\n");
         const userMessage: ChatMessage = {
           id: `user-${Date.now()}`,
           role: "user",
-          text: text.trim(),
+          text: visibleText,
           createdAt: Date.now(),
         };
-        const title = makeSessionTitle(text);
+        const title = makeSessionTitle(text || attachments.map(({ file_name }) => file_name).join(", "));
         set((state) => ({
           messages: [...state.messages, userMessage],
           composer: "",
@@ -649,11 +677,13 @@ export const useDesktopStore = create<DesktopStore>()(
         }));
         try {
           const response = await requestRuntime<{ run_id: string }>(clientId, "agent.send", {
-            task: makeTask(workspacePath, text, sessionId, taskMode),
+            task: makeTask(workspacePath, visibleText, sessionId, taskMode, attachments),
           });
           set({ activeRunId: expectResult(response).run_id, lastError: null });
+          return true;
         } catch (error) {
           set({ runPhase: "failed", lastError: errorMessage(error) });
+          return false;
         }
       },
 
@@ -841,6 +871,57 @@ export const useDesktopStore = create<DesktopStore>()(
           set({ settings: payload, isLoadingSettings: false, settingsError: null });
         } catch (error) {
           set({ isLoadingSettings: false, settingsError: errorMessage(error) });
+        }
+      },
+
+      inspectMcp: async () => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        set({ isLoadingMcp: true, settingsError: null });
+        try {
+          const snapshot = expectResult(
+            await requestRuntime<McpSnapshot>(clientId, "mcp.inspect", {}),
+          );
+          if (!snapshot || !Array.isArray(snapshot.servers)) {
+            throw new RpcTransportError("runtime returned malformed MCP status", "malformed_event");
+          }
+          set({ mcpSnapshot: snapshot, isLoadingMcp: false, settingsError: null });
+        } catch (error) {
+          set({ isLoadingMcp: false, settingsError: errorMessage(error) });
+        }
+      },
+
+      refreshMcp: async (serverId) => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        set({ isLoadingMcp: true, settingsError: null });
+        try {
+          const snapshot = expectResult(
+            await requestRuntime<McpSnapshot>(clientId, "mcp.refresh", {
+              approved: true,
+              ...(serverId ? { server_id: serverId } : {}),
+            }),
+          );
+          if (!snapshot || !Array.isArray(snapshot.servers)) {
+            throw new RpcTransportError("runtime returned malformed MCP status", "malformed_event");
+          }
+          set({ mcpSnapshot: snapshot, isLoadingMcp: false, settingsError: null });
+        } catch (error) {
+          set({ isLoadingMcp: false, settingsError: errorMessage(error) });
+        }
+      },
+
+      disconnectMcp: async (serverId) => {
+        const { clientId, status } = get();
+        if (!clientId || status !== "connected") return;
+        set({ settingsError: null });
+        try {
+          const snapshot = expectResult(
+            await requestRuntime<McpSnapshot>(clientId, "mcp.disconnect", { server_id: serverId }),
+          );
+          set({ mcpSnapshot: snapshot, settingsError: null });
+        } catch (error) {
+          set({ settingsError: errorMessage(error) });
         }
       },
 
@@ -1090,7 +1171,14 @@ export const useDesktopStore = create<DesktopStore>()(
             set((state) => ({
               approvals: [
                 ...state.approvals.filter((item) => item.approval_id !== approvalId),
-                { approval_id: approvalId, tool: tool as ApprovalRequest["tool"] },
+                {
+                  approval_id: approvalId,
+                  tool: tool as ApprovalRequest["tool"],
+                  risk_categories: Array.isArray(params.risk_categories)
+                    ? params.risk_categories.filter((risk): risk is string => typeof risk === "string")
+                    : [],
+                  reason: typeof params.reason === "string" ? params.reason : "",
+                },
               ],
               toolActivity: state.toolActivity.map((activity, index, all) =>
                 index === all.length - 1 && activity.name === (tool as ApprovalRequest["tool"]).name

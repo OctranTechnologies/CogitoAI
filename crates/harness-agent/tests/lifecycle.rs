@@ -25,6 +25,10 @@ use harness_session::{EventType, HarnessEvent, JsonlSessionStore, Session, Sessi
 use harness_tools::{ProcessRunner, ToolRegistry};
 use harness_verification::{VerificationPlan, VerificationReport, Verifier};
 
+fn workspace_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap()
+}
+
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(root)
@@ -41,7 +45,7 @@ fn git(root: &Path, args: &[&str]) {
 /// A sample repository with a real manifest, so discovery and verification have
 /// something to work with.
 fn sample_repository() -> tempfile::TempDir {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = workspace_tempdir();
     let root = temporary.path();
     git(root, &["init", "--quiet"]);
     git(root, &["config", "user.email", "lifecycle@example.invalid"]);
@@ -610,6 +614,7 @@ fn a_denied_edit_never_reaches_the_filesystem() {
     let context = harness_tools::ToolContext {
         policy: &harness_policy::DenyAllPolicy,
         working_directory: root,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,

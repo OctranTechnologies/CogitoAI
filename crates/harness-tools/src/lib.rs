@@ -1,7 +1,12 @@
+mod background;
 mod customization;
+mod environment;
 mod filesystem;
+mod mcp;
 mod process;
 mod repository_index;
+mod subagent;
+mod web;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,17 +22,35 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
 pub use customization::{available_skills, SkillMetadata};
+pub use environment::{
+    local_execution_environment, ExecutionEnvironment, LocalExecutionEnvironment, WorkspaceSnapshot,
+};
 pub use filesystem::{
     ApplyPatchTool, CreateFileTool, DeleteFileTool, GlobTool, GrepTool, ListDirectoryTool,
     ReadFileTool, RenameFileTool, ReplaceRangeTool, ReplaceTextTool, ShellTool, WriteFileTool,
 };
+pub use harness_mcp::{
+    McpConfig, McpConnectionState, McpError, McpManager, McpResourceDescriptor, McpServerConfig,
+    McpServerSnapshot, McpSnapshot, McpToolDescriptor, McpTransportConfig,
+};
+pub use process::{
+    BackgroundProcessStatus, ManagedProcessInfo, ProcessLogBatch, ProcessManager,
+    ProcessStatusSink, ProcessWaitResult,
+};
 pub use process::{
     CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
-    ProcessResult, ProcessRunner,
+    ProcessResult, ProcessRunner, ProcessStartRequest,
 };
 pub use repository_index::{
     IndexedFile, RepositoryAction, RepositoryIndex, RepositoryIndexService, RepositoryTool,
     SymbolDefinition, SymbolKind,
+};
+pub use subagent::{
+    DelegateSubagentsTool, SubagentContext, SubagentContextMetrics, SubagentExecutor,
+    SubagentReport, SubagentRole, SubagentTask,
+};
+pub use web::{
+    HttpWebClient, WebClient, WebError, WebFetchTool, WebPage, WebSearchResult, WebSearchTool,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -100,11 +123,14 @@ pub enum ToolError {
     Io { operation: String, message: String },
     #[error("process execution failed: {message}")]
     Process { message: String },
+    #[error("network request failed: {message}")]
+    Network { message: String },
 }
 
 pub struct ToolContext<'a> {
     pub policy: &'a dyn Policy,
     pub working_directory: &'a std::path::Path,
+    pub execution_environment: &'a dyn ExecutionEnvironment,
     /// Per-run cancellation supplied by the agent loop. Tools which support
     /// interruption should prefer it over their standalone default token.
     pub cancellation: Option<&'a CancellationToken>,
@@ -142,6 +168,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     repository_index: Option<Arc<RepositoryIndexService>>,
+    process_manager: Option<Arc<ProcessManager>>,
     read_revisions: Mutex<BTreeMap<String, String>>,
 }
 
@@ -155,6 +182,45 @@ impl ToolRegistry {
     }
 
     pub fn with_workspace_tools_cancellation(cancellation: CancellationToken) -> Self {
+        Self::with_workspace_tools_and_process_manager(
+            cancellation,
+            Arc::new(ProcessManager::default()),
+        )
+    }
+
+    /// A child-agent tool catalog. It contains workspace reads, repository
+    /// queries, and project instructions/skills only. In particular it has no
+    /// filesystem mutation, process, network, or recursive delegation tools.
+    pub fn with_read_only_workspace_tools() -> Self {
+        let mut registry = Self::new();
+        registry.register(Box::new(ReadFileTool));
+        registry.register(Box::new(ListDirectoryTool));
+        registry.register(Box::new(GlobTool));
+        registry.register(Box::new(GrepTool));
+        registry.register(subagent::read_git_diff_tool());
+        let index = Arc::new(RepositoryIndexService::default());
+        for action in [
+            RepositoryAction::SearchFiles,
+            RepositoryAction::SearchText,
+            RepositoryAction::FindSymbol,
+            RepositoryAction::FindReferences,
+            RepositoryAction::GotoDefinition,
+            RepositoryAction::GetFileOutline,
+            RepositoryAction::GetRepoTree,
+        ] {
+            registry.register(Box::new(RepositoryTool::new(action, Arc::clone(&index))));
+        }
+        registry.repository_index = Some(index);
+        registry.register(Box::new(customization::InstructionsTool));
+        registry.register(Box::new(customization::ListSkillsTool));
+        registry.register(Box::new(customization::LoadSkillTool));
+        registry
+    }
+
+    pub fn with_workspace_tools_and_process_manager(
+        cancellation: CancellationToken,
+        process_manager: Arc<ProcessManager>,
+    ) -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(ReadFileTool));
         registry.register(Box::new(CreateFileTool));
@@ -167,10 +233,23 @@ impl ToolRegistry {
         registry.register(Box::new(ListDirectoryTool));
         registry.register(Box::new(GlobTool));
         registry.register(Box::new(GrepTool));
-        registry.register(Box::new(ShellTool::new(
-            Arc::new(LocalProcessRunner),
-            cancellation,
-        )));
+        registry.register(Box::new(ShellTool::with_cancellation(cancellation.clone())));
+        registry.register(Box::new(
+            ShellTool::with_cancellation(cancellation).named("run_command"),
+        ));
+        for action in [
+            background::ProcessToolAction::Start,
+            background::ProcessToolAction::ReadOutput,
+            background::ProcessToolAction::List,
+            background::ProcessToolAction::Stop,
+            background::ProcessToolAction::WaitForOutput,
+        ] {
+            registry.register(Box::new(background::BackgroundProcessTool::new(
+                Arc::clone(&process_manager),
+                action,
+            )));
+        }
+        registry.process_manager = Some(process_manager);
         let index = Arc::new(RepositoryIndexService::default());
         for action in [
             RepositoryAction::SearchFiles,
@@ -188,7 +267,21 @@ impl ToolRegistry {
         registry.register(Box::new(customization::InstructionsTool));
         registry.register(Box::new(customization::ListSkillsTool));
         registry.register(Box::new(customization::LoadSkillTool));
+        let web_client: Arc<dyn WebClient> = Arc::new(HttpWebClient);
+        registry.register(Box::new(WebSearchTool::new(Arc::clone(&web_client))));
+        registry.register(Box::new(WebFetchTool::new(web_client)));
         registry
+    }
+
+    pub fn process_manager(&self) -> Option<Arc<ProcessManager>> {
+        self.process_manager.as_ref().map(Arc::clone)
+    }
+
+    /// Adds a small lazy MCP tool surface. Remote definitions are fetched only
+    /// when the model explicitly searches for an integration capability.
+    pub fn with_mcp_manager(mut self, manager: Arc<McpManager>) -> Self {
+        mcp::register_mcp_tools(&mut self, manager);
+        self
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
@@ -247,6 +340,11 @@ impl ToolRegistry {
             rule: evaluation.rule.clone(),
             operation: policy_request.operation_name().to_owned(),
             mode: format!("{:?}", policy_request.mode).to_ascii_lowercase(),
+            risk_categories: policy_request
+                .risk_categories()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         });
         match evaluation.decision {
             PolicyDecision::Deny => {
@@ -284,6 +382,11 @@ impl ToolRegistry {
                         rule: destination_evaluation.rule.clone(),
                         operation: destination_request.operation_name().to_owned(),
                         mode: format!("{:?}", destination_request.mode).to_ascii_lowercase(),
+                        risk_categories: destination_request
+                            .risk_categories()
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
                     });
                     match destination_evaluation.decision {
                         PolicyDecision::Deny => {
@@ -682,7 +785,10 @@ fn event_arguments(arguments: &serde_json::Value) -> BTreeMap<String, String> {
                         serde_json::Value::String(text) => text.clone(),
                         other => other.to_string(),
                     };
-                    (name.clone(), concise_event_value(&rendered))
+                    (
+                        name.clone(),
+                        concise_event_value(&harness_core::redact_sensitive(&rendered)),
+                    )
                 })
                 .collect()
         })

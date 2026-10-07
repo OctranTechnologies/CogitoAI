@@ -36,6 +36,7 @@ import { LandingView } from "./components/landing-view";
 import { SessionWorkspace } from "./components/session-workspace";
 import type { InspectorTab } from "./components/inspector";
 import type { SettingsScreen } from "./lib/settings";
+import type { InputAttachment } from "./lib/rpc";
 import { readStoredRailTarget, storeRailTarget } from "./lib/shell-prefs";
 import { groupSessionsByWorkspace, sortSessionsByRecent, type SidebarProject } from "./lib/sidebar-model";
 import {
@@ -69,6 +70,7 @@ function App() {
   const [settingsScreen, setSettingsScreen] = useState<SettingsScreen>("models");
   const [connectProviderId, setConnectProviderId] = useState<string | null>(null);
   const [pendingMode, setPendingMode] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<InputAttachment[]>([]);
   const {
     status,
     runtimeState,
@@ -152,6 +154,10 @@ function App() {
     void connect(address, workspacePath);
   }, [address, connect, status, workspacePath]);
 
+  useEffect(() => {
+    setAttachments([]);
+  }, [workspacePath]);
+
   const connected = status === "connected";
   const running = runPhase === "pending" || runPhase === "running" || runPhase === "cancelling";
   // The landing screen is for "no conversation selected". A session that exists
@@ -221,8 +227,8 @@ function App() {
    * button all funnel through the same path; the form event is only used to stop
    * the browser navigating on a native submit.
    */
-  const submitPrompt = useCallback(async (text: string) => {
-    await sendMessage(text);
+  const submitPrompt = useCallback(async (text: string, submittedAttachments: InputAttachment[] = []) => {
+    if (await sendMessage(text, submittedAttachments)) setAttachments([]);
   }, [sendMessage]);
 
   async function selectModel(provider: string, model: string) {
@@ -313,9 +319,9 @@ function App() {
       } else if (matchesDesktopShortcut(event, "submitPrompt")) {
         const target = event.target;
         if (target instanceof HTMLElement && target.closest('[aria-label="Message the agent"]')) return;
-        if (composer.trim() && connected && !running && workspacePath) {
+        if ((composer.trim() || attachments.length > 0) && connected && !running && workspacePath) {
           event.preventDefault();
-          void submitPrompt(composer);
+          void submitPrompt(composer, attachments);
         }
       }
     };
@@ -323,6 +329,7 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     composer,
+    attachments,
     connected,
     createSession,
     isLoadingSession,
@@ -475,6 +482,8 @@ function App() {
                 value: composer,
                 onChange: setComposer,
                 onSubmit: submitPrompt,
+                attachments,
+                onAttachmentsChange: setAttachments,
                 onCancel: cancel,
                 workspacePath,
                 onChooseWorkspace: chooseWorkspace,
@@ -520,6 +529,8 @@ function App() {
               value={composer}
               onChange={setComposer}
               onSubmit={submitPrompt}
+              attachments={attachments}
+              onAttachmentsChange={setAttachments}
               disabled={!connected || running || !workspacePath}
               running={running}
               onCancel={cancel}

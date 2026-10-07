@@ -179,6 +179,7 @@ impl ContextAssembly {
     }
 }
 
+#[derive(Clone)]
 pub struct ContextBuilder {
     budget_manager: ContextBudgetManager,
 }
@@ -405,7 +406,9 @@ impl ContextBuilder {
             let is_failure = result.result.is_error
                 || result.name == "task_completion_check"
                 || (result.name == "verification" && result.result.output.contains("passed=false"));
-            let priority = if is_failure || result.name == "read_file" {
+            let priority = if is_failure {
+                1
+            } else if result.name == "read_file" {
                 2
             } else if result.is_shell {
                 5
@@ -428,7 +431,11 @@ impl ContextBuilder {
                     source: result.name.clone(),
                     reason: ContextReason::RelevantToolResult,
                     content,
-                    required: false,
+                    // Keep at least the identifying diagnostics when the
+                    // context budget is tight. `add_item` truncates required
+                    // candidates to the remaining budget instead of dropping
+                    // them, which is preferable to losing a fresh failure.
+                    required: is_failure,
                     limit: Some(if result.is_shell {
                         ContextLimit::ShellOutputSize
                     } else {

@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,8 +10,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
-    ProcessRunner, Tool, ToolContext, ToolError, ToolRequest, ToolResult, ToolSpec,
+    CancellationToken, ProcessError, ProcessEvent, ProcessRequest, ProcessRunner, Tool,
+    ToolContext, ToolError, ToolRequest, ToolResult, ToolSpec,
 };
 
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -25,15 +24,17 @@ const MAX_SCAN_DEPTH: usize = 16;
 static EDIT_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct ShellTool {
-    runner: Arc<dyn ProcessRunner>,
+    runner: Option<Arc<dyn ProcessRunner>>,
     cancellation: CancellationToken,
+    name: &'static str,
 }
 
 impl Default for ShellTool {
     fn default() -> Self {
         Self {
-            runner: Arc::new(LocalProcessRunner),
+            runner: None,
             cancellation: CancellationToken::new(),
+            name: "shell",
         }
     }
 }
@@ -41,9 +42,23 @@ impl Default for ShellTool {
 impl ShellTool {
     pub fn new(runner: Arc<dyn ProcessRunner>, cancellation: CancellationToken) -> Self {
         Self {
-            runner,
+            runner: Some(runner),
             cancellation,
+            name: "shell",
         }
+    }
+
+    pub fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self {
+            runner: None,
+            cancellation,
+            name: "shell",
+        }
+    }
+
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -54,7 +69,7 @@ impl ShellTool {
 impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "shell".to_owned(),
+            name: self.name.to_owned(),
             description: "Run an explicitly approved command in the workspace shell".to_owned(),
             arguments_schema: json!({
                 "type": "object",
@@ -88,7 +103,8 @@ impl Tool for ShellTool {
         let shell = optional_string(&request, "shell", "auto")?.to_ascii_lowercase();
         let (program, args) = shell_invocation(&shell, &command_text)?;
         let working_directory = optional_string(&request, "working_directory", ".")?;
-        let (_root, working_directory) = resolve_existing(context, &working_directory, "shell")?;
+        let (workspace_root, working_directory) =
+            resolve_existing(context, &working_directory, "shell")?;
         let timeout_ms = optional_u64(&request, "timeout_ms", 30_000, 1, 600_000, "shell")?;
         let max_output_bytes = optional_usize(
             &request,
@@ -107,21 +123,29 @@ impl Tool for ShellTool {
             max_output_bytes,
         };
         let cancellation = context.cancellation.unwrap_or(&self.cancellation);
-        let result = self
-            .runner
-            .execute(request, cancellation, &mut |event| {
-                emit_process_event(
-                    context,
-                    &event,
-                    &command_text,
-                    &event_working_directory,
-                    timeout_ms,
-                );
-                Ok(())
-            })
-            .map_err(|error: ProcessError| ToolError::Process {
-                message: error.to_string(),
-            })?;
+        let mut on_event = |event| {
+            emit_process_event(
+                context,
+                &event,
+                &command_text,
+                &event_working_directory,
+                timeout_ms,
+            );
+            Ok(())
+        };
+        let result = if let Some(runner) = &self.runner {
+            runner.execute(request, cancellation, &mut on_event)
+        } else {
+            context.execution_environment.spawn_process(
+                &workspace_root,
+                request,
+                cancellation,
+                &mut on_event,
+            )
+        }
+        .map_err(|error: ProcessError| ToolError::Process {
+            message: error.to_string(),
+        })?;
         let mut output = String::new();
         if !result.stdout.is_empty() {
             output.push_str("stdout:\n");
@@ -237,7 +261,13 @@ impl Tool for ReadFileTool {
         } else {
             MAX_FILE_BYTES
         };
-        let (bytes, full_text) = read_text_snapshot(&resolved, "read_file", read_limit)?;
+        let (bytes, full_text) = read_text_snapshot(
+            context.execution_environment,
+            &root,
+            &resolved,
+            "read_file",
+            read_limit,
+        )?;
         let text = if let (Some(start), Some(end)) = (start, end) {
             if end < start {
                 return Err(invalid_arguments(
@@ -334,7 +364,12 @@ impl Tool for WriteFileTool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original = if resolved.exists() {
-            Some(load_editable(&resolved, "write_file")?)
+            Some(load_editable(
+                context.execution_environment,
+                &root,
+                &resolved,
+                "write_file",
+            )?)
         } else {
             None
         };
@@ -358,14 +393,22 @@ impl Tool for WriteFileTool {
         let bom = original.as_ref().is_some_and(|value| value.bom);
         let content = encode_new_text(&content, eol, bom);
         ensure_edit_not_cancelled(context)?;
-        if let Some(parent) = resolved.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| io_error("create parent directory", error))?;
-        }
+        let relative =
+            resolved
+                .strip_prefix(&root)
+                .map_err(|_| ToolError::PathOutsideWorkspace {
+                    path: resolved.clone(),
+                })?;
         let committed = if let Some(snapshot) = expected_snapshot.as_deref() {
-            atomic_replace(&resolved, Some(snapshot), content.as_bytes())?
+            context
+                .execution_environment
+                .write_workspace_file_atomic(&root, relative, Some(snapshot), content.as_bytes())
+                .map_err(|error| io_error("atomically replace file", error))?
         } else {
-            atomic_create(&resolved, content.as_bytes())?
+            context
+                .execution_environment
+                .create_workspace_file_atomic(&root, relative, content.as_bytes())
+                .map_err(|error| io_error("atomically create file", error))?
         };
         if !committed {
             return Ok(conflict_result(
@@ -477,11 +520,16 @@ impl Tool for CreateFileTool {
             ));
         }
         ensure_edit_not_cancelled(context)?;
-        if let Some(parent) = resolved.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| io_error("create parent directory", error))?;
-        }
-        atomic_create(&resolved, content.as_bytes())?;
+        let relative =
+            resolved
+                .strip_prefix(&root)
+                .map_err(|_| ToolError::PathOutsideWorkspace {
+                    path: resolved.clone(),
+                })?;
+        context
+            .execution_environment
+            .create_workspace_file_atomic(&root, relative, content.as_bytes())
+            .map_err(|error| io_error("atomically create file", error))?;
         context.emit(harness_session::EventPayload::FileChanged {
             path: resolved.clone(),
             change: harness_session::FileChange::Added,
@@ -558,7 +606,12 @@ impl Tool for ReplaceRangeTool {
         let _guard = EDIT_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original = load_editable(&resolved, "replace_range")?;
+        let original = load_editable(
+            context.execution_environment,
+            &root,
+            &resolved,
+            "replace_range",
+        )?;
         if let Some(conflict) = stale_revision(&request, &root, &resolved, &original) {
             return Ok(conflict);
         }
@@ -623,11 +676,27 @@ impl Tool for DeleteFileTool {
         let _guard = EDIT_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original = load_editable(&resolved, "delete_file")?;
+        let original = load_editable(
+            context.execution_environment,
+            &root,
+            &resolved,
+            "delete_file",
+        )?;
         if let Some(conflict) = stale_revision(&request, &root, &resolved, &original) {
             return Ok(conflict);
         }
-        if read_limited(&resolved, "verify delete", MAX_EDIT_FILE_BYTES)? != original.raw {
+        ensure_edit_not_cancelled(context)?;
+        let relative =
+            resolved
+                .strip_prefix(&root)
+                .map_err(|_| ToolError::PathOutsideWorkspace {
+                    path: resolved.clone(),
+                })?;
+        if !context
+            .execution_environment
+            .delete_workspace_file(&root, relative, &original.raw)
+            .map_err(|error| io_error("delete file", error))?
+        {
             return Ok(conflict_result(
                 &root,
                 &resolved,
@@ -635,8 +704,6 @@ impl Tool for DeleteFileTool {
                 "The file changed during deletion. No change was made.",
             ));
         }
-        ensure_edit_not_cancelled(context)?;
-        fs::remove_file(&resolved).map_err(|error| io_error("delete file", error))?;
         context.emit(harness_session::EventPayload::FileChanged {
             path: resolved.clone(),
             change: harness_session::FileChange::Deleted,
@@ -679,7 +746,7 @@ impl Tool for RenameFileTool {
         let _guard = EDIT_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original = load_editable(&from, "rename_file")?;
+        let original = load_editable(context.execution_environment, &root, &from, "rename_file")?;
         if let Some(conflict) = stale_revision(&request, &root, &from, &original) {
             return Ok(conflict);
         }
@@ -691,20 +758,25 @@ impl Tool for RenameFileTool {
                 "The destination already exists.",
             ));
         }
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| io_error("create move destination", error))?;
-        }
-        if read_limited(&from, "verify move", MAX_EDIT_FILE_BYTES)? != original.raw {
+        ensure_edit_not_cancelled(context)?;
+        let from_relative = from
+            .strip_prefix(&root)
+            .map_err(|_| ToolError::PathOutsideWorkspace { path: from.clone() })?;
+        let to_relative = to
+            .strip_prefix(&root)
+            .map_err(|_| ToolError::PathOutsideWorkspace { path: to.clone() })?;
+        if !context
+            .execution_environment
+            .move_workspace_file(&root, from_relative, to_relative, &original.raw)
+            .map_err(|error| io_error("move file", error))?
+        {
             return Ok(conflict_result(
                 &root,
                 &from,
                 "concurrent_modification",
-                "The source changed while preparing the move.",
+                "The source changed or destination appeared while preparing the move.",
             ));
         }
-        ensure_edit_not_cancelled(context)?;
-        fs::rename(&from, &to).map_err(|error| io_error("move file", error))?;
         context.emit(harness_session::EventPayload::FileChanged {
             path: from.clone(),
             change: harness_session::FileChange::Deleted,
@@ -889,7 +961,7 @@ impl Tool for GrepTool {
         let filter = optional_string(&request, "glob", "*")?;
         let limit = optional_limit(&request, "max_results", MAX_RESULTS)?;
         let case_sensitive = optional_bool(&request, "case_sensitive", true)?;
-        let (_root, base) = resolve_existing(context, &path, "grep")?;
+        let (workspace_root, base) = resolve_existing(context, &path, "grep")?;
         let matcher = Glob::new(&filter)
             .map_err(|error| invalid_arguments("grep", &error.to_string()))?
             .compile_matcher();
@@ -907,7 +979,12 @@ impl Tool for GrepTool {
             if !matcher.is_match(&relative) {
                 continue;
             }
-            let Ok(contents) = read_text(&file, "grep") else {
+            let Ok(contents) = read_text(
+                context.execution_environment,
+                &workspace_root,
+                &file,
+                "grep",
+            ) else {
                 continue;
             };
             for (line_number, line) in contents.lines().enumerate() {
@@ -941,7 +1018,10 @@ impl Tool for GrepTool {
     }
 }
 
-fn shell_invocation(shell: &str, command: &str) -> Result<(&'static str, Vec<String>), ToolError> {
+pub(crate) fn shell_invocation(
+    shell: &str,
+    command: &str,
+) -> Result<(&'static str, Vec<String>), ToolError> {
     match shell {
         "auto" => {
             #[cfg(windows)]
@@ -1128,7 +1208,7 @@ fn io_error(operation: &str, error: std::io::Error) -> ToolError {
     }
 }
 
-fn resolve_existing(
+pub(crate) fn resolve_existing(
     context: &ToolContext<'_>,
     relative: &str,
     tool: &str,
@@ -1217,7 +1297,12 @@ pub(crate) fn content_revision(bytes: &[u8]) -> String {
     format!("sha256:{digest:x}")
 }
 
-fn load_editable(path: &Path, tool: &str) -> Result<EditableFile, ToolError> {
+fn load_editable(
+    environment: &dyn super::ExecutionEnvironment,
+    root: &Path,
+    path: &Path,
+    tool: &str,
+) -> Result<EditableFile, ToolError> {
     let metadata = fs::metadata(path).map_err(|error| io_error("inspect editable file", error))?;
     if !metadata.is_file() {
         return Err(ToolError::NotFile {
@@ -1230,7 +1315,7 @@ fn load_editable(path: &Path, tool: &str) -> Result<EditableFile, ToolError> {
             limit: MAX_EDIT_FILE_BYTES,
         });
     }
-    let raw = read_limited(path, tool, MAX_EDIT_FILE_BYTES)?;
+    let raw = read_limited(environment, root, path, tool, MAX_EDIT_FILE_BYTES)?;
     if raw.contains(&0) {
         return Err(ToolError::BinaryFile {
             path: path.to_path_buf(),
@@ -1347,7 +1432,7 @@ fn replace_exact(
     let _guard = EDIT_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let original = load_editable(&path, tool)?;
+    let original = load_editable(context.execution_environment, &root, &path, tool)?;
     if let Some(conflict) = stale_revision(request, &root, &path, &original) {
         return Ok(conflict);
     }
@@ -1405,7 +1490,16 @@ fn commit_existing(
     ensure_edit_not_cancelled(context)?;
     let new_text = encode_new_text(&updated_text, &original.eol, original.bom);
     let new_bytes = new_text.as_bytes();
-    if !atomic_replace(path, Some(&original.raw), new_bytes)? {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| ToolError::PathOutsideWorkspace {
+            path: path.to_path_buf(),
+        })?;
+    if !context
+        .execution_environment
+        .write_workspace_file_atomic(root, relative, Some(&original.raw), new_bytes)
+        .map_err(|error| io_error("atomically replace file", error))?
+    {
         return Ok(conflict_result(
             root,
             path,
@@ -1432,57 +1526,6 @@ fn ensure_edit_not_cancelled(context: &ToolContext<'_>) -> Result<(), ToolError>
         })
     } else {
         Ok(())
-    }
-}
-
-fn atomic_replace(path: &Path, expected: Option<&[u8]>, bytes: &[u8]) -> Result<bool, ToolError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_arguments("edit", "target has no parent directory"))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| io_error("create atomic temporary file", error))?;
-    temporary
-        .write_all(bytes)
-        .map_err(|error| io_error("write atomic temporary file", error))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| io_error("flush atomic temporary file", error))?;
-    if let Ok(metadata) = fs::metadata(path) {
-        temporary
-            .as_file()
-            .set_permissions(metadata.permissions())
-            .map_err(|error| io_error("preserve file permissions", error))?;
-    }
-    if let Some(expected) = expected {
-        match read_limited(path, "verify atomic edit", MAX_EDIT_FILE_BYTES) {
-            Ok(current) if current == expected => {}
-            _ => return Ok(false),
-        }
-    }
-    temporary
-        .persist(path)
-        .map_err(|error| io_error("atomically replace file", error.error))?;
-    Ok(true)
-}
-
-fn atomic_create(path: &Path, bytes: &[u8]) -> Result<bool, ToolError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid_arguments("create_file", "target has no parent directory"))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| io_error("create atomic temporary file", error))?;
-    temporary
-        .write_all(bytes)
-        .map_err(|error| io_error("write atomic temporary file", error))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| io_error("flush atomic temporary file", error))?;
-    match temporary.persist_noclobber(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(io_error("atomically create file", error.error)),
     }
 }
 
@@ -1682,11 +1725,23 @@ fn required_line(request: &ToolRequest, key: &str, tool: &str) -> Result<usize, 
         .ok_or_else(|| invalid_arguments(tool, &format!("{key} must be a positive integer")))
 }
 
-fn read_text(path: &Path, tool: &str) -> Result<String, ToolError> {
-    read_text_snapshot(path, tool, MAX_FILE_BYTES).map(|(_, text)| text)
+fn read_text(
+    environment: &dyn super::ExecutionEnvironment,
+    workspace_root: &Path,
+    path: &Path,
+    tool: &str,
+) -> Result<String, ToolError> {
+    read_text_snapshot(environment, workspace_root, path, tool, MAX_FILE_BYTES)
+        .map(|(_, text)| text)
 }
 
-fn read_text_snapshot(path: &Path, tool: &str, limit: u64) -> Result<(Vec<u8>, String), ToolError> {
+fn read_text_snapshot(
+    environment: &dyn super::ExecutionEnvironment,
+    workspace_root: &Path,
+    path: &Path,
+    tool: &str,
+    limit: u64,
+) -> Result<(Vec<u8>, String), ToolError> {
     if !path.is_file() {
         return Err(ToolError::NotFile {
             path: path.to_path_buf(),
@@ -1698,7 +1753,7 @@ fn read_text_snapshot(path: &Path, tool: &str, limit: u64) -> Result<(Vec<u8>, S
             limit,
         });
     }
-    let bytes = read_limited(path, tool, limit)?;
+    let bytes = read_limited(environment, workspace_root, path, tool, limit)?;
     if bytes.contains(&0) {
         return Err(ToolError::BinaryFile {
             path: path.to_path_buf(),
@@ -1711,20 +1766,30 @@ fn read_text_snapshot(path: &Path, tool: &str, limit: u64) -> Result<(Vec<u8>, S
     Ok((bytes, text))
 }
 
-fn read_limited(path: &Path, tool: &str, limit: u64) -> Result<Vec<u8>, ToolError> {
-    let file =
-        fs::File::open(path).map_err(|error| io_error(&format!("read {tool} file"), error))?;
-    let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error(&format!("read {tool} file"), error))?;
-    if bytes.len() as u64 > limit {
-        return Err(ToolError::FileTooLarge {
-            path: path.to_path_buf(),
-            limit,
-        });
-    }
-    Ok(bytes)
+fn read_limited(
+    environment: &dyn super::ExecutionEnvironment,
+    workspace_root: &Path,
+    path: &Path,
+    tool: &str,
+    limit: u64,
+) -> Result<Vec<u8>, ToolError> {
+    let relative =
+        path.strip_prefix(workspace_root)
+            .map_err(|_| ToolError::PathOutsideWorkspace {
+                path: path.to_path_buf(),
+            })?;
+    environment
+        .read_workspace_file(workspace_root, relative, limit)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                ToolError::FileTooLarge {
+                    path: path.to_path_buf(),
+                    limit,
+                }
+            } else {
+                io_error(&format!("read {tool} file"), error)
+            }
+        })
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -1802,6 +1867,7 @@ fn truncate_line(line: &str) -> &str {
 #[cfg(test)]
 mod editing_engine_tests {
     use super::*;
+    use crate::ExecutionEnvironment;
     use tempfile::tempdir;
 
     #[test]
@@ -1812,7 +1878,14 @@ mod editing_engine_tests {
         let snapshot = fs::read(&path).unwrap();
         fs::write(&path, "concurrent version\n").unwrap();
 
-        assert!(!atomic_replace(&path, Some(&snapshot), b"agent version\n").unwrap());
+        assert!(!super::super::local_execution_environment()
+            .write_workspace_file_atomic(
+                temporary.path(),
+                Path::new("source.txt"),
+                Some(&snapshot),
+                b"agent version\n",
+            )
+            .unwrap());
         assert_eq!(fs::read_to_string(path).unwrap(), "concurrent version\n");
     }
 }

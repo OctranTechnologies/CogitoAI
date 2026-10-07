@@ -505,6 +505,10 @@ pub fn reconstruct_state(
             | EventPayload::ToolOutput { .. }
             | EventPayload::ToolCompleted { .. }
             | EventPayload::ToolFailed { .. } => state.tool_events += 1,
+            EventPayload::SubagentStarted { .. }
+            | EventPayload::SubagentCompleted { .. }
+            | EventPayload::SubagentFailed { .. }
+            | EventPayload::SubagentLinked { .. } => {}
             EventPayload::FileChanged { .. } => state.files_changed += 1,
             EventPayload::CheckpointCreated { .. } => state.checkpoints_created += 1,
             EventPayload::CheckpointRestored { .. } => {}
@@ -545,6 +549,8 @@ pub fn reconstruct_state(
             | EventPayload::ProcessStdout { .. }
             | EventPayload::ProcessStderr { .. }
             | EventPayload::ProcessExited { .. }
+            | EventPayload::BackgroundProcessStarted { .. }
+            | EventPayload::BackgroundProcessStatus { .. }
             | EventPayload::PolicyDecision { .. } => {}
         }
         state.last_event_id = Some(event.event_id.clone());

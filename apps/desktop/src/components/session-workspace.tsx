@@ -7,7 +7,7 @@ import { TerminalPanel } from "./terminal-panel";
 import { buildActivityStream, summariseStream, type ActivityBlock } from "../lib/activity";
 import { useAutoScroll } from "../lib/auto-scroll";
 import type { ModelDescriptor, ModelSettings, PermissionSettings, ProviderCredentialStatus } from "../lib/settings";
-import type { HarnessEvent, TaskMode, TaskRunSnapshot } from "../lib/rpc";
+import type { HarnessEvent, InputAttachment, TaskMode, TaskRunSnapshot } from "../lib/rpc";
 import type { CheckpointEntry, ChangeEntry, FileChange, FileView } from "../lib/changes";
 import type { RunPhase } from "../lib/events";
 
@@ -32,7 +32,9 @@ export interface SessionWorkspaceProps {
   composer: {
     value: string;
     onChange: (value: string) => void;
-    onSubmit: (value: string) => void;
+    onSubmit: (value: string, attachments?: InputAttachment[]) => void | Promise<void>;
+    attachments?: InputAttachment[];
+    onAttachmentsChange?: (attachments: InputAttachment[]) => void;
     onCancel: () => void;
     workspacePath: string;
     onChooseWorkspace: () => void;
@@ -190,6 +192,8 @@ export function SessionWorkspace(props: SessionWorkspaceProps) {
                 workspacePath={props.composer.workspacePath}
                 onChooseWorkspace={props.composer.onChooseWorkspace}
                 connected={props.connected}
+                attachments={props.composer.attachments}
+                onAttachmentsChange={props.composer.onAttachmentsChange}
               />
             </div>
           </div>

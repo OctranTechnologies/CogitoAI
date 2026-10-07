@@ -7,6 +7,7 @@ import {
   FileCode2,
   GitBranch,
   ShieldAlert,
+  Terminal,
 } from "lucide-react";
 import {
   type ActivityBlock,
@@ -127,8 +128,16 @@ export function ToolRow({
       </div>
 
       {waiting ? (
-        <div className="mt-1 flex items-center gap-2 pl-8">
-          <span className="text-2xs text-warning">Approve to continue</span>
+        <div className="mt-1 space-y-1 pl-8">
+          <p className="whitespace-pre-wrap break-words rounded bg-panel/70 px-2 py-1 font-mono text-2xs text-secondary">
+            {JSON.stringify(visibleArguments(block.arguments), null, 2)}
+          </p>
+          {block.approvalRisks.length > 0 ? (
+            <p className="text-2xs text-faint">Risk: {block.approvalRisks.join(" · ")}</p>
+          ) : null}
+          {block.approvalReason ? <p className="text-2xs text-faint">{block.approvalReason}</p> : null}
+          <div className="flex items-center gap-2">
+          <span className="text-2xs text-warning">Approve this action to continue</span>
           <button
             type="button"
             onClick={() => onApprove(block.approvalId!)}
@@ -143,6 +152,7 @@ export function ToolRow({
           >
             Deny
           </button>
+          </div>
         </div>
       ) : null}
 
@@ -281,7 +291,11 @@ function ErrorRow({ block }: { block: ErrorBlock }) {
 function NoticeRow({ block }: { block: NoticeBlock }) {
   return (
     <div className="flex items-center gap-2 px-2 py-1 text-2xs text-faint" data-testid={`notice-${block.id}`}>
-      <GitBranch className="size-icon-xs shrink-0 opacity-60" />
+      {block.reference?.startsWith("proc-") ? (
+        <Terminal className="size-icon-xs shrink-0 opacity-60" />
+      ) : (
+        <GitBranch className="size-icon-xs shrink-0 opacity-60" />
+      )}
       <span>{block.label}</span>
       {block.detail ? <span className="truncate opacity-80">{block.detail}</span> : null}
     </div>
@@ -317,6 +331,10 @@ function ApprovalRow({
           ))}
         </dl>
       ) : null}
+      {block.risks.length > 0 ? (
+        <p className="mb-1 text-2xs text-faint">Risk: {block.risks.join(" · ")}</p>
+      ) : null}
+      {block.reason ? <p className="mb-1 text-2xs text-faint">{block.reason}</p> : null}
       <div className="flex items-center gap-2">
         <button
           type="button"

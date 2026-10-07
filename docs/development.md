@@ -15,10 +15,11 @@ the crates above it in this table and never the reverse.
 | Crate | Responsibility | Depends on |
 | --- | --- | --- |
 | `harness-core` | Shared types (`Error`, `SessionId`, `RunId`, `CheckpointId`, `Timestamp`), workspace discovery, project configuration, instruction loading, logging init | — |
+| `harness-mcp` | MCP client adapters, stdio/Streamable HTTP transports, secret-safe configuration, discovery, bounded results and connection lifecycle | `harness-core`, `rmcp` |
 | `harness-models` | Model boundary: `ModelRequest`, `ModelResponse`, content blocks, tool definitions and calls, streaming deltas, `ModelCapabilities`, `ProviderError`, `ModelProvider` trait, mock and OpenAI providers | `harness-core` |
 | `harness-policy` | `OperationKind`, `Permission`, `ExecutionMode`, `PolicyRule`, `PolicyEngine`, built-in workspace and credential protections | `harness-core` |
 | `harness-session` | Event model, `EventBus`, `SessionStore` trait, `JsonlSessionStore`, compaction records | `harness-core` |
-| `harness-tools` | `Tool` trait, `ToolRegistry`, `ToolContext`, `ToolResult`, filesystem/process tools, `RepositoryIndexService` and repository queries | `harness-core`, `harness-policy`, `harness-session` |
+| `harness-tools` | `Tool` trait, `ToolRegistry`, `ToolContext`, `ToolResult`, filesystem/process tools, lazy MCP meta-tools, `RepositoryIndexService` and repository queries | `harness-core`, `harness-mcp`, `harness-policy`, `harness-session` |
 | `harness-git` | `GitClient`, status and diffs, `Checkpoint`/`CheckpointStore` trait, `ShadowCheckpointStore`, runtime-state path exclusion | `harness-core`, `harness-session` |
 | `harness-context` | Context assembly from workspace description, instructions, and Git state | `harness-core`, `harness-git`, `harness-session`, `harness-tools` |
 | `harness-verification` | `VerificationPlanner`, staged `VerificationPlan`, structured `VerificationFailure`, `Verifier` trait, `CommandVerifier` | `harness-core`, `harness-tools` |
@@ -34,6 +35,10 @@ Non-crate directories:
   events onto state, and `src-tauri/` holds the Rust shell that bridges Tauri
   commands to the transport.
 - `docs/` — this guide and the architecture document.
+- `evals/` — deterministic task repositories, the cross-provider evaluation
+  runner, report comparison gate, and runner tests. Follow
+  [evaluation-policy.md](evaluation-policy.md) before starting meaningful
+  agent-loop work.
 
 ## Local RPC runtime discovery
 
@@ -108,6 +113,32 @@ standard handles so a persistent runtime cannot keep a parent shell's captured
 input or output pipes open.
 Healthy runtimes started manually are reused by the same health check and are not
 automatically stopped by clients.
+
+## MCP integration boundary
+
+The `.agent/mcp.toml` file maps stable server IDs to either direct child-process
+stdio transports or HTTPS Streamable HTTP endpoints. Keep only environment
+variable names in this file. HTTP bearer credentials are read in `harness-mcp`
+inside the runtime. Do not put RMCP protocol types into `harness-tools`,
+`harness-agent`, `harness-models`, or frontend RPC types; the manager's public
+descriptors are ordinary bounded JSON data.
+
+The standard `ToolRegistry` exposes only the four small `mcp_*` meta-tool
+schemas. The agent searches for a capability to fetch a few matching remote
+definitions, then invokes a selected tool through the normal `ToolRegistry`
+policy and event path. `OperationKind::Mcp` carries `NETWORK` risk, so the
+configured network policy is applied before a connection or tool call and ASK
+uses the existing task approval broker. Remote descriptions, schemas, resources,
+and results are untrusted input; keep limits in place and never interpret them
+as policy or instructions. Calls are bounded and are not automatically replayed
+after cancellation or transport failure.
+
+The CLI and desktop settings controls inspect cached connection state without
+starting configured servers. A deliberate connect/discovery or resource-list
+action evaluates the MCP policy and supplies the human's one-shot approval for
+ASK; explicit DENY remains final. A new transport belongs in `harness-mcp`, with
+fake-server coverage for connect, tool/resource discovery, invocation,
+timeouts/cancellation, errors, oversized content, and disconnect.
 
 ## Invariants
 

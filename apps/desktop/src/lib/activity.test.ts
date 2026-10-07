@@ -57,6 +57,17 @@ describe("describeTool", () => {
     expect(label.endsWith("...")).toBe(true);
   });
 
+  it("shows bounded delegation compactly and hides child context payloads", () => {
+    expect(
+      describeTool("delegate_subagents", {
+        tasks: JSON.stringify({ tasks: [{ role: "explore" }, { role: "review" }] }),
+      }),
+    ).toBe("Delegating to 2 read-only agents");
+    expect(
+      visibleArguments({ tasks: "large task payload", selected_context: "source text", role: "review" }),
+    ).toEqual({ role: "review" });
+  });
+
   it("keeps the row phrased when a required argument is missing", () => {
     expect(describeTool("read_file", {})).toBe("Reading a file");
     expect(describeTool("grep", {})).toBe("Searching");
@@ -77,6 +88,34 @@ describe("visibleArguments", () => {
 });
 
 describe("buildActivityStream", () => {
+  it("keeps background process status compact and updates it when the process exits", () => {
+    const blocks = buildActivityStream([
+      event("background_process.started", {
+        process_id: "proc-123-0",
+        command: "npm run dev",
+        working_directory: "C:/repo",
+        pid: 123,
+        started_at_unix_ms: 1,
+      }),
+      event("background_process.status", {
+        process_id: "proc-123-0",
+        pid: 123,
+        status: "exited",
+        exit_code: 0,
+        timed_out: false,
+      }),
+    ]);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      kind: "notice",
+      label: "Background process exited",
+      detail: "proc-123-0 · npm run dev · PID 123 · exited (0)",
+      tone: "success",
+      reference: "proc-123-0",
+    });
+  });
+
   it("orders a run the way the runtime reported it", () => {
     const blocks = buildActivityStream([
       event("user.message", { text: "fix the parser" }),

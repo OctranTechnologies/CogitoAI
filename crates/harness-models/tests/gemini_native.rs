@@ -6,8 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use harness_models::{
-    FinishReason, GeminiProvider, Message, ModelProvider, ModelRequest, ModelStreamEvent,
-    ProviderError, ReasoningConfig, ReasoningEffort, ToolDefinition, ToolResult,
+    ContentBlock, FinishReason, GeminiProvider, Message, ModelProvider, ModelRequest,
+    ModelStreamEvent, ProviderError, ReasoningConfig, ReasoningEffort, ToolDefinition, ToolResult,
 };
 use serde_json::{json, Value};
 
@@ -295,6 +295,29 @@ fn streams_text_and_usage_using_native_endpoint_and_auth_header() {
         .contains(&format!("x-goog-api-key: {TEST_KEY}")));
     assert!(!captured.body.to_string().contains(TEST_KEY));
     assert!(!format!("{provider:?}").contains(TEST_KEY));
+}
+
+#[test]
+fn forwards_normalized_image_input_to_an_image_capable_gemini_model() {
+    let server = MockServer::start(vec![MockResponse::sse(&[json!({
+        "responseId": "image-response",
+        "candidates": [{ "content": { "parts": [{ "text": "The screenshot shows a settings panel." }] }, "finishReason": "STOP" }]
+    })])]);
+    let provider = server.provider("gemini-3.8-flash");
+    let mut model_request = request("gemini-3.8-flash");
+    model_request.messages[0].content.push(ContentBlock::Image {
+        media_type: "image/png".to_owned(),
+        data: "iVBORw0KGgo=".to_owned(),
+    });
+    let response = provider.generate(&model_request, &mut |_| Ok(())).unwrap();
+    server.wait_for_response();
+    assert!(response.text().contains("settings panel"));
+    let body = server.request(0).body;
+    let parts = body["contents"][0]["parts"].as_array().unwrap();
+    assert!(parts.iter().any(|part| {
+        part["inlineData"]["mimeType"] == "image/png"
+            && part["inlineData"]["data"] == "iVBORw0KGgo="
+    }));
 }
 
 #[test]

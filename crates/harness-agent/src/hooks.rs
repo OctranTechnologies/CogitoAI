@@ -268,6 +268,7 @@ mod tests {
         let context = ToolContext {
             policy: &AllowAllPolicy,
             working_directory: temporary.path(),
+            execution_environment: harness_tools::local_execution_environment(),
             cancellation: Some(&cancellation),
             event_bus: None,
             session_id: Some(&session_id),

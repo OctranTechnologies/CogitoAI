@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Stdout};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::time::{Duration, Instant};
@@ -133,6 +133,7 @@ struct AppState {
     last_run_duration: Option<Duration>,
     current_action: Option<String>,
     active_process: Option<String>,
+    background_processes: BTreeMap<String, String>,
     activity: VecDeque<String>,
     input: String,
     cursor: usize,
@@ -164,6 +165,7 @@ impl AppState {
             last_run_duration: None,
             current_action: None,
             active_process: None,
+            background_processes: BTreeMap::new(),
             startup,
             activity: VecDeque::new(),
             input: String::new(),
@@ -229,7 +231,13 @@ impl AppState {
                     "glob" => "Searching files",
                     "grep" => "Searching symbol",
                     "write_file" | "apply_patch" => "Editing file",
-                    "shell" => "Running command",
+                    "shell" | "run_command" => "Running command",
+                    "start_background_command" => "Starting background process",
+                    "read_process_output" => "Reading process logs",
+                    "list_processes" => "Inspecting processes",
+                    "stop_process" => "Stopping process",
+                    "wait_for_process_output" => "Waiting for process readiness",
+                    "delegate_subagents" => "Delegating to read-only agents",
                     _ => "Using tool",
                 };
                 let target = arguments
@@ -238,7 +246,13 @@ impl AppState {
                     .or_else(|| arguments.get("query"))
                     .or_else(|| arguments.get("command"));
                 self.current_action = Some(target.map_or_else(
-                    || format!("{action} · {tool}"),
+                    || {
+                        if tool == "delegate_subagents" {
+                            action.to_owned()
+                        } else {
+                            format!("{action} · {tool}")
+                        }
+                    },
                     |target| format!("{action} · {}", compact(target, 72)),
                 ));
             }
@@ -253,6 +267,23 @@ impl AppState {
             EventPayload::ProcessExited { .. } => {
                 self.active_process = None;
                 self.current_action = Some("Checking command result".to_owned());
+            }
+            EventPayload::BackgroundProcessStarted {
+                process_id,
+                command,
+                ..
+            } => {
+                self.background_processes
+                    .insert(process_id, compact(&command, 36));
+                self.current_action = Some("Background process running".to_owned());
+            }
+            EventPayload::BackgroundProcessStatus {
+                process_id, status, ..
+            } => {
+                if status != "running" && status != "stopping" {
+                    self.background_processes.remove(&process_id);
+                }
+                self.current_action = Some(format!("Background process {status}"));
             }
             EventPayload::ToolCompleted { .. } => {
                 self.current_action = Some("Thinking".to_owned());
@@ -1296,7 +1327,14 @@ fn status_detail(state: &AppState) -> String {
                 .unwrap_or("Agent working")
                 .to_owned()
         };
-        return format!("{action} · Ctrl+C cancel · PgUp/PgDn scroll");
+        let processes = background_process_summary(state);
+        return format!(
+            "{action}{} · Ctrl+C cancel · PgUp/PgDn scroll",
+            processes.map_or_else(String::new, |summary| format!(" · {summary}"))
+        );
+    }
+    if let Some(processes) = background_process_summary(state) {
+        return format!("{processes} · Enter run · ↑/↓ history · /help");
     }
     if state.status != "Ready  |  Enter a task or type /help" {
         return state.status.clone();
@@ -1305,6 +1343,16 @@ fn status_detail(state: &AppState) -> String {
         return "Connected · Enter run · ↑/↓ history · /help".to_owned();
     }
     "Enter run · ↑/↓ history · /help · Ctrl+C exit".to_owned()
+}
+
+fn background_process_summary(state: &AppState) -> Option<String> {
+    let (id, command) = state.background_processes.iter().next()?;
+    Some(format!(
+        "{} bg · {} {}",
+        state.background_processes.len(),
+        &id[..id.len().min(12)],
+        command
+    ))
 }
 
 fn truncate_path(value: &str, max_chars: usize) -> String {
@@ -1712,6 +1760,32 @@ mod tests {
         });
         assert!(mock_state.token_usage.is_none());
         assert!(!status_text(&mock_state, 120).contains("tok"));
+    }
+
+    #[test]
+    fn background_processes_stay_visible_after_the_task_finishes_and_clear_on_exit() {
+        let mut state = AppState::new(startup(), false);
+        state.runtime_status = Some("Connected".to_owned());
+        state.apply_runtime_event(EventPayload::BackgroundProcessStarted {
+            process_id: "proc-123-0".to_owned(),
+            command: "npm run dev".to_owned(),
+            working_directory: "C:/repo".into(),
+            pid: 123,
+            started_at_unix_ms: 1,
+        });
+        assert!(status_detail(&state).contains("npm run dev"));
+
+        state.apply_runtime_event(EventPayload::BackgroundProcessStatus {
+            process_id: "proc-123-0".to_owned(),
+            pid: 123,
+            status: "exited".to_owned(),
+            exit_code: Some(0),
+            timed_out: false,
+        });
+        assert_eq!(
+            status_detail(&state),
+            "Connected · Enter run · ↑/↓ history · /help"
+        );
     }
 
     #[test]

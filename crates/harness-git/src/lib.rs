@@ -399,25 +399,27 @@ impl GitClient {
     }
 
     fn blob_exists(&self, path: &str) -> Result<bool, GitError> {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .current_dir(&self.root)
-            .args(["cat-file", "-e", &format!("HEAD:{path}")])
-            .output()
-            .map_err(|error| GitError::Command {
-                message: error.to_string(),
-            })?;
+            .args(["cat-file", "-e", &format!("HEAD:{path}")]);
+        configure_hidden_process(&mut command);
+        let output = command.output().map_err(|error| GitError::Command {
+            message: error.to_string(),
+        })?;
         Ok(output.status.success())
     }
 
     fn blob(&self, path: &str) -> Result<Vec<u8>, GitError> {
-        let mut child = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .current_dir(&self.root)
             .args(["show", &format!("HEAD:{path}")])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| GitError::Command {
-                message: error.to_string(),
-            })?;
+            .stdout(std::process::Stdio::piped());
+        configure_hidden_process(&mut command);
+        let mut child = command.spawn().map_err(|error| GitError::Command {
+            message: error.to_string(),
+        })?;
         let mut buffer = Vec::new();
         if let Some(mut stdout) = child.stdout.take() {
             let _ = stdout
@@ -904,13 +906,12 @@ fn run_git(directory: &Path, args: &[&str]) -> Result<String, GitError> {
 /// `git diff` exits with status 1 when differences exist, which is not an error
 /// for a read-only diff request.
 fn run_git_allow_failure(directory: &Path, args: &[&str]) -> Result<String, GitError> {
-    let output = Command::new("git")
-        .current_dir(directory)
-        .args(args)
-        .output()
-        .map_err(|error| GitError::Command {
-            message: error.to_string(),
-        })?;
+    let mut command = Command::new("git");
+    command.current_dir(directory).args(args);
+    configure_hidden_process(&mut command);
+    let output = command.output().map_err(|error| GitError::Command {
+        message: error.to_string(),
+    })?;
     if output.status.success() || !output.stdout.is_empty() {
         return String::from_utf8(output.stdout).map_err(|error| GitError::Command {
             message: error.to_string(),
@@ -1007,13 +1008,12 @@ fn language_for(path: &str) -> &'static str {
 }
 
 fn run_git_optional(directory: &Path, args: &[&str]) -> Result<Option<String>, GitError> {
-    let output = Command::new("git")
-        .current_dir(directory)
-        .args(args)
-        .output()
-        .map_err(|error| GitError::Command {
-            message: error.to_string(),
-        })?;
+    let mut command = Command::new("git");
+    command.current_dir(directory).args(args);
+    configure_hidden_process(&mut command);
+    let output = command.output().map_err(|error| GitError::Command {
+        message: error.to_string(),
+    })?;
     if output.status.success() {
         Ok(Some(
             String::from_utf8_lossy(&output.stdout).trim().to_owned(),
@@ -1024,17 +1024,27 @@ fn run_git_optional(directory: &Path, args: &[&str]) -> Result<Option<String>, G
 }
 
 fn run_git_bytes(directory: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
-    let output = Command::new("git")
-        .current_dir(directory)
-        .args(args)
-        .output()
-        .map_err(|error| GitError::Command {
-            message: error.to_string(),
-        })?;
+    let mut command = Command::new("git");
+    command.current_dir(directory).args(args);
+    configure_hidden_process(&mut command);
+    let output = command.output().map_err(|error| GitError::Command {
+        message: error.to_string(),
+    })?;
     if !output.status.success() {
         return Err(GitError::Command {
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
     Ok(output.stdout)
+}
+
+fn configure_hidden_process(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
 }

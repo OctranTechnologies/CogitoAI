@@ -7,6 +7,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use harness_agent::AgentTask;
 use harness_context::WorkspaceMetadata;
@@ -18,10 +20,10 @@ use harness_models::{
     has_model_environment_override, load_project_model_preference, load_user_model_preference,
     provider_from_config_with_store, save_project_model_preference, save_user_model_preference,
     validate_provider_credential, ContentBlock, CredentialSecret, CredentialSource,
-    CredentialStatus, CredentialStore, FinishReason, Message, ModelConfig, ModelPreference,
-    ModelPreferenceError, ModelRegistry, ModelRegistryFilter, ModelRequest, ModelResponse,
-    ModelStreamEvent, ProviderError, ProviderKind, ReasoningEffort, SystemCredentialStore,
-    ToolCall, Usage,
+    CredentialStatus, CredentialStore, FinishReason, InputAttachment, Message, ModelConfig,
+    ModelPreference, ModelPreferenceError, ModelRegistry, ModelRegistryFilter, ModelRequest,
+    ModelResponse, ModelStreamEvent, ProviderError, ProviderKind, ReasoningEffort,
+    SystemCredentialStore, ToolCall, Usage,
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_rpc::{
@@ -53,6 +55,7 @@ enum InteractiveCommand {
     Models,
     ModelSelect,
     Connect,
+    Mcp,
     Mode,
     Explore,
     Plan,
@@ -75,6 +78,7 @@ struct AgentRunUi {
     task_mode: TaskMode,
     tui: Option<TuiSender>,
     cancellation: Option<CancellationToken>,
+    attachments: Vec<InputAttachment>,
 }
 
 /// The single source used for interactive dispatch, help, and Tab completion.
@@ -175,6 +179,13 @@ const INTERACTIVE_COMMANDS: &[InteractiveCommandDefinition] = &[
         usage: "/connect [provider-id]",
         description: "Validate and securely store a provider credential",
         command: InteractiveCommand::Connect,
+        plain_supported: true,
+    },
+    InteractiveCommandDefinition {
+        name: "/mcp",
+        usage: "/mcp [refresh [server] | disconnect <server> | resources <server>]",
+        description: "Inspect configured MCP servers and manage their local connections",
+        command: InteractiveCommand::Mcp,
         plain_supported: true,
     },
     InteractiveCommandDefinition {
@@ -297,6 +308,8 @@ enum Command {
         task: String,
         #[arg(default_value = ".")]
         path: PathBuf,
+        #[arg(long = "attach", value_name = "FILE", action = clap::ArgAction::Append)]
+        attachments: Vec<PathBuf>,
     },
     Sessions {
         #[arg(long, default_value_t = 20)]
@@ -352,10 +365,16 @@ enum Command {
         #[arg(long)]
         provider: Option<String>,
     },
+    Mcp {
+        action: Option<String>,
+        server_id: Option<String>,
+    },
     Agent {
         task: String,
         #[arg(default_value = ".")]
         path: PathBuf,
+        #[arg(long = "attach", value_name = "FILE", action = clap::ArgAction::Append)]
+        attachments: Vec<PathBuf>,
     },
     Session {
         #[command(subcommand)]
@@ -441,9 +460,17 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 inspect(cli, &effective_path(cli, path))
             }
         }
-        Some(Command::Run { task, path }) => {
-            run_agent(cli, task.clone(), effective_path(cli, path), None)
-        }
+        Some(Command::Run {
+            task,
+            path,
+            attachments,
+        }) => run_agent_with_files(
+            cli,
+            task.clone(),
+            effective_path(cli, path),
+            None,
+            attachments,
+        ),
         Some(Command::Sessions { limit }) => sessions(cli, *limit),
         Some(Command::Resume { id, task, path }) => {
             resume_session(cli, id, task.clone(), path.clone())
@@ -482,9 +509,25 @@ fn execute(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             models_command(cli, &arguments)
         }
-        Some(Command::Agent { task, path }) => {
-            run_agent(cli, task.clone(), effective_path(cli, path), None)
+        Some(Command::Mcp { action, server_id }) => {
+            let arguments = match (action.as_deref(), server_id.as_deref()) {
+                (Some(action), Some(server)) => format!("{action} {server}"),
+                (Some(action), None) => action.to_owned(),
+                _ => String::new(),
+            };
+            mcp_command(cli, &arguments)
         }
+        Some(Command::Agent {
+            task,
+            path,
+            attachments,
+        }) => run_agent_with_files(
+            cli,
+            task.clone(),
+            effective_path(cli, path),
+            None,
+            attachments,
+        ),
         Some(Command::Session { command }) => session_command(cli, command),
         Some(Command::Auth { command }) => auth_command(cli, command),
         Some(Command::Runtime { command }) => runtime_command(cli, command),
@@ -784,6 +827,7 @@ fn plain_interactive(
                     &session_cli,
                     (!arguments.is_empty()).then_some(arguments),
                 )?,
+                InteractiveCommand::Mcp => mcp_command(&session_cli, arguments)?,
                 InteractiveCommand::Mode => {
                     if !arguments.is_empty() {
                         eprintln!("usage: /mode (shows the workspace-configured mode)");
@@ -985,6 +1029,7 @@ fn dispatch_interactive(
         InteractiveCommand::Connect => run_visible_command(tui, || {
             connect_provider_cli(cli, (!arguments.is_empty()).then_some(arguments))
         }),
+        InteractiveCommand::Mcp => run_visible_command(tui, || mcp_command(cli, arguments)),
         InteractiveCommand::Mode => {
             if !arguments.is_empty() {
                 return Err("usage: /mode (shows the workspace-configured mode)".to_owned());
@@ -1080,6 +1125,7 @@ fn start_interactive_run(
                     task_mode,
                     tui: Some(sender.clone()),
                     cancellation: Some(cancellation),
+                    attachments: Vec::new(),
                 },
                 run_connector,
             )
@@ -1489,6 +1535,128 @@ fn models_command(cli: &Cli, arguments: &str) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn mcp_command(cli: &Cli, arguments: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut fields = arguments.split_whitespace();
+    let action = fields.next().unwrap_or("status");
+    let server_id = fields.next();
+    if fields.next().is_some()
+        || !matches!(action, "status" | "refresh" | "disconnect" | "resources")
+        || (matches!(action, "disconnect" | "resources") && server_id.is_none())
+    {
+        return Err(
+            "usage: /mcp [status | refresh [server] | disconnect <server> | resources <server>]"
+                .into(),
+        );
+    }
+    let workspace = std::fs::canonicalize(effective_path(cli, Path::new(".")))?;
+    let model = model_config(cli)?;
+    let launch = runtime_launch_config(cli, &workspace, &model)?;
+    let connector = HarnessConnectionManager::default();
+    let mut client = connect_runtime_for_cli(&connector, &launch, cli, None)?;
+    let method = match action {
+        "refresh" => "mcp.refresh",
+        "disconnect" => "mcp.disconnect",
+        "resources" => "mcp.resources",
+        _ => "mcp.inspect",
+    };
+    let params = match action {
+        "refresh" => server_id.map_or_else(
+            || json!({"approved": true}),
+            |server_id| json!({"approved": true, "server_id": server_id}),
+        ),
+        "resources" => json!({"approved": true, "server_id": server_id}),
+        "disconnect" => json!({"server_id": server_id}),
+        _ => json!({}),
+    };
+    let result = rpc_result(client.request(method, params)?)?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if action == "resources" {
+        let resources = result
+            .get("resources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if resources.is_empty() {
+            println!("No resources available from {server_id:?}.");
+        } else {
+            for resource in resources {
+                println!(
+                    "{}  {}{}",
+                    resource
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("resource"),
+                    resource.get("uri").and_then(Value::as_str).unwrap_or(""),
+                    resource
+                        .get("mime_type")
+                        .and_then(Value::as_str)
+                        .map_or_else(String::new, |kind| format!("  · {kind}")),
+                );
+            }
+        }
+        return Ok(());
+    }
+    let servers = result
+        .get("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if servers.is_empty() {
+        println!("No MCP servers configured. Add servers to .agent/mcp.toml.");
+        return Ok(());
+    }
+    for server in servers {
+        let id = server
+            .get("server_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let state = server
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("disconnected");
+        let transport = server
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let tools = server
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let resources = server
+            .get("resources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        println!(
+            "{id} · {transport} · {state} · {} tools · {} resources",
+            tools.len(),
+            resources.len()
+        );
+        if let Some(error) = server.get("error").and_then(Value::as_str) {
+            println!("  {error}");
+        }
+        for tool in tools {
+            println!(
+                "  {} — {} (≈{} tokens)",
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unnamed"),
+                tool.get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                tool.get("estimated_definition_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn mode_info(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mode = configured_mode(cli)?;
     if cli.json {
@@ -1885,29 +2053,171 @@ fn session_command(cli: &Cli, command: &SessionCommand) -> Result<(), Box<dyn st
     }
 }
 
-fn run_agent(
+fn load_task_attachments(
+    paths: &[PathBuf],
+) -> Result<Vec<InputAttachment>, Box<dyn std::error::Error>> {
+    const MAX_FILES: usize = 8;
+    const MAX_BYTES_PER_FILE: u64 = 10 * 1024 * 1024;
+    if paths.len() > MAX_FILES {
+        return Err(std::io::Error::other(format!(
+            "at most {MAX_FILES} attachments can be supplied"
+        ))
+        .into());
+    }
+    let attachments = paths
+        .iter()
+        .map(|path| {
+            let path = std::fs::canonicalize(path)?;
+            if harness_policy::is_protected_path(&path) {
+                return Err(std::io::Error::other(
+                    "credential and shell-profile files cannot be attached",
+                ));
+            }
+            let metadata = std::fs::metadata(&path)?;
+            if !metadata.is_file() {
+                return Err(std::io::Error::other("attachment path is not a file"));
+            }
+            if metadata.len() > MAX_BYTES_PER_FILE {
+                return Err(std::io::Error::other(format!(
+                    "attachment {} exceeds the 10 MiB file limit",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                )));
+            }
+            let bytes = std::fs::read(&path)?;
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| std::io::Error::other("attachment name is not valid Unicode"))?
+                .to_owned();
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let media_type = match extension.as_str() {
+                "png" => Some("image/png"),
+                "jpg" | "jpeg" => Some("image/jpeg"),
+                "gif" => Some("image/gif"),
+                "webp" => Some("image/webp"),
+                "pdf" => {
+                    return Err(std::io::Error::other(
+                        "PDF attachments are not supported yet; export the relevant pages as text or images",
+                    ))
+                }
+                "json" => Some("application/json"),
+                "xml" => Some("application/xml"),
+                _ => None,
+            };
+            if let Some(media_type) = media_type.filter(|media_type| media_type.starts_with("image/")) {
+                if !image_signature_matches(media_type, &bytes) {
+                    return Err(std::io::Error::other(format!(
+                        "attachment {file_name} does not contain a valid {media_type} image"
+                    )));
+                }
+                return Ok(InputAttachment::Image {
+                    file_name,
+                    media_type: media_type.to_owned(),
+                    data: BASE64_STANDARD.encode(bytes),
+                });
+            }
+            let text = String::from_utf8(bytes).map_err(|_| {
+                std::io::Error::other(format!(
+                    "attachment {file_name} is not a supported image or UTF-8 text file"
+                ))
+            })?;
+            if text.len() > 512 * 1024 {
+                return Err(std::io::Error::other(format!(
+                    "text attachment {file_name} exceeds the 512 KiB per-file limit"
+                )));
+            }
+            Ok(InputAttachment::Text {
+                file_name,
+                media_type: media_type.unwrap_or("text/plain").to_owned(),
+                text,
+            })
+        })
+        .collect::<Result<Vec<_>, std::io::Error>>()
+        ?;
+    let image_bytes = attachments
+        .iter()
+        .filter_map(|attachment| match attachment {
+            InputAttachment::Image { data, .. } => Some(data.len()),
+            InputAttachment::Text { .. } => None,
+        })
+        .sum::<usize>();
+    let image_raw_bytes = attachments
+        .iter()
+        .filter_map(|attachment| match attachment {
+            InputAttachment::Image { data, .. } => Some(decoded_base64_len(data)),
+            InputAttachment::Text { .. } => None,
+        })
+        .sum::<usize>();
+    let text_bytes = attachments
+        .iter()
+        .filter_map(|attachment| match attachment {
+            InputAttachment::Image { .. } => None,
+            InputAttachment::Text { text, .. } => Some(text.len()),
+        })
+        .sum::<usize>();
+    if image_bytes > 22 * 1024 * 1024 {
+        return Err(std::io::Error::other(
+            "combined image attachments exceed the 22 MiB encoded-data limit",
+        )
+        .into());
+    }
+    if image_raw_bytes > 16 * 1024 * 1024 {
+        return Err(std::io::Error::other(
+            "combined image attachments exceed the 16 MiB raw-data limit",
+        )
+        .into());
+    }
+    if text_bytes > 2 * 1024 * 1024 {
+        return Err(
+            std::io::Error::other("combined text attachments exceed the 2 MiB limit").into(),
+        );
+    }
+    Ok(attachments)
+}
+
+fn decoded_base64_len(value: &str) -> usize {
+    let padding = value
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count();
+    (value.len() / 4 * 3).saturating_sub(padding)
+}
+
+fn image_signature_matches(media_type: &str, bytes: &[u8]) -> bool {
+    match media_type {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn run_agent_with_files(
     cli: &Cli,
     task: String,
     path: PathBuf,
     resume_session: Option<SessionId>,
+    attachment_paths: &[PathBuf],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_agent_with_connector(
+    let attachments = load_task_attachments(attachment_paths)?;
+    run_agent_with_ui(
         cli,
         task,
         path,
         resume_session,
+        AgentRunUi {
+            attachments,
+            ..AgentRunUi::default()
+        },
         HarnessConnectionManager::default(),
     )
-}
-
-fn run_agent_with_connector(
-    cli: &Cli,
-    task: String,
-    path: PathBuf,
-    resume_session: Option<SessionId>,
-    connector: HarnessConnectionManager,
-) -> Result<(), Box<dyn std::error::Error>> {
-    run_agent_with_task_mode(cli, task, path, resume_session, connector, TaskMode::Code)
 }
 
 fn run_agent_with_task_mode(
@@ -1943,6 +2253,7 @@ fn run_agent_with_ui(
         task_mode,
         tui,
         cancellation,
+        attachments,
     } = ui;
     let path = std::fs::canonicalize(&path)?;
     let mut current_session_id = resume_session.as_ref().map(ToString::to_string);
@@ -1988,6 +2299,7 @@ fn run_agent_with_ui(
     let agent_task = AgentTask {
         workspace_root: path.clone(),
         user_task: task,
+        attachments,
         task_mode,
         system_instructions:
             "You are the CogitoAI coding agent. Follow project instructions and use tools safely."
@@ -2103,11 +2415,19 @@ fn run_agent_with_ui(
                         .get("tool")
                         .cloned()
                         .unwrap_or(Value::Null);
-                    let tool_name = tool
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
-                        .to_owned();
+                    let risk_categories = notification
+                        .params
+                        .get("risk_categories")
+                        .and_then(Value::as_array)
+                        .map(|risks| {
+                            risks
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        })
+                        .unwrap_or_default();
+                    let approval_summary = approval_action_summary(&tool, &risk_categories);
                     let writer = writer.clone();
                     let tui = tui.clone();
                     let auto_approve = cli.yes;
@@ -2115,9 +2435,9 @@ fn run_agent_with_ui(
                         let approved = if auto_approve {
                             true
                         } else if let Some(tui) = tui {
-                            tui.request_approval(&tool_name)
+                            tui.request_approval(&approval_summary)
                         } else {
-                            eprint!("Approve tool {tool_name}? [y/N] ");
+                            eprint!("Approve {approval_summary}? [y/N] ");
                             let _ = io::stderr().flush();
                             let mut answer = String::new();
                             io::stdin().read_line(&mut answer).is_ok()
@@ -2203,6 +2523,26 @@ fn run_agent_with_ui(
     }
     print_completion(cli, &outcome, tui.as_ref());
     Ok(())
+}
+
+fn approval_action_summary(tool: &Value, risks: &str) -> String {
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let arguments = tool.get("arguments").cloned().unwrap_or(Value::Null);
+    let detail = if name == "shell" {
+        arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| format!("{name}: {command}"))
+            .unwrap_or_else(|| name.to_owned())
+    } else {
+        format!("{name}: {arguments}")
+    };
+    let detail: String = detail.chars().take(200).collect();
+    if risks.is_empty() {
+        detail
+    } else {
+        format!("{detail} [{risks}]")
+    }
 }
 
 fn rpc_result(response: RpcResponse) -> Result<Value, Box<dyn std::error::Error>> {
@@ -2738,6 +3078,9 @@ fn mock_runtime_responses(
     if config.provider != ProviderKind::Mock {
         return Ok(None);
     }
+    if let Some(responses) = mock_script_responses()? {
+        return Ok(Some(responses));
+    }
     if let Some(repair) = mock_repair_script()? {
         return Ok(Some(vec![
             tool_response("read_file", json!({ "path": repair.path })),
@@ -2763,6 +3106,77 @@ fn mock_runtime_responses(
         ),
         text_response("Mock coding workflow completed."),
     ]))
+}
+
+/// Loads a bounded, deterministic response sequence for isolated coding-agent
+/// evaluations. This is deliberately available only to the mock provider.
+fn mock_script_responses() -> Result<Option<Vec<ModelResponse>>, ProviderError> {
+    let Some(raw) = std::env::var_os("COGITO_MOCK_SCRIPT") else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy();
+    parse_mock_script(&raw).map(Some)
+}
+
+fn parse_mock_script(raw: &str) -> Result<Vec<ModelResponse>, ProviderError> {
+    let invalid = |reason: String| ProviderError::Configuration {
+        reason: format!("COGITO_MOCK_SCRIPT: {reason}"),
+    };
+    if raw.len() > 256 * 1024 {
+        return Err(invalid("script exceeds 256 KiB".to_owned()));
+    }
+    let value: Value =
+        serde_json::from_str(raw).map_err(|error| invalid(format!("expected JSON ({error})")))?;
+    let steps = value
+        .get("steps")
+        .and_then(Value::as_array)
+        .filter(|steps| !steps.is_empty() && steps.len() <= 128)
+        .ok_or_else(|| invalid("expected 1 to 128 steps".to_owned()))?;
+
+    steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let tool = step.get("tool").and_then(Value::as_str);
+            let text = step.get("text").and_then(Value::as_str);
+            match (tool, text) {
+                (Some(name), None) if !name.is_empty() && name.len() <= 128 => {
+                    let arguments = step.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    if arguments.to_string().len() > 64 * 1024 {
+                        return Err(invalid(format!("step {index} arguments exceed 64 KiB")));
+                    }
+                    Ok(ModelResponse {
+                        id: format!("eval-response-{index}"),
+                        model: "mock-eval".to_owned(),
+                        content: Vec::new(),
+                        tool_calls: vec![ToolCall {
+                            id: format!("eval-call-{index}"),
+                            name: name.to_owned(),
+                            arguments,
+                        }],
+                        finish_reason: FinishReason::ToolCalls,
+                        // The scripted provider is a harness fixture, not a
+                        // token-pricing model. Context estimates are reported
+                        // separately by the evaluation runner.
+                        usage: None,
+                    })
+                }
+                (None, Some(text)) if text.len() <= 16 * 1024 => Ok(ModelResponse {
+                    id: format!("eval-response-{index}"),
+                    model: "mock-eval".to_owned(),
+                    content: vec![ContentBlock::Text {
+                        text: text.to_owned(),
+                    }],
+                    tool_calls: Vec::new(),
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                }),
+                _ => Err(invalid(format!(
+                    "step {index} must contain exactly one bounded `tool` or `text` field"
+                ))),
+            }
+        })
+        .collect()
 }
 
 /// A deliberately broken edit followed by a corrective one, so the mock can
@@ -2951,11 +3365,18 @@ fn format_activity(event: &HarnessEvent) -> Option<String> {
                 "glob" => "Searching files",
                 "grep" => "Searching symbol",
                 "write_file" | "apply_patch" => "Editing file",
-                "shell" => "Running command",
+                "shell" | "run_command" => "Running command",
+                "start_background_command" => "Starting background process",
+                "read_process_output" => "Reading process logs",
+                "list_processes" => "Inspecting processes",
+                "stop_process" => "Stopping process",
+                "wait_for_process_output" => "Waiting for process readiness",
+                "delegate_subagents" => "Delegating to read-only agents",
                 _ => "Using tool",
             };
             Some(match target {
                 Some(target) => format!("{description} · {}", concise(target, 100)),
+                None if tool == "delegate_subagents" => description.to_owned(),
                 None => format!("{description} · {tool}"),
             })
         }
@@ -2986,6 +3407,16 @@ fn format_activity(event: &HarnessEvent) -> Option<String> {
                 ))
             }
         }
+        EventPayload::BackgroundProcessStarted { command, pid, .. } => Some(format!(
+            "Background process started · PID {pid} · {}",
+            concise(command, 100)
+        )),
+        EventPayload::BackgroundProcessStatus {
+            status, process_id, ..
+        } => Some(format!(
+            "Background process {status} · {}",
+            concise(process_id, 50)
+        )),
         EventPayload::FileChanged { path, change } => Some(format!(
             "{} · {}",
             match change {
@@ -3137,6 +3568,54 @@ mod interactive_command_tests {
     use super::*;
 
     #[test]
+    fn scripted_mock_responses_are_bounded_and_deterministic() {
+        let responses = parse_mock_script(
+            r#"{"steps":[{"tool":"read_file","arguments":{"path":"src/lib.py"}},{"text":"done"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].tool_calls[0].name, "read_file");
+        assert_eq!(responses[0].tool_calls[0].id, "eval-call-0");
+        assert_eq!(
+            responses[1].content,
+            [ContentBlock::Text {
+                text: "done".into()
+            }]
+        );
+        assert!(responses.iter().all(|response| response.usage.is_none()));
+    }
+
+    #[test]
+    fn scripted_mock_rejects_ambiguous_or_unbounded_steps() {
+        assert!(parse_mock_script(r#"{"steps":[]}"#).is_err());
+        assert!(
+            parse_mock_script(r#"{"steps":[{"tool":"read_file","text":"ambiguous"}]}"#).is_err()
+        );
+        assert!(parse_mock_script(&format!(
+            "{{\"steps\":[{{\"text\":\"{}\"}}]}}",
+            "x".repeat(16 * 1024 + 1)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn subagent_delegation_uses_a_compact_activity_label() {
+        let event = HarnessEvent::new(
+            harness_core::SessionId::new("session-subagent-test").unwrap(),
+            EventPayload::ToolRequested {
+                tool: "delegate_subagents".to_owned(),
+                arguments: Default::default(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(
+            format_activity(&event).as_deref(),
+            Some("Delegating to read-only agents")
+        );
+    }
+
+    #[test]
     fn advertised_commands_have_a_dispatch_target_and_parse_arguments() {
         for definition in INTERACTIVE_COMMANDS {
             let (command, _) = parse_interactive_command(definition.usage)
@@ -3179,6 +3658,8 @@ mod interactive_command_tests {
             Cli::try_parse_from(["harness", "models", "--refresh", "--provider", "gemini"])
                 .unwrap();
         assert!(matches!(parsed.command, Some(Command::Models { .. })));
+        let parsed = Cli::try_parse_from(["harness", "mcp", "refresh", "docs"]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::Mcp { .. })));
         assert_eq!(parse_interactive_command("/not-a-command"), None);
         assert_eq!(parse_interactive_command("ordinary task"), None);
     }
@@ -3190,6 +3671,7 @@ mod interactive_command_tests {
             "/help",
             "/model",
             "/models",
+            "/mcp",
             "/mode",
             "/explore",
             "/plan",

@@ -242,6 +242,7 @@ impl RuntimeLauncher for ProcessRuntimeLauncher {
             .and_then(|mut stdin| {
                 stdin
                     .write_all(&payload)
+                    .and_then(|()| stdin.write_all(b"\n"))
                     .and_then(|()| stdin.flush())
                     .map_err(|error| {
                         format!("could not send runtime startup configuration: {error}")
@@ -415,10 +416,9 @@ fn configure_detached_process(command: &mut Command) {
 #[cfg(windows)]
 fn configure_detached_process(command: &mut Command) {
     use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
 #[cfg(windows)]
@@ -434,9 +434,8 @@ mod windows_handle_inheritance {
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
 
-    /// Temporarily prevents a detached runtime from retaining its client's
-    /// parent-captured stdout/stderr handles. The handles explicitly supplied
-    /// through `Command::stdin/stdout/stderr` remain inheritable for the spawn.
+    /// Prevents the detached runtime from retaining the client's captured
+    /// standard handles. Explicitly configured child stdio stays inheritable.
     pub(super) struct Guard {
         handles: Vec<HANDLE>,
     }

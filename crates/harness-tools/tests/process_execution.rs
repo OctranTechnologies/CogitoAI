@@ -2,11 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use harness_policy::{AllowAllPolicy, DenyAllPolicy};
+use harness_policy::{AllowAllPolicy, DenyAllPolicy, ExecutionMode, PolicyEngine};
 use harness_session::{EventBus, EventType};
 use harness_tools::{
-    CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent, ProcessRequest,
-    ProcessResult, ProcessRunner, ShellTool, Tool, ToolContext, ToolRegistry, ToolRequest,
+    BackgroundProcessStatus, CancellationToken, LocalProcessRunner, ProcessError, ProcessEvent,
+    ProcessManager, ProcessRequest, ProcessResult, ProcessRunner, ShellTool, ToolContext,
+    ToolRegistry, ToolRequest,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -43,6 +44,7 @@ fn shell_context<'a>(
     ToolContext {
         policy,
         working_directory: workspace,
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: None,
         session_id: None,
@@ -108,24 +110,34 @@ fn shell_tool_returns_success_and_preserves_shell_quoting() {
 #[test]
 fn shell_tool_reports_timeout_and_large_output_safely() {
     let temporary = tempdir().unwrap();
-    let registry = ToolRegistry::with_workspace_tools();
-    let timeout_command = if cfg!(windows) {
-        "ping -n 10 127.0.0.1 > nul"
-    } else {
-        "sleep 10"
+    #[cfg(windows)]
+    let timeout_request = ProcessRequest {
+        program: "powershell.exe".to_owned(),
+        args: vec![
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            "Start-Sleep -Seconds 10".to_owned(),
+        ],
+        working_directory: temporary.path().to_path_buf(),
+        timeout: Duration::from_millis(100),
+        max_output_bytes: 1024,
     };
-    let timeout = registry
-        .execute(
-            &shell_context(temporary.path(), &AllowAllPolicy),
-            request(
-                "shell",
-                json!({ "command": timeout_command, "timeout_ms": 100 }),
-            ),
-        )
+    #[cfg(not(windows))]
+    let timeout_request = ProcessRequest {
+        program: "sh".to_owned(),
+        args: vec!["-c".to_owned(), "sleep 10".to_owned()],
+        working_directory: temporary.path().to_path_buf(),
+        timeout: Duration::from_millis(100),
+        max_output_bytes: 1024,
+    };
+    let timeout_result = LocalProcessRunner
+        .execute(timeout_request, &CancellationToken::new(), &mut |_| Ok(()))
         .unwrap();
-    assert_eq!(timeout.metadata["timed_out"], true);
-    assert!(timeout.metadata["duration_ms"].as_u64().unwrap() < 5_000);
+    assert!(timeout_result.timed_out);
+    assert!(timeout_result.duration_ms < 5_000);
 
+    let registry = ToolRegistry::with_workspace_tools();
     let large_command = if cfg!(windows) {
         "for /L %i in (1,1,20000) do @echo 123456789012345678901234567890"
     } else {
@@ -148,23 +160,410 @@ fn shell_tool_reports_timeout_and_large_output_safely() {
 fn cancellation_stops_a_running_process_and_returns_control() {
     let temporary = tempdir().unwrap();
     let cancellation = CancellationToken::new();
-    let shell = ShellTool::new(Arc::new(LocalProcessRunner), cancellation.clone());
     let workspace = temporary.path().to_path_buf();
     let cancel = cancellation.clone();
-    let handle = thread::spawn(move || {
-        let policy = AllowAllPolicy;
-        let context = shell_context(&workspace, &policy);
-        shell.execute(
-            &context,
-            request("shell", json!({ "command": "ping -n 10 127.0.0.1 > nul" })),
-        )
+    let cancellation_thread = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        cancel.cancel();
     });
-    thread::sleep(Duration::from_millis(150));
-    cancel.cancel();
-    let result = handle.join().unwrap().unwrap();
+    #[cfg(windows)]
+    let process = process_request(
+        "powershell.exe",
+        &[
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            "Start-Sleep -Seconds 10".to_owned(),
+        ],
+        &workspace,
+    );
+    #[cfg(not(windows))]
+    let process = process_request("sh", &["-c".to_owned(), "sleep 10".to_owned()], &workspace);
+    let mut on_event = |_event| Ok(());
+    let result = LocalProcessRunner
+        .execute(process, &cancellation, &mut on_event)
+        .unwrap();
+    cancellation_thread.join().unwrap();
 
-    assert_eq!(result.metadata["cancelled"], true);
-    assert!(result.metadata["duration_ms"].as_u64().unwrap() < 5_000);
+    assert!(result.cancelled);
+    assert!(result.duration_ms < 5_000);
+}
+
+#[test]
+fn background_process_lifecycle_supports_readiness_logs_listing_and_stop() {
+    let temporary = tempdir().unwrap();
+    let manager = Arc::new(ProcessManager::default());
+    let registry = ToolRegistry::with_workspace_tools_and_process_manager(
+        CancellationToken::new(),
+        Arc::clone(&manager),
+    );
+    let cancellation = CancellationToken::new();
+    let policy = AllowAllPolicy;
+    let context = ToolContext {
+        policy: &policy,
+        working_directory: temporary.path(),
+        execution_environment: harness_tools::local_execution_environment(),
+        cancellation: Some(&cancellation),
+        event_bus: None,
+        session_id: None,
+        correlation_id: None,
+    };
+    let command = long_running_ready_command();
+    let started = registry
+        .execute(
+            &context,
+            request(
+                "start_background_command",
+                json!({"command": command, "working_directory": "."}),
+            ),
+        )
+        .unwrap();
+    let process = started.metadata["process"].clone();
+    let process_id = process["id"].as_str().unwrap().to_owned();
+    assert_eq!(process["status"], "running");
+
+    let ready = registry
+        .execute(
+            &context,
+            request(
+                "wait_for_process_output",
+                json!({"process_id": process_id, "pattern": "READY", "timeout_ms": 5000}),
+            ),
+        )
+        .unwrap();
+    assert_eq!(ready.metadata["ready"], true);
+
+    let smoke_test_command = if cfg!(windows) {
+        "echo test server is reachable"
+    } else {
+        "printf 'test server is reachable'"
+    };
+    let verification = registry
+        .execute(
+            &context,
+            request("run_command", json!({"command": smoke_test_command})),
+        )
+        .unwrap();
+    assert_eq!(verification.metadata["success"], true);
+    assert!(verification.output.contains("test server is reachable"));
+
+    let logs = registry
+        .execute(
+            &context,
+            request(
+                "read_process_output",
+                json!({"process_id": process_id, "after_cursor": 0}),
+            ),
+        )
+        .unwrap();
+    assert!(logs.output.contains("READY"));
+    assert!(logs.metadata["next_cursor"].as_u64().unwrap() > 0);
+
+    let listed = registry
+        .execute(&context, request("list_processes", json!({})))
+        .unwrap();
+    assert!(
+        listed.metadata["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["id"] == process_id && entry["status"] == "running" }),
+        "process list was: {}",
+        listed.metadata["processes"]
+    );
+
+    let stopped = registry
+        .execute(
+            &context,
+            request("stop_process", json!({"process_id": process_id})),
+        )
+        .unwrap();
+    assert_eq!(stopped.metadata["process"]["status"], "stopped");
+}
+
+#[test]
+fn background_start_and_stop_require_policy_approval_before_side_effects() {
+    let temporary = tempdir().unwrap();
+    let manager = Arc::new(ProcessManager::default());
+    let registry = ToolRegistry::with_workspace_tools_and_process_manager(
+        CancellationToken::new(),
+        Arc::clone(&manager),
+    );
+    let policy = PolicyEngine::new(ExecutionMode::Normal, temporary.path());
+    let cancellation = CancellationToken::new();
+    let context = ToolContext {
+        policy: &policy,
+        working_directory: temporary.path(),
+        execution_environment: harness_tools::local_execution_environment(),
+        cancellation: Some(&cancellation),
+        event_bus: None,
+        session_id: None,
+        correlation_id: None,
+    };
+    let start = registry.execute(
+        &context,
+        request(
+            "start_background_command",
+            json!({"command": long_running_ready_command()}),
+        ),
+    );
+    assert!(start
+        .unwrap_err()
+        .to_string()
+        .contains("permission approval required"));
+    assert!(manager.list().is_empty());
+}
+
+#[test]
+fn background_process_lifecycle_is_published_as_runtime_events() {
+    let temporary = tempdir().unwrap();
+    let manager = Arc::new(ProcessManager::default());
+    let registry = ToolRegistry::with_workspace_tools_and_process_manager(
+        CancellationToken::new(),
+        Arc::clone(&manager),
+    );
+    let policy = AllowAllPolicy;
+    let cancellation = CancellationToken::new();
+    let bus = EventBus::new();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let _subscription = bus.subscribe(Arc::new(move |event: &harness_session::HarnessEvent| {
+        captured.lock().unwrap().push(event.payload.clone());
+    }));
+    let session_id = harness_core::SessionId::new("background-process-events".to_owned()).unwrap();
+    let context = ToolContext {
+        policy: &policy,
+        working_directory: temporary.path(),
+        execution_environment: harness_tools::local_execution_environment(),
+        cancellation: Some(&cancellation),
+        event_bus: Some(&bus),
+        session_id: Some(&session_id),
+        correlation_id: None,
+    };
+
+    let started = registry
+        .execute(
+            &context,
+            request(
+                "start_background_command",
+                json!({"command": long_running_ready_command()}),
+            ),
+        )
+        .unwrap();
+    let process_id = started.metadata["process"]["id"].as_str().unwrap();
+    registry
+        .execute(
+            &context,
+            request("stop_process", json!({"process_id": process_id})),
+        )
+        .unwrap();
+
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        harness_session::EventPayload::BackgroundProcessStarted { process_id: id, .. }
+            if id == process_id
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        harness_session::EventPayload::BackgroundProcessStatus { process_id: id, status, .. }
+            if id == process_id && status == "stopped"
+    )));
+}
+
+#[test]
+fn background_manager_tracks_multiple_processes_crashes_timeouts_and_cancellation() {
+    let temporary = tempdir().unwrap();
+    let manager = Arc::new(ProcessManager::default());
+    let registry = ToolRegistry::with_workspace_tools_and_process_manager(
+        CancellationToken::new(),
+        Arc::clone(&manager),
+    );
+    let cancellation = CancellationToken::new();
+    let policy = AllowAllPolicy;
+    let context = ToolContext {
+        policy: &policy,
+        working_directory: temporary.path(),
+        execution_environment: harness_tools::local_execution_environment(),
+        cancellation: Some(&cancellation),
+        event_bus: None,
+        session_id: None,
+        correlation_id: None,
+    };
+
+    let command = long_running_ready_command();
+    for _ in 0..2 {
+        registry
+            .execute(
+                &context,
+                request("start_background_command", json!({"command": command})),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        manager
+            .list()
+            .iter()
+            .filter(|process| process.status.is_running())
+            .count(),
+        2
+    );
+
+    let failed = registry
+        .execute(
+            &context,
+            request(
+                "start_background_command",
+                json!({"command": failing_command()}),
+            ),
+        )
+        .unwrap();
+    let failed_id = failed.metadata["process"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for_process_status(&manager, &failed_id, BackgroundProcessStatus::Failed);
+    assert_eq!(
+        manager
+            .list()
+            .iter()
+            .find(|process| process.id == failed_id)
+            .unwrap()
+            .exit_code,
+        Some(7)
+    );
+
+    cancellation.cancel();
+    for process in manager
+        .list()
+        .into_iter()
+        .filter(|process| process.status.is_running())
+    {
+        wait_for_process_status(&manager, &process.id, BackgroundProcessStatus::Stopped);
+    }
+}
+
+#[test]
+fn background_logs_are_truncated_and_process_timeout_is_enforced() {
+    let temporary = tempdir().unwrap();
+    let manager = Arc::new(ProcessManager::default());
+    let registry = ToolRegistry::with_workspace_tools_and_process_manager(
+        CancellationToken::new(),
+        Arc::clone(&manager),
+    );
+    let policy = AllowAllPolicy;
+    let cancellation = CancellationToken::new();
+    let context = ToolContext {
+        policy: &policy,
+        working_directory: temporary.path(),
+        execution_environment: harness_tools::local_execution_environment(),
+        cancellation: Some(&cancellation),
+        event_bus: None,
+        session_id: None,
+        correlation_id: None,
+    };
+    let noisy = registry
+        .execute(
+            &context,
+            request(
+                "start_background_command",
+                json!({"command": large_output_command()}),
+            ),
+        )
+        .unwrap();
+    let noisy_id = noisy.metadata["process"]["id"].as_str().unwrap().to_owned();
+    wait_until_not_running(&manager, &noisy_id);
+    let logs = registry
+        .execute(
+            &context,
+            request(
+                "read_process_output",
+                json!({"process_id": noisy_id, "after_cursor": 0, "max_bytes": 65536}),
+            ),
+        )
+        .unwrap();
+    assert_eq!(logs.metadata["truncated"], true);
+    assert!(logs.output.len() <= 65_536);
+
+    let timeout = registry
+        .execute(
+            &context,
+            request(
+                "start_background_command",
+                json!({"command": long_running_ready_command(), "timeout_ms": 100}),
+            ),
+        )
+        .unwrap();
+    let timeout_id = timeout.metadata["process"]["id"].as_str().unwrap();
+    wait_for_process_status(&manager, timeout_id, BackgroundProcessStatus::Stopped);
+    assert!(
+        manager
+            .list()
+            .iter()
+            .find(|process| process.id == timeout_id)
+            .unwrap()
+            .timed_out
+    );
+}
+
+fn wait_for_process_status(manager: &ProcessManager, id: &str, expected: BackgroundProcessStatus) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if manager
+            .list()
+            .iter()
+            .any(|process| process.id == id && process.status == expected)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {id} did not reach {expected}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_until_not_running(manager: &ProcessManager, id: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if manager
+            .list()
+            .iter()
+            .any(|process| process.id == id && !process.status.is_running())
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {id} did not finish"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn long_running_ready_command() -> &'static str {
+    if cfg!(windows) {
+        "echo READY & powershell.exe -NoProfile -NonInteractive -Command Start-Sleep -Seconds 30"
+    } else {
+        "printf 'READY\\n'; exec sleep 30"
+    }
+}
+
+fn failing_command() -> &'static str {
+    if cfg!(windows) {
+        "exit /B 7"
+    } else {
+        "exit 7"
+    }
+}
+
+fn large_output_command() -> &'static str {
+    if cfg!(windows) {
+        "for /L %i in (1,1,15000) do @echo 12345678901234567890"
+    } else {
+        "yes 12345678901234567890 | head -c 400000"
+    }
 }
 
 #[test]
@@ -183,6 +582,7 @@ fn agent_run_cancellation_from_tool_context_interrupts_a_reused_registry() {
         let context = ToolContext {
             policy: &policy,
             working_directory: &workspace,
+            execution_environment: harness_tools::local_execution_environment(),
             cancellation: Some(&cancellation),
             event_bus: None,
             session_id: None,
@@ -271,6 +671,7 @@ fn process_events_are_emitted_alongside_tool_events() {
     let context = ToolContext {
         policy: &AllowAllPolicy,
         working_directory: temporary.path(),
+        execution_environment: harness_tools::local_execution_environment(),
         cancellation: None,
         event_bus: Some(&bus),
         session_id: Some(&session_id),

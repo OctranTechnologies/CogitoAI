@@ -21,7 +21,9 @@ use harness_models::{
 };
 use harness_policy::{ExecutionMode, Policy, PolicyEngine};
 use harness_session::{EventBus, JsonlSessionStore, SessionStore};
-use harness_tools::{LocalProcessRunner, ToolRegistry};
+use harness_tools::{
+    CancellationToken, LocalExecutionEnvironment, McpManager, ProcessManager, ToolRegistry,
+};
 use harness_verification::CommandVerifier;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -182,6 +184,8 @@ struct RuntimeRunnerFactory {
     approvals: Arc<ApprovalBroker>,
     mock_responses: Vec<ModelResponse>,
     compaction_threshold_tokens: Option<u32>,
+    process_manager: Arc<ProcessManager>,
+    mcp_manager: Arc<McpManager>,
 }
 
 impl AgentRunnerFactory for RuntimeRunnerFactory {
@@ -206,27 +210,40 @@ impl AgentRunnerFactory for RuntimeRunnerFactory {
             })?
             .repository_root
             .unwrap_or_else(|| self.workspace_root.clone());
-        let policy: Arc<dyn Policy> = Arc::new(PolicyEngine::new(mode, &project_root));
+        let policy_engine = policy_for_workspace(&project_root)
+            .map_err(|error| Error::InvalidConfig {
+                reason: error.to_string(),
+            })?
+            .with_mode(mode);
+        let execution_environment =
+            Arc::new(LocalExecutionEnvironment::new(policy_engine.network_access));
+        let policy: Arc<dyn Policy> = Arc::new(policy_engine);
         let threshold = self
             .compaction_threshold_tokens
             .unwrap_or_else(|| CompactionConfig::default().threshold_tokens);
         let mut runner = AgentRunner::new(
             provider,
             model.model.clone(),
-            ToolRegistry::with_workspace_tools(),
+            ToolRegistry::with_workspace_tools_and_process_manager(
+                CancellationToken::new(),
+                Arc::clone(&self.process_manager),
+            )
+            .with_mcp_manager(Arc::clone(&self.mcp_manager)),
             policy,
             Arc::clone(&self.sessions),
             ContextBuilder::default(),
             AgentLimits::from_env(),
             Arc::new(RpcApprovalHandler::new(Arc::clone(&self.approvals))),
         )
+        .with_execution_environment(execution_environment.clone())
         .with_event_bus(self.event_bus.clone())
+        .with_subagents()
         .with_reasoning_config(model.reasoning_config())
         .with_compaction_config(CompactionConfig {
             threshold_tokens: threshold,
             ..CompactionConfig::default()
         })
-        .with_verifier(Arc::new(CommandVerifier::new(Arc::new(LocalProcessRunner))));
+        .with_verifier(Arc::new(CommandVerifier::new(execution_environment)));
         if self.checkpoints_enabled {
             runner = runner.with_checkpoints(Arc::clone(&self.checkpoints));
         }
@@ -262,12 +279,14 @@ fn build_runtime(
         )
         .map_err(|error| error.to_string())?,
     );
-    let mode = policy_for_workspace(&project_root)
-        .map_err(|error| error.to_string())?
-        .mode();
-    let policy: Arc<dyn Policy> = Arc::new(PolicyEngine::new(mode, &project_root));
+    let policy_engine = policy_for_workspace(&project_root).map_err(|error| error.to_string())?;
+    let mode = policy_engine.mode;
+    let policy: Arc<dyn Policy> = Arc::new(policy_engine);
     let model = config.model.clone().unwrap_or_else(ModelConfig::from_env);
     let credentials: Arc<dyn CredentialStore> = Arc::new(SystemCredentialStore::new());
+    let process_manager = Arc::new(ProcessManager::default());
+    let mcp_manager =
+        Arc::new(McpManager::from_workspace(&project_root).map_err(|error| error.to_string())?);
     let runner_factory = Arc::new(RuntimeRunnerFactory {
         workspace_root: workspace_root.clone(),
         sessions: Arc::clone(&sessions),
@@ -281,6 +300,8 @@ fn build_runtime(
             .clone()
             .unwrap_or_else(default_mock_responses),
         compaction_threshold_tokens: config.compaction_threshold_tokens,
+        process_manager: Arc::clone(&process_manager),
+        mcp_manager: Arc::clone(&mcp_manager),
     });
     let runner = runner_factory
         .build(&model, mode)
@@ -288,7 +309,11 @@ fn build_runtime(
     let runtime = Runtime::new(
         Arc::new(UnavailableAgent),
         Vec::new(),
-        ToolRegistry::with_workspace_tools(),
+        ToolRegistry::with_workspace_tools_and_process_manager(
+            CancellationToken::new(),
+            process_manager,
+        )
+        .with_mcp_manager(Arc::clone(&mcp_manager)),
         policy,
         sessions,
         checkpoints,
@@ -305,6 +330,7 @@ fn build_runtime(
     .with_credential_store(credentials)
     .with_workspace_root(workspace_root)
     .with_session_root(session_root);
+    let runtime = runtime.with_mcp_manager(mcp_manager);
     if config.apply_saved_preferences && config.model.is_none() {
         runtime
             .apply_saved_model_preferences()

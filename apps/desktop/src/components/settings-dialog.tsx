@@ -6,6 +6,7 @@ import {
   FolderOpen,
   LoaderCircle,
   KeyRound,
+  Network,
   RefreshCw,
   Save,
   Settings2,
@@ -31,9 +32,10 @@ const SCREEN_ICONS: Record<SettingsScreen, typeof Settings2> = {
   permissions: ShieldCheck,
   project: FolderOpen,
   verification: TestTube2,
+  mcp: Network,
 };
 
-/** Runtime-backed settings dialog covering the five v0 configuration screens. */
+/** Runtime-backed settings dialog for project and runtime controls. */
 export function SettingsDialog({
   open,
   onClose,
@@ -52,6 +54,7 @@ export function SettingsDialog({
   const refreshSettings = useDesktopStore((state) => state.refreshSettings);
   const clearSettingsError = useDesktopStore((state) => state.clearSettingsError);
   const [screen, setScreen] = useState<SettingsScreen>(initialScreen);
+  const inspectMcp = useDesktopStore((state) => state.inspectMcp);
 
   // Follow the requested screen each time it is opened, so the rail entry that
   // was pressed is the screen that appears.
@@ -63,6 +66,10 @@ export function SettingsDialog({
   useEffect(() => {
     if (open) void refreshSettings();
   }, [open, refreshSettings]);
+
+  useEffect(() => {
+    if (open && screen === "mcp") void inspectMcp();
+  }, [open, screen, inspectMcp]);
 
   return (
     <Modal
@@ -126,6 +133,7 @@ export function SettingsDialog({
               {screen === "permissions" ? <PermissionsScreen /> : null}
               {screen === "project" ? <ProjectScreen /> : null}
               {screen === "verification" ? <VerificationScreen /> : null}
+              {screen === "mcp" ? <McpScreen /> : null}
             </>
           )}
         </div>
@@ -137,6 +145,108 @@ export function SettingsDialog({
       />
     </Modal>
   );
+}
+
+function McpScreen() {
+  const snapshot = useDesktopStore((state) => state.mcpSnapshot);
+  const isLoading = useDesktopStore((state) => state.isLoadingMcp);
+  const refreshMcp = useDesktopStore((state) => state.refreshMcp);
+  const disconnectMcp = useDesktopStore((state) => state.disconnectMcp);
+  const [disconnecting, setDisconnecting] = useState<string | null>(null);
+
+  return (
+    <Screen
+      title="MCP servers"
+      description="Configured servers stay idle until you connect. Agent tool calls still pass through harness permissions and approval."
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-line bg-sunken px-3 py-2">
+        <div className="text-xs text-secondary">
+          {snapshot
+            ? `${snapshot.total_tools} discovered tools · about ${snapshot.estimated_tool_definition_tokens.toLocaleString()} definition tokens`
+            : "MCP configuration is read from .agent/mcp.toml"}
+        </div>
+        <Button
+          size="sm"
+          onClick={() => void refreshMcp()}
+          disabled={isLoading}
+          icon={<RefreshCw className={cx("size-icon-sm", isLoading && "animate-spin")} />}
+        >
+          Connect & discover
+        </Button>
+      </div>
+
+      {!snapshot?.servers.length ? (
+        <p className="rounded-md border border-dashed border-line p-3 text-xs leading-4 text-faint">
+          No MCP servers are configured. Add a stdio or Streamable HTTP server to .agent/mcp.toml, then refresh.
+        </p>
+      ) : (
+        <div className="space-y-3">
+          {snapshot.servers.map((server) => (
+            <section key={server.server_id} className="rounded-md border border-line bg-sunken p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Network className="size-icon-sm shrink-0 text-faint" />
+                  <span className="truncate text-sm font-medium text-primary" title={server.server_id}>
+                    {server.server_id}
+                  </span>
+                  <span className="text-2xs text-faint">{server.transport}</span>
+                  <Badge tone={mcpStateTone(server.state)}>{server.state}</Badge>
+                </div>
+                {server.state !== "disconnected" ? (
+                  <Button
+                    size="sm"
+                    disabled={disconnecting === server.server_id}
+                    onClick={async () => {
+                      setDisconnecting(server.server_id);
+                      await disconnectMcp(server.server_id);
+                      setDisconnecting(null);
+                    }}
+                  >
+                    Disconnect
+                  </Button>
+                ) : null}
+              </div>
+              {server.error ? (
+                <p className="mt-2 break-words text-xs text-error">{server.error}</p>
+              ) : null}
+              {server.tools.length ? (
+                <ul className="mt-2 divide-y divide-line/60">
+                  {server.tools.slice(0, 30).map((tool) => (
+                    <li key={`${server.server_id}/${tool.name}`} className="flex items-start justify-between gap-3 py-1.5">
+                      <div className="min-w-0">
+                        <p className="truncate font-mono text-xs text-secondary" title={tool.name}>{tool.name}</p>
+                        <p className="line-clamp-2 text-2xs leading-4 text-faint">{tool.description || "No description"}</p>
+                      </div>
+                      <span className="shrink-0 text-2xs text-faint" title="Estimated prompt tokens for this definition">
+                        ≈{tool.estimated_definition_tokens} tokens
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-xs text-faint">No tools discovered yet.</p>
+              )}
+              {server.tools.length > 30 ? (
+                <p className="mt-1 text-2xs text-faint">Showing 30 of {server.tools.length} tools.</p>
+              ) : null}
+              {server.resources.length ? (
+                <p className="mt-2 text-2xs text-faint">
+                  {server.resources.length} resources available to the agent when requested.
+                </p>
+              ) : null}
+            </section>
+          ))}
+        </div>
+      )}
+    </Screen>
+  );
+}
+
+function mcpStateTone(state: string): Tone {
+  if (state === "connected") return "success";
+  if (state === "failed") return "error";
+  if (state === "connecting") return "warning";
+  return "neutral";
 }
 
 function SettingsFooter({

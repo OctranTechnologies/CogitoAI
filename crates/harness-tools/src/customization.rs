@@ -381,6 +381,7 @@ mod tests {
         ToolContext {
             policy,
             working_directory: root,
+            execution_environment: crate::local_execution_environment(),
             cancellation: None,
             event_bus: None,
             session_id: None,

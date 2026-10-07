@@ -72,6 +72,8 @@ function resetStore() {
     checkpoints: [],
     restoringCheckpointId: null,
     lastRestore: null,
+    mcpSnapshot: null,
+    isLoadingMcp: false,
     modelCatalog: null,
     isLoadingModelCatalog: false,
   });
@@ -125,6 +127,60 @@ describe("desktop runtime store", () => {
     expect(requestRuntime).toHaveBeenCalledWith("client-1", "agent.send", {
       task: expect.objectContaining({ task_mode: "plan" }),
     });
+  });
+
+  it("inspects MCP state passively and marks explicit connect as user approved", async () => {
+    const snapshot = {
+      servers: [{
+        server_id: "docs",
+        transport: "streamable_http",
+        state: "disconnected",
+        tools: [],
+        resources: [],
+        error: null,
+      }],
+      total_tools: 0,
+      estimated_tool_definition_tokens: 0,
+    };
+    requestRuntime.mockImplementation(async (_clientId: string, method: string) => {
+      if (method === "rpc.initialize") return response({ version: 1 });
+      if (method === "workspace.open") return response({ current_directory: "/repo", repository_root: "/repo", languages: [], manifests: [], instructions: [], configuration: { package_manager: null, commands: {}, source: null } });
+      if (method === "session.list") return response([]);
+      if (method === "mcp.inspect" || method === "mcp.refresh") return response(snapshot);
+      return response({});
+    });
+    await useDesktopStore.getState().connect("127.0.0.1:4545", "/repo");
+    requestRuntime.mockClear();
+
+    await useDesktopStore.getState().inspectMcp();
+    expect(requestRuntime).toHaveBeenCalledWith("client-1", "mcp.inspect", {});
+    expect(useDesktopStore.getState().mcpSnapshot).toEqual(snapshot);
+
+    await useDesktopStore.getState().refreshMcp("docs");
+    expect(requestRuntime).toHaveBeenCalledWith("client-1", "mcp.refresh", {
+      approved: true,
+      server_id: "docs",
+    });
+  });
+
+  it("sends attachment content once in the task payload without persisting it to UI history", async () => {
+    await useDesktopStore.getState().connect("127.0.0.1:4545", "/repo");
+    const attachment = {
+      kind: "text" as const,
+      file_name: "error.txt",
+      media_type: "text/plain",
+      text: "private diagnostic contents",
+    };
+    await useDesktopStore.getState().sendMessage("Explain this", [attachment]);
+
+    expect(requestRuntime).toHaveBeenCalledWith("client-1", "agent.send", {
+      task: expect.objectContaining({
+        user_task: expect.stringContaining("Attached files: error.txt"),
+        attachments: [attachment],
+      }),
+    });
+    expect(useDesktopStore.getState().messages[0].text).toContain("error.txt");
+    expect(useDesktopStore.getState().messages[0].text).not.toContain("private diagnostic contents");
   });
 
   it("shows a recovery step for incompatible runtime protocol versions", async () => {
